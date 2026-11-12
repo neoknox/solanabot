@@ -50,6 +50,10 @@ export class LatencyTracker {
     setTimeout(checkDelay, 50).unref();
   }
 
+  public measureEventLoopDelay(): number {
+    return this.currentEventLoopDelayMs;
+  }
+
   public recordDecodeDuration(durationUs: number): void {
     this.addSample(this.decodeSamplesUs, durationUs);
   }
@@ -70,19 +74,20 @@ export class LatencyTracker {
     this.addSample(this.rpcSamplesMs, durationMs);
   }
 
-  public recordSlotLag(lag: number): void {
-    this.lastSlotLag = Math.max(0, lag);
+  public recordSlotLag(slotLag: number): void {
+    this.lastSlotLag = slotLag;
   }
 
   public recordReconnectDuration(durationMs: number): void {
     this.lastReconnectDurationMs = durationMs;
   }
 
-  private addSample(array: number[], value: number): void {
+  private addSample(array: number[], val: number): void {
+    if (val < 0 || isNaN(val)) return;
     if (array.length >= LatencyTracker.MAX_SAMPLES) {
       array.shift();
     }
-    array.push(value);
+    array.push(val);
   }
 
   private calculatePercentiles(samples: number[]): PercentileStats {
@@ -92,21 +97,23 @@ export class LatencyTracker {
 
     const sorted = [...samples].sort((a, b) => a - b);
     const count = sorted.length;
-    const sum = sorted.reduce((acc, val) => acc + val, 0);
+    const min = sorted[0];
+    const max = sorted[count - 1];
+    const sum = sorted.reduce((acc, v) => acc + v, 0);
+    const mean = sum / count;
 
-    const getP = (p: number) => {
-      const idx = Math.min(count - 1, Math.floor((p / 100) * count));
-      return sorted[idx];
-    };
+    const p50 = sorted[Math.floor(count * 0.50)];
+    const p95 = sorted[Math.floor(count * 0.95)] || max;
+    const p99 = sorted[Math.floor(count * 0.99)] || max;
 
     return {
       count,
-      min: sorted[0],
-      p50: getP(50),
-      p95: getP(95),
-      p99: getP(99),
-      max: sorted[count - 1],
-      mean: Math.round((sum / count) * 100) / 100
+      min: Number(min.toFixed(2)),
+      p50: Number(p50.toFixed(2)),
+      p95: Number(p95.toFixed(2)),
+      p99: Number(p99.toFixed(2)),
+      max: Number(max.toFixed(2)),
+      mean: Number(mean.toFixed(2))
     };
   }
 
@@ -118,17 +125,9 @@ export class LatencyTracker {
       detectionToDecisionUs: this.calculatePercentiles(this.decisionSamplesUs),
       rpcLatencyMs: this.calculatePercentiles(this.rpcSamplesMs),
       lastSlotLag: this.lastSlotLag,
-      lastReconnectDurationMs: this.lastReconnectDurationMs,
-      eventLoopDelayMs: Math.round(this.currentEventLoopDelayMs * 100) / 100,
+      lastReconnectDurationMs: Number(this.lastReconnectDurationMs.toFixed(2)),
+      eventLoopDelayMs: Number(this.currentEventLoopDelayMs.toFixed(2)),
       totalDecisionsMeasured: this.decisionSamplesUs.length
     };
-  }
-
-  public reset(): void {
-    this.decodeSamplesUs = [];
-    this.quoteSamplesUs = [];
-    this.validationSamplesUs = [];
-    this.decisionSamplesUs = [];
-    this.rpcSamplesMs = [];
   }
 }

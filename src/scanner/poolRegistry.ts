@@ -2,6 +2,7 @@ import { DexType, PoolState } from '../types/index.js';
 import {
   CANONICAL_WSOL_MINT,
   CANONICAL_USDC_MINT,
+  CANONICAL_USDT_MINT,
   KNOWN_PROGRAM_IDS
 } from '../config/index.js';
 
@@ -48,16 +49,17 @@ export class PoolRegistry {
       description: 'Orca Whirlpool 0.04% SOL/USDC'
     });
 
-    // 3. Orca Whirlpool Secondary (FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q)
+    // 3. Orca Whirlpool Secondary (FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q, verified on-chain 2 bps)
+    // Intra-DEX counterpart to Czfq3xZZ
     this.register({
       id: 'FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q',
       dex: 'ORCA_WHIRLPOOL',
       programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
       tokenAMint: CANONICAL_WSOL_MINT,
       tokenBMint: CANONICAL_USDC_MINT,
-      feeBps: 20,
-      initialLiquidityUsd: 600000,
-      description: 'Orca Whirlpool 0.20% SOL/USDC'
+      feeBps: 2,
+      initialLiquidityUsd: 1200000,
+      description: 'Orca Whirlpool 0.02% SOL/USDC (Intra-DEX tier)'
     });
 
     // 4. Meteora DLMM (Primary dynamic bin pool, verified on-chain)
@@ -72,7 +74,31 @@ export class PoolRegistry {
       description: 'Meteora DLMM Dynamic Bin SOL/USDC'
     });
 
-    // 5. Raydium CLMM (Concentrated Liquidity, verified on-chain)
+    // 5. Orca Whirlpool USDC/USDT 0.01% (verified on-chain, 653-byte layout)
+    this.register({
+      id: '4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4',
+      dex: 'ORCA_WHIRLPOOL',
+      programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
+      tokenAMint: CANONICAL_USDC_MINT,
+      tokenBMint: CANONICAL_USDT_MINT,
+      feeBps: 1,
+      initialLiquidityUsd: 25000000,
+      description: 'Orca Whirlpool 0.01% USDC/USDT Stable Pair'
+    });
+
+    // 6. Raydium AMM V4 WSOL/USDT (verified on-chain, 752-byte layout)
+    this.register({
+      id: '7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX',
+      dex: 'RAYDIUM_AMM',
+      programId: KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4,
+      tokenAMint: CANONICAL_WSOL_MINT,
+      tokenBMint: CANONICAL_USDT_MINT,
+      feeBps: 25,
+      initialLiquidityUsd: 8500000,
+      description: 'Raydium AMM V4 Main SOL/USDT Pool'
+    });
+
+    // 7. Raydium CLMM (Concentrated Liquidity, verified on-chain)
     this.register({
       id: '3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv',
       dex: 'RAYDIUM_CLMM',
@@ -84,7 +110,7 @@ export class PoolRegistry {
       description: 'Raydium CLMM SOL/USDC'
     });
 
-    // 6. Phoenix Market (Orderbook DEX on Solana, verified on-chain)
+    // 8. Phoenix Market (Orderbook DEX on Solana, verified on-chain)
     this.register({
       id: '4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg',
       dex: 'PHOENIX',

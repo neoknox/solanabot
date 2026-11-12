@@ -7,6 +7,13 @@ dotenv.config();
 // Canonical Mint Definitions
 export const CANONICAL_WSOL_MINT = 'So11111111111111111111111111111111111111112';
 export const CANONICAL_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+export const CANONICAL_USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+
+export const ALLOWLISTED_MINTS = new Set([
+  CANONICAL_WSOL_MINT,
+  CANONICAL_USDC_MINT,
+  CANONICAL_USDT_MINT
+]);
 
 export const KNOWN_TOKENS: Record<string, TokenInfo> = {
   [CANONICAL_WSOL_MINT]: {
@@ -21,6 +28,13 @@ export const KNOWN_TOKENS: Record<string, TokenInfo> = {
     symbol: 'USDC',
     decimals: 6,
     name: 'USD Coin',
+    programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+  },
+  [CANONICAL_USDT_MINT]: {
+    mint: CANONICAL_USDT_MINT,
+    symbol: 'USDT',
+    decimals: 6,
+    name: 'Tether USD',
     programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
   }
 };
@@ -48,13 +62,14 @@ const rawConfigSchema = z.object({
   SOLANA_RPC_WS: z.string().default('wss://api.mainnet-beta.solana.com'),
   JUPITER_API_KEY: z.string().optional().default(''),
   JUPITER_API_URL: z.string().url().default('https://api.jup.ag/swap/v1'),
-  SCAN_TOKENS: z.string().default('SOL,USDC'),
+  SCAN_TOKENS: z.string().default('SOL,USDC,USDT'),
   TRADE_SIZES_USDC: z.string().default('25,50,100,250,500,1000'),
   VIRTUAL_CAPITAL_USDC: z.coerce.number().positive().default(1000),
   MIN_NET_PROFIT_USDC: z.coerce.number().min(0.01).default(0.50),
   SAFETY_BUFFER_USDC: z.coerce.number().min(0).default(0.25),
   SLIPPAGE_BPS_LEG1: z.coerce.number().min(0).max(500).default(10),
   SLIPPAGE_BPS_LEG2: z.coerce.number().min(0).max(500).default(10),
+  SLIPPAGE_BPS_LEG3: z.coerce.number().min(0).max(500).default(10),
   MAX_QUOTE_AGE_MS: z.coerce.number().min(100).max(60000).default(2500),
   MAX_SLOT_GAP: z.coerce.number().min(0).max(200).default(10),
   MIN_POOL_LIQUIDITY_USD: z.coerce.number().min(0).default(10000),
@@ -64,6 +79,7 @@ const rawConfigSchema = z.object({
   ESTIMATED_SIGNATURES: z.coerce.number().min(1).max(10).default(1),
   PRIORITY_FEE_LAMPORTS: z.coerce.number().min(0).default(10000),
   JITO_TIP_LAMPORTS: z.coerce.number().min(0).default(0),
+  ATA_RENT_EXEMPT_LAMPORTS: z.coerce.number().default(2039280),
   EXECUTION_CONTINGENCY_USDC: z.coerce.number().min(0).default(0.02),
   POLL_INTERVAL_MS: z.coerce.number().min(500).default(3000),
   HEALTH_CHECK_INTERVAL_MS: z.coerce.number().min(1000).default(10000),
@@ -76,6 +92,9 @@ const rawConfigSchema = z.object({
   MAX_EVENT_QUEUE_CAPACITY: z.coerce.number().min(100).default(2000),
   ASYNC_DB_FLUSH_INTERVAL_MS: z.coerce.number().min(10).default(100),
   SCAN_INTERVAL_MS: z.coerce.number().min(50).default(500),
+  ENABLE_OPTIMAL_SIZING: z.coerce.boolean().default(true),
+  ENABLE_THREE_LEG_CYCLES: z.coerce.boolean().default(true),
+  ENABLE_INTRA_DEX_CYCLES: z.coerce.boolean().default(true),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info')
 });
 

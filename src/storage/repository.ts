@@ -1,20 +1,27 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
-import { ArbitrageCandidate } from '../types/index.js';
 import { AppConfig } from '../config/index.js';
+import { ArbitrageCandidate, AuditMetrics } from '../types/index.js';
 import { initDatabase } from './db.js';
 
-export interface StorageStats {
+export interface StorageSummaryStats {
   totalSignals: number;
   qualifiedCount: number;
+  totalCandidates: number;
+  qualifiedShadowCount: number;
   candidateCount: number;
   rejectedCount: number;
+  staleCount: number;
+  degradedCount: number;
   totalTheoreticalProfitUSDC: number;
+  totalProviderEvents: number;
+  oldestRecordTimestamp?: number;
+  newestRecordTimestamp?: number;
 }
 
 export class ArbitrageRepository {
-  private db: Database.Database;
   private config: AppConfig;
+  private db: Database.Database;
   private insertCandidateStmt: Database.Statement;
   private insertEventStmt: Database.Statement;
   private batchInsertTransaction: Database.Transaction<(items: ArbitrageCandidate[]) => void>;
@@ -27,16 +34,17 @@ export class ArbitrageRepository {
 
     this.insertCandidateStmt = this.db.prepare(`
       INSERT OR REPLACE INTO candidates (
-        candidate_id, route_name, direction, input_amount_usdc,
-        leg1_expected_out_wsol, leg1_conservative_out_wsol,
+        candidate_id, route_name, direction, cycle_type, quality_label, optimal_size_usdc,
+        input_amount_usdc, leg1_expected_out_wsol, leg1_conservative_out_wsol,
         leg2_expected_out_usdc, leg2_conservative_out_usdc,
         expected_net_usdc, min_conservative_net_usdc, status,
         rejection_reasons, leg1_pool_id, leg1_dex, leg1_quote_source,
         leg2_pool_id, leg2_dex, leg2_quote_source,
-        costs_total_usdc, sol_price_usdc, costs_breakdown_json,
-        quote_age_ms, slot_gap, timestamp
+        costs_total_usdc, sol_price_usdc, recoverable_deposit_usdc,
+        consumed_cost_usdc, potential_loss_failure_usdc, survival_status,
+        costs_breakdown_json, quote_age_ms, slot_gap, timestamp
       ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
     `);
 
@@ -64,6 +72,9 @@ export class ArbitrageRepository {
         candidate.candidateId,
         candidate.routeName,
         candidate.direction,
+        candidate.cycleType || '2_LEG',
+        candidate.qualityLabel || 'INVALID',
+        candidate.optimalSizeUSDC || 0,
         candidate.inputAmountUSDC.toString(),
         candidate.leg1ExpectedOutWSOL.toString(),
         candidate.leg1ConservativeOutWSOL.toString(),
@@ -81,6 +92,10 @@ export class ArbitrageRepository {
         candidate.leg2Quote.quoteSource,
         candidate.costs.totalCostsUSDC,
         candidate.costs.solPriceUSDC,
+        candidate.recoverableDepositUSDC || '0.000000',
+        candidate.consumedCostUSDC || candidate.costs.totalCostsUSDC,
+        candidate.potentialLossOnFailureUSDC || '0.000000',
+        candidate.survivalStatus || 'UNCHECKED',
         JSON.stringify(candidate.costs),
         candidate.quoteAgeMs,
         candidate.slotGap,
@@ -134,27 +149,21 @@ export class ArbitrageRepository {
     } catch {}
   }
 
-  public recordAuditMetrics(metrics: {
-    totalEvaluated: number;
-    uniqueOpportunities: number;
-    candidatesGrossPositive: number;
-    candidatesConservativeQualified: number;
-    rejectedRoutes: number;
-    quoteValidationFailures: number;
-    unsupportedRoutes: number;
-    staleDataRejections: number;
-  }): void {
+  public recordAuditMetrics(metrics: AuditMetrics): void {
+    const runId = `AUDIT-${Date.now()}`;
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO audit_metrics (
+        run_id, total_evaluated, unique_opportunities,
+        candidates_gross_positive, candidates_conservative_qualified,
+        rejected_routes, quote_validation_failures, unsupported_routes,
+        stale_data_rejections, two_leg_evaluated, three_leg_evaluated,
+        intra_dex_evaluated, inter_dex_evaluated, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
     try {
-      const stmt = this.db.prepare(`
-        INSERT OR REPLACE INTO audit_metrics (
-          run_id, total_evaluated, unique_opportunities,
-          candidates_gross_positive, candidates_conservative_qualified,
-          rejected_routes, quote_validation_failures,
-          unsupported_routes, stale_data_rejections, timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
       stmt.run(
-        `RUN-${Date.now()}`,
+        runId,
         metrics.totalEvaluated,
         metrics.uniqueOpportunities,
         metrics.candidatesGrossPositive,
@@ -163,86 +172,98 @@ export class ArbitrageRepository {
         metrics.quoteValidationFailures,
         metrics.unsupportedRoutes,
         metrics.staleDataRejections,
+        metrics.twoLegEvaluated || 0,
+        metrics.threeLegEvaluated || 0,
+        metrics.intraDexEvaluated || 0,
+        metrics.interDexEvaluated || 0,
         Date.now()
       );
     } catch {}
   }
 
-  public getLatestAuditMetrics(): {
-    totalEvaluated: number;
-    uniqueOpportunities: number;
-    candidatesGrossPositive: number;
-    candidatesConservativeQualified: number;
-    rejectedRoutes: number;
-    quoteValidationFailures: number;
-    unsupportedRoutes: number;
-    staleDataRejections: number;
-  } | null {
-    try {
-      const row = this.db.prepare(`
-        SELECT 
-          SUM(total_evaluated) as totalEvaluated,
-          SUM(unique_opportunities) as uniqueOpportunities,
-          SUM(candidates_gross_positive) as candidatesGrossPositive,
-          SUM(candidates_conservative_qualified) as candidatesConservativeQualified,
-          SUM(rejected_routes) as rejectedRoutes,
-          SUM(quote_validation_failures) as quoteValidationFailures,
-          SUM(unsupported_routes) as unsupportedRoutes,
-          SUM(stale_data_rejections) as staleDataRejections
-        FROM audit_metrics
-      `).get() as any;
+  public getLatestAuditMetrics(): AuditMetrics | null {
+    const row = this.db.prepare(`
+      SELECT * FROM audit_metrics ORDER BY timestamp DESC LIMIT 1
+    `).get() as Record<string, unknown> | undefined;
 
-      if (!row || row.totalEvaluated === null) return null;
-      return {
-        totalEvaluated: row.totalEvaluated || 0,
-        uniqueOpportunities: row.uniqueOpportunities || 0,
-        candidatesGrossPositive: row.candidatesGrossPositive || 0,
-        candidatesConservativeQualified: row.candidatesConservativeQualified || 0,
-        rejectedRoutes: row.rejectedRoutes || 0,
-        quoteValidationFailures: row.quoteValidationFailures || 0,
-        unsupportedRoutes: row.unsupportedRoutes || 0,
-        staleDataRejections: row.staleDataRejections || 0
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  public purgeOldRecords(retentionHours?: number): number {
-    this.flushSync();
-    const hours = retentionHours || this.config.DB_RETENTION_HOURS;
-    const cutoff = Date.now() - hours * 3600 * 1000;
-    const stmt = this.db.prepare('DELETE FROM candidates WHERE timestamp < ?');
-    const result = stmt.run(cutoff);
-    const eventStmt = this.db.prepare('DELETE FROM provider_events WHERE timestamp < ?');
-    eventStmt.run(cutoff);
-    return result.changes;
-  }
-
-  public getSummaryStats(): StorageStats {
-    this.flushSync();
-    const counts = this.db.prepare(`
-      SELECT 
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'QUALIFIED_SHADOW' THEN 1 ELSE 0 END) as qualified,
-        SUM(CASE WHEN status = 'CANDIDATE' THEN 1 ELSE 0 END) as candidate,
-        SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END) as rejected,
-        SUM(CASE WHEN status = 'QUALIFIED_SHADOW' THEN CAST(min_conservative_net_usdc AS REAL) ELSE 0 END) as theoreticalProfit
-      FROM candidates
-    `).get() as {
-      total: number;
-      qualified: number;
-      candidate: number;
-      rejected: number;
-      theoreticalProfit: number | null;
-    };
+    if (!row) return null;
 
     return {
-      totalSignals: counts?.total || 0,
-      qualifiedCount: counts?.qualified || 0,
-      candidateCount: counts?.candidate || 0,
-      rejectedCount: counts?.rejected || 0,
-      totalTheoreticalProfitUSDC: counts?.theoreticalProfit || 0
+      totalEvaluated: Number(row.total_evaluated),
+      uniqueOpportunities: Number(row.unique_opportunities),
+      candidatesGrossPositive: Number(row.candidates_gross_positive),
+      candidatesConservativeQualified: Number(row.candidates_conservative_qualified),
+      rejectedRoutes: Number(row.rejected_routes),
+      quoteValidationFailures: Number(row.quote_validation_failures),
+      unsupportedRoutes: Number(row.unsupported_routes),
+      staleDataRejections: Number(row.stale_data_rejections),
+      twoLegEvaluated: Number(row.two_leg_evaluated || 0),
+      threeLegEvaluated: Number(row.three_leg_evaluated || 0),
+      intraDexEvaluated: Number(row.intra_dex_evaluated || 0),
+      interDexEvaluated: Number(row.inter_dex_evaluated || 0)
+    };
+  }
+
+  public getSummaryStats(): StorageSummaryStats {
+    this.flushSync();
+    const candidateCounts = this.db.prepare(`
+      SELECT 
+        status, 
+        COUNT(*) as count 
+      FROM candidates 
+      GROUP BY status
+    `).all() as Array<{ status: string; count: number }>;
+
+    let qualifiedShadowCount = 0;
+    let candidateCount = 0;
+    let rejectedCount = 0;
+    let staleCount = 0;
+    let degradedCount = 0;
+    let totalCandidates = 0;
+
+    for (const row of candidateCounts) {
+      totalCandidates += row.count;
+      switch (row.status) {
+        case 'QUALIFIED_SHADOW': qualifiedShadowCount = row.count; break;
+        case 'CANDIDATE': candidateCount = row.count; break;
+        case 'REJECTED': rejectedCount = row.count; break;
+        case 'STALE': staleCount = row.count; break;
+        case 'DEGRADED': degradedCount = row.count; break;
+      }
+    }
+
+    const eventCountRow = this.db.prepare(`
+      SELECT COUNT(*) as count FROM provider_events
+    `).get() as { count: number };
+
+    const timeExtremes = this.db.prepare(`
+      SELECT 
+        MIN(timestamp) as oldest, 
+        MAX(timestamp) as newest 
+      FROM candidates
+    `).get() as { oldest: number | null; newest: number | null };
+
+    const profitRow = this.db.prepare(`
+      SELECT SUM(CAST(min_conservative_net_usdc AS REAL)) as totalProfit
+      FROM candidates
+      WHERE status = 'QUALIFIED_SHADOW'
+    `).get() as { totalProfit: number | null };
+
+    const totalTheoreticalProfitUSDC = Number(profitRow?.totalProfit || 0);
+
+    return {
+      totalSignals: totalCandidates,
+      qualifiedCount: qualifiedShadowCount,
+      totalCandidates,
+      qualifiedShadowCount,
+      candidateCount,
+      rejectedCount,
+      staleCount,
+      degradedCount,
+      totalTheoreticalProfitUSDC,
+      totalProviderEvents: eventCountRow?.count || 0,
+      oldestRecordTimestamp: timeExtremes?.oldest ?? undefined,
+      newestRecordTimestamp: timeExtremes?.newest ?? undefined
     };
   }
 
@@ -259,7 +280,14 @@ export class ArbitrageRepository {
     return rows.map(r => ({
       candidateId: String(r.candidate_id),
       routeName: String(r.route_name),
-      direction: 'USDC_TO_WSOL_TO_USDC',
+      direction: String(r.direction || 'USDC_TO_WSOL_TO_USDC'),
+      cycleType: (r.cycle_type as any) || '2_LEG',
+      qualityLabel: (r.quality_label as any) || 'INVALID',
+      optimalSizeUSDC: Number(r.optimal_size_usdc || 0),
+      recoverableDepositUSDC: String(r.recoverable_deposit_usdc || '0'),
+      consumedCostUSDC: String(r.consumed_cost_usdc || '0'),
+      potentialLossOnFailureUSDC: String(r.potential_loss_failure_usdc || '0'),
+      survivalStatus: (r.survival_status as any) || 'UNCHECKED',
       inputAmountUSDC: BigInt(String(r.input_amount_usdc)),
       leg1ExpectedOutWSOL: BigInt(String(r.leg1_expected_out_wsol)),
       leg1ConservativeOutWSOL: BigInt(String(r.leg1_conservative_out_wsol)),
@@ -310,10 +338,11 @@ export class ArbitrageRepository {
     this.flushSync();
     const rows = this.db.prepare(`
       SELECT 
-        candidate_id, route_name, input_amount_usdc,
-        expected_net_usdc, min_conservative_net_usdc, status,
+        candidate_id, route_name, cycle_type, quality_label, optimal_size_usdc,
+        input_amount_usdc, expected_net_usdc, min_conservative_net_usdc, status,
         leg1_dex, leg1_pool_id, leg2_dex, leg2_pool_id,
-        costs_total_usdc, sol_price_usdc, quote_age_ms, slot_gap,
+        costs_total_usdc, sol_price_usdc, potential_loss_failure_usdc,
+        quote_age_ms, slot_gap,
         datetime(timestamp / 1000, 'unixepoch') as time_utc
       FROM candidates
       ORDER BY timestamp DESC
@@ -336,6 +365,15 @@ export class ArbitrageRepository {
 
     fs.writeFileSync(filePath, csvLines.join('\n'));
     return rows.length;
+  }
+
+  public purgeOldRecords(hoursToKeep: number): number {
+    this.flushSync();
+    const cutoffTimestamp = Date.now() - (hoursToKeep * 60 * 60 * 1000);
+    const result = this.db.prepare(`
+      DELETE FROM candidates WHERE timestamp < ?
+    `).run(cutoffTimestamp);
+    return result.changes;
   }
 
   public close(): void {

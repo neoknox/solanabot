@@ -9,6 +9,7 @@ export interface FeeEstimateInput {
   solPriceTimestamp?: number;
   measuredPriorityFeeLamports?: number;
   tokenTransferFeeBps?: number;
+  requiresAtaSetup?: boolean;
 }
 
 export class CostModel {
@@ -82,12 +83,28 @@ export class CostModel {
     const safetyBufferUSDC = new Decimal(this.config.SAFETY_BUFFER_USDC);
     assumptions.push(`Safety buffer hurdle: $${safetyBufferUSDC.toFixed(4)}`);
 
-    // Total execution costs (excluding buffer hurdle which is subtracted separately)
-    const totalCostsUSDC = networkFeeUSDC
+    // 7. Recoverable ATA deposit (if temporary WSOL ATA creation/close is needed)
+    let recoverableDepositUSDC = new Decimal(0);
+    if (input.requiresAtaSetup) {
+      const ataRentLamports = new Decimal(this.config.ATA_RENT_EXEMPT_LAMPORTS || 2039280);
+      recoverableDepositUSDC = ataRentLamports.div(1e9).mul(solPrice);
+      assumptions.push(`Recoverable ATA rent deposit: $${recoverableDepositUSDC.toFixed(4)} (returned upon ATA close)`);
+    }
+
+    // Permanently consumed costs: base signature fee + priority compute fee + Jito tip + token transfer fees + contingency
+    const consumedCostUSDC = networkFeeUSDC
       .add(priorityFeeUSDC)
       .add(jitoTipUSDC)
       .add(tokenTransferFeesUSDC)
       .add(contingencyUSDC);
+
+    // Total execution costs (consumed costs only, as rent deposit is fully refunded in atomic tx)
+    const totalCostsUSDC = consumedCostUSDC;
+
+    // Potential loss on failure: If transaction reverts on-chain due to min-profit slippage check,
+    // principal capital and ATA rent are preserved by runtime rollback.
+    // Permanently burned: base network fee + priority fee.
+    const potentialLossOnFailureUSDC = networkFeeUSDC.add(priorityFeeUSDC);
 
     return {
       breakdown: {
@@ -99,6 +116,9 @@ export class CostModel {
         safetyBufferUSDC: safetyBufferUSDC.toFixed(4),
         totalCostsUSDC: totalCostsUSDC.toFixed(6),
         solPriceUSDC: solPrice.toFixed(4),
+        recoverableDepositUSDC: recoverableDepositUSDC.toFixed(6),
+        consumedCostUSDC: consumedCostUSDC.toFixed(6),
+        potentialLossOnFailureUSDC: potentialLossOnFailureUSDC.toFixed(6),
         assumptions
       },
       isComplete: true

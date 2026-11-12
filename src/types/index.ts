@@ -1,5 +1,5 @@
 /**
- * Core Types and Enums for Solana Arbitrage Scanner (Phase 1)
+ * Core Types and Enums for Solana Arbitrage Scanner (Phase 1.2: Competitive Opportunity Intelligence)
  * Strictly READ-ONLY. No wallet, no signer, no transaction broadcast interfaces.
  */
 
@@ -38,9 +38,20 @@ export type ExecutionTag =
   | 'POTENTIAL_ATOMIC'            // Plausible future single-tx atomic execution route
   | 'INDICATIVE_ONLY';            // Off-chain RFQ / non-atomic / indicative only
 
+export type CycleType = '2_LEG' | '3_LEG';
+
+export type OpportunityQualityLabel =
+  | 'INVALID'                     // Stale data, unknown fees, unsafe token, invalid pools or missing quote support
+  | 'INDICATIVE_ONLY'             // Price difference exists but atomic composition or executable quote is unverified
+  | 'SHADOW_QUALIFIED';           // All read-only math, route, pool and cost checks pass >= $0.50 conservative estimated profit
+
+export type SurvivalStatus = 'SURVIVED' | 'DECAYED' | 'UNCHECKED';
+
+export type TradeSizingMethod = 'COARSE_GRID' | 'COARSE_TO_FINE';
+
 export type OpportunityStatus =
   | 'OBSERVED'                    // Pool state updated, not a completed quote
-  | 'PRICED'                      // Both legs quoted, freshness & synchronization verified
+  | 'PRICED'                      // Legs quoted, freshness & synchronization verified
   | 'CANDIDATE'                   // Full cost estimate available, expected net positive
   | 'QUALIFIED_SHADOW'            // Conservative net >= $0.50 after all fees and buffer
   | 'REJECTED'                    // Violated profitability, risk, or validation rules
@@ -70,6 +81,7 @@ export type RejectionReasonCode =
   | 'PRICE_CONVERSION_STALE'
   | 'DUPLICATE_SIGNAL'
   | 'TOO_MANY_ACCOUNTS_UNKNOWN'
+  | 'COMPUTE_LIMIT_EXCEEDED'
   | 'PROVIDER_UNAVAILABLE';
 
 export type FeedHealth = 'HEALTHY' | 'DEGRADED' | 'STALE' | 'DISCONNECTED';
@@ -128,28 +140,50 @@ export interface CostBreakdown {
   safetyBufferUSDC: string;           // Required safety buffer hurdle
   totalCostsUSDC: string;             // Sum of all variable and fixed costs
   solPriceUSDC: string;               // SOL/USDC price used for lamport conversions
+  recoverableDepositUSDC?: string;    // Rent deposit returned upon ATA closing
+  consumedCostUSDC?: string;          // Permanently consumed costs (signatures + compute + tip)
+  potentialLossOnFailureUSDC?: string;// Maximum loss if tx reverts on-chain (signatures + compute)
+  riskRewardRatio?: string;           // Potential loss on failure divided by conservative net profit
   assumptions: string[];              // Auditable list of cost assumptions
 }
 
 export interface ArbitrageCandidate {
   candidateId: string;
   routeName: string;
-  leg1Quote: SwapQuote;
-  leg2Quote: SwapQuote;
-  direction: 'USDC_TO_WSOL_TO_USDC';
+  direction: string;
+  cycleType?: CycleType;
+  qualityLabel?: OpportunityQualityLabel;
+  optimalSizeUSDC?: number;
+  sizingMethod?: TradeSizingMethod;
   inputAmountUSDC: bigint;            // Exact input USDC (6 decimals)
-  leg1ExpectedOutWSOL: bigint;        // Expected WSOL output from leg 1
-  leg1ConservativeOutWSOL: bigint;    // Conservative WSOL input to leg 2 (after slippage allowance)
-  leg2ExpectedOutUSDC: bigint;        // Expected USDC output from leg 2
-  leg2ConservativeOutUSDC: bigint;    // Conservative USDC output (after slippage allowance)
+  
+  // Leg 1
+  leg1Quote: SwapQuote;
+  leg1ExpectedOutWSOL: bigint;        // Expected intermediate token output from leg 1
+  leg1ConservativeOutWSOL: bigint;    // Conservative intermediate token input to leg 2 (after slippage allowance)
+
+  // Leg 2
+  leg2Quote: SwapQuote;
+  leg2ExpectedOutUSDC: bigint;        // Expected output from leg 2
+  leg2ConservativeOutUSDC: bigint;    // Conservative output from leg 2
+
+  // Optional Leg 3 (for 3-leg triangular arbitrage cycles)
+  leg3Quote?: SwapQuote;
+  leg3ExpectedOutUSDC?: bigint;
+  leg3ConservativeOutUSDC?: bigint;
+
   costs: CostBreakdown;
-  expectedNetUSDC: string;            // leg2ExpectedOut - initialUSDC - costs (Decimal string)
-  minConservativeNetUSDC: string;     // leg2ConservativeOut - initialUSDC - costs - buffer (Decimal string)
+  recoverableDepositUSDC?: string;
+  consumedCostUSDC?: string;
+  potentialLossOnFailureUSDC?: string;
+  expectedNetUSDC: string;            // legEndExpectedOut - initialUSDC - costs (Decimal string)
+  minConservativeNetUSDC: string;     // legEndConservativeOut - initialUSDC - costs - buffer (Decimal string)
   status: OpportunityStatus;
   rejectionReasons: RejectionReasonCode[];
   timestamp: number;
   slotGap: number;
   quoteAgeMs: number;
+  survivalStatus?: SurvivalStatus;
 }
 
 export interface ScanHealthStatus {
@@ -175,4 +209,12 @@ export interface AuditMetrics {
   quoteValidationFailures: number;
   unsupportedRoutes: number;
   staleDataRejections: number;
+  twoLegEvaluated?: number;
+  threeLegEvaluated?: number;
+  intraDexEvaluated?: number;
+  interDexEvaluated?: number;
+  shadowQualifiedCount?: number;
+  survivalCheckedCount?: number;
+  survivalSurvivedCount?: number;
+  survivalDecayedCount?: number;
 }

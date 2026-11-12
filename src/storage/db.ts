@@ -19,6 +19,9 @@ export function initDatabase(config: AppConfig): Database.Database {
       candidate_id TEXT PRIMARY KEY,
       route_name TEXT NOT NULL,
       direction TEXT NOT NULL,
+      cycle_type TEXT DEFAULT '2_LEG',
+      quality_label TEXT DEFAULT 'INVALID',
+      optimal_size_usdc REAL DEFAULT 0,
       input_amount_usdc TEXT NOT NULL,
       leg1_expected_out_wsol TEXT NOT NULL,
       leg1_conservative_out_wsol TEXT NOT NULL,
@@ -36,14 +39,15 @@ export function initDatabase(config: AppConfig): Database.Database {
       leg2_quote_source TEXT NOT NULL,
       costs_total_usdc TEXT NOT NULL,
       sol_price_usdc TEXT NOT NULL,
+      recoverable_deposit_usdc TEXT DEFAULT '0',
+      consumed_cost_usdc TEXT DEFAULT '0',
+      potential_loss_failure_usdc TEXT DEFAULT '0',
+      survival_status TEXT DEFAULT 'UNCHECKED',
       costs_breakdown_json TEXT NOT NULL,
       quote_age_ms INTEGER NOT NULL,
       slot_gap INTEGER NOT NULL,
       timestamp INTEGER NOT NULL
     );
-
-    CREATE INDEX IF NOT EXISTS idx_candidates_status ON candidates(status);
-    CREATE INDEX IF NOT EXISTS idx_candidates_timestamp ON candidates(timestamp);
 
     CREATE TABLE IF NOT EXISTS provider_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,8 +59,6 @@ export function initDatabase(config: AppConfig): Database.Database {
       timestamp INTEGER NOT NULL
     );
 
-    CREATE INDEX IF NOT EXISTS idx_events_timestamp ON provider_events(timestamp);
-
     CREATE TABLE IF NOT EXISTS audit_metrics (
       run_id TEXT PRIMARY KEY,
       total_evaluated INTEGER NOT NULL,
@@ -67,8 +69,38 @@ export function initDatabase(config: AppConfig): Database.Database {
       quote_validation_failures INTEGER NOT NULL,
       unsupported_routes INTEGER NOT NULL,
       stale_data_rejections INTEGER NOT NULL,
+      two_leg_evaluated INTEGER DEFAULT 0,
+      three_leg_evaluated INTEGER DEFAULT 0,
+      intra_dex_evaluated INTEGER DEFAULT 0,
+      inter_dex_evaluated INTEGER DEFAULT 0,
       timestamp INTEGER NOT NULL
     );
+  `);
+
+  // Safe incremental column migration if table already existed from Phase 1 / 1.1
+  const candidateColumns = db.prepare("PRAGMA table_info(candidates)").all() as Array<{ name: string }>;
+  const colNames = new Set(candidateColumns.map(c => c.name));
+  if (!colNames.has('cycle_type')) db.exec("ALTER TABLE candidates ADD COLUMN cycle_type TEXT DEFAULT '2_LEG'");
+  if (!colNames.has('quality_label')) db.exec("ALTER TABLE candidates ADD COLUMN quality_label TEXT DEFAULT 'INVALID'");
+  if (!colNames.has('optimal_size_usdc')) db.exec("ALTER TABLE candidates ADD COLUMN optimal_size_usdc REAL DEFAULT 0");
+  if (!colNames.has('recoverable_deposit_usdc')) db.exec("ALTER TABLE candidates ADD COLUMN recoverable_deposit_usdc TEXT DEFAULT '0'");
+  if (!colNames.has('consumed_cost_usdc')) db.exec("ALTER TABLE candidates ADD COLUMN consumed_cost_usdc TEXT DEFAULT '0'");
+  if (!colNames.has('potential_loss_failure_usdc')) db.exec("ALTER TABLE candidates ADD COLUMN potential_loss_failure_usdc TEXT DEFAULT '0'");
+  if (!colNames.has('survival_status')) db.exec("ALTER TABLE candidates ADD COLUMN survival_status TEXT DEFAULT 'UNCHECKED'");
+
+  const auditColumns = db.prepare("PRAGMA table_info(audit_metrics)").all() as Array<{ name: string }>;
+  const auditColNames = new Set(auditColumns.map(c => c.name));
+  if (!auditColNames.has('two_leg_evaluated')) db.exec("ALTER TABLE audit_metrics ADD COLUMN two_leg_evaluated INTEGER DEFAULT 0");
+  if (!auditColNames.has('three_leg_evaluated')) db.exec("ALTER TABLE audit_metrics ADD COLUMN three_leg_evaluated INTEGER DEFAULT 0");
+  if (!auditColNames.has('intra_dex_evaluated')) db.exec("ALTER TABLE audit_metrics ADD COLUMN intra_dex_evaluated INTEGER DEFAULT 0");
+  if (!auditColNames.has('inter_dex_evaluated')) db.exec("ALTER TABLE audit_metrics ADD COLUMN inter_dex_evaluated INTEGER DEFAULT 0");
+
+  // Create indexes after ensuring columns exist
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_candidates_status ON candidates(status);
+    CREATE INDEX IF NOT EXISTS idx_candidates_timestamp ON candidates(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_candidates_quality ON candidates(quality_label);
+    CREATE INDEX IF NOT EXISTS idx_events_timestamp ON provider_events(timestamp);
   `);
 
   return db;

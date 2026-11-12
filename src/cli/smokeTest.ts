@@ -3,8 +3,8 @@ import { ArbitrageScanner } from '../scanner/arbitrageScanner.js';
 
 async function main() {
   console.log('================================================================');
-  console.log('  SOLANA ARBITRAGE BOT - LIVE MAINNET SMOKE TEST (PHASE 1.1)    ');
-  console.log('  PERFORMANCE & LATENCY HARDENING ADDENDUM                     ');
+  console.log('  SOLANA ARBITRAGE BOT - LIVE MAINNET SMOKE TEST (PHASE 1.2)    ');
+  console.log('  COMPETITIVE OPPORTUNITY INTELLIGENCE & 3-LEG CYCLES          ');
   console.log('  (Strictly Read-Only: No Private Keys, No Execution, No Funds) ');
   console.log('================================================================');
   console.log(`Connecting to Solana RPC: ${config.SOLANA_RPC_HTTP}`);
@@ -15,24 +15,43 @@ async function main() {
   const startTimeMs = performance.now();
 
   const scanner = new ArbitrageScanner(config);
+  const routeIndex = scanner.getRouteIndex();
+
+  console.log(`Route Index Configured:`);
+  console.log(`  Total Directed Routes:  ${routeIndex.getRouteCount()}`);
+  console.log(`  2-Leg Cycles:           ${routeIndex.getTwoLegRouteCount()}`);
+  console.log(`  3-Leg Cycles:           ${routeIndex.getThreeLegRouteCount()}`);
+  console.log(`  Intra-DEX Routes:       ${routeIndex.getIntraDexRouteCount()}`);
+  console.log(`  Inter-DEX Routes:       ${routeIndex.getInterDexRouteCount()}\n`);
+
+  let indicativeCount = 0;
+  let shadowQualifiedCount = 0;
+  let invalidCount = 0;
 
   scanner.onCandidate((c) => {
     const time = new Date(c.timestamp).toISOString();
     const inputUSD = (Number(c.inputAmountUSDC) / 1e6).toFixed(2);
-    const out1WSOL = (Number(c.leg1ExpectedOutWSOL) / 1e9).toFixed(5);
-    const out2USD = (Number(c.leg2ExpectedOutUSDC) / 1e6).toFixed(2);
-    console.log(`[CANDIDATE ${c.status}] ${time} ${c.routeName}`);
-    console.log(`  Size: $${inputUSD} -> Leg1: ${out1WSOL} WSOL -> Leg2: $${out2USD} USDC`);
-    console.log(`  Expected Net: $${c.expectedNetUSDC} | Conservative Net: $${c.minConservativeNetUSDC}`);
-    if (c.rejectionReasons.length > 0) {
-      console.log(`  Rejection Reasons: ${c.rejectionReasons.join(', ')}`);
+    const outUSD = (Number(c.leg3ExpectedOutUSDC || c.leg2ExpectedOutUSDC) / 1e6).toFixed(2);
+    
+    if (c.qualityLabel === 'SHADOW_QUALIFIED') shadowQualifiedCount++;
+    else if (c.qualityLabel === 'INDICATIVE_ONLY') indicativeCount++;
+    else invalidCount++;
+
+    if (c.status === 'QUALIFIED_SHADOW' || c.status === 'CANDIDATE') {
+      console.log(`[CANDIDATE ${c.status} | ${c.qualityLabel}] ${time} ${c.routeName}`);
+      console.log(`  Cycle: ${c.cycleType || '2_LEG'} | Optimal Size: $${inputUSD} -> Final Out: $${outUSD}`);
+      console.log(`  Expected Net: $${c.expectedNetUSDC} | Conservative Net: $${c.minConservativeNetUSDC}`);
+      console.log(`  Consumed Cost: $${c.consumedCostUSDC} | Potential Loss On Failure: $${c.potentialLossOnFailureUSDC}`);
+      if (c.rejectionReasons.length > 0) {
+        console.log(`  Rejection Reasons: ${c.rejectionReasons.join(', ')}`);
+      }
+      console.log('');
     }
-    console.log('');
   });
 
   await scanner.start();
 
-  console.log('Running event-driven scan against Solana mainnet for 25 seconds...\n');
+  console.log('Running competitive event-driven scan against Solana mainnet for 25 seconds...\n');
   await new Promise(resolve => setTimeout(resolve, 25000));
 
   const totalRunTimeMs = performance.now() - startTimeMs;
@@ -43,23 +62,27 @@ async function main() {
   const audit = scanner.getAuditMetrics();
   const latency = scanner.getLatencyReport();
   const queueStats = scanner.getEventQueueStats();
-  const routeCount = scanner.getRouteIndex().getRouteCount();
 
   scanner.getRepository().recordAuditMetrics(audit);
 
   console.log('================================================================');
-  console.log('  MAINNET SMOKE TEST & LATENCY BENCHMARK COMPLETED              ');
+  console.log('  MAINNET SMOKE TEST & COMPETITIVE BENCHMARK COMPLETED          ');
   console.log('================================================================');
   console.log(`Final Solana Slot:              ${health.currentSlot}`);
   console.log(`WebSocket Feed Status:          ${health.connectedWs ? 'CONNECTED' : 'DISCONNECTED'}`);
   console.log(`Active Monitored Pools:         ${health.activePoolCount}`);
-  console.log(`Indexed Directed Routes:        ${routeCount}`);
   console.log(`Total Routes Evaluated:         ${audit.totalEvaluated}`);
+  console.log(`  - 2-Leg Cycles Evaluated:     ${audit.twoLegEvaluated || 0}`);
+  console.log(`  - 3-Leg Cycles Evaluated:     ${audit.threeLegEvaluated || 0}`);
+  console.log(`  - Intra-DEX Evaluated:        ${audit.intraDexEvaluated || 0}`);
+  console.log(`  - Inter-DEX Evaluated:        ${audit.interDexEvaluated || 0}`);
   console.log(`Unique Opportunities:           ${audit.uniqueOpportunities}`);
   console.log(`Gross-Positive Candidates:      ${audit.candidatesGrossPositive}`);
   console.log(`Conservative Net Qualified:     ${audit.candidatesConservativeQualified}`);
-  console.log(`Rejected Routes:                ${audit.rejectedRoutes}`);
-  console.log(`Quote Validation Failures:      ${audit.quoteValidationFailures}`);
+  console.log(`Opportunity Quality Labels:`);
+  console.log(`  - SHADOW_QUALIFIED:           ${audit.candidatesConservativeQualified}`);
+  console.log(`  - INDICATIVE_ONLY:            ${audit.unsupportedRoutes + audit.quoteValidationFailures}`);
+  console.log(`  - INVALID / REJECTED:         ${audit.rejectedRoutes}`);
   console.log(`Rejection Reasons Breakdown:    ${JSON.stringify(health.rejectionBreakdown, null, 2)}`);
 
   console.log('\n--- LATENCY INSTRUMENTATION BENCHMARKS ---');
