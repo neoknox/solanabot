@@ -1,4 +1,4 @@
-import { PoolConfig } from './poolRegistry.js';
+import { PoolConfig, VerificationStatus } from './poolRegistry.js';
 import { DexType, CycleType } from '../types/index.js';
 import {
   CANONICAL_WSOL_MINT,
@@ -52,6 +52,9 @@ export class RouteIndex {
   // All indexed directed routes sorted by priority
   private allRoutes: IndexedDirectedRoute[] = [];
 
+  // Pool ID -> PoolConfig snapshot for dynamic classification
+  private poolConfigs = new Map<string, PoolConfig>();
+
   constructor(pools: PoolConfig[]) {
     this.buildIndices(pools);
   }
@@ -60,7 +63,45 @@ export class RouteIndex {
     this.tokenToPools.clear();
     this.poolToRoutes.clear();
     this.allRoutes = [];
+    this.poolConfigs.clear();
     this.buildIndices(pools);
+  }
+
+  public updatePoolStatus(poolId: string, status: VerificationStatus): void {
+    const pool = this.poolConfigs.get(poolId);
+    if (pool) {
+      pool.verificationStatus = status;
+    }
+
+    const affectedRoutes = this.poolToRoutes.get(poolId) || [];
+    for (const route of affectedRoutes) {
+      const isDirect = route.poolIds.every(id => {
+        const cfg = this.poolConfigs.get(id);
+        return cfg ? this.isPoolVerifiedDirect(cfg) : false;
+      });
+
+      route.isDirectToDirect = isDirect;
+
+      let priority = 0;
+      if (route.isDirectToDirect) priority += (route.cycleType === '3_LEG' ? 800 : 1000);
+      else if (route.poolIds.some(id => {
+        const cfg = this.poolConfigs.get(id);
+        return cfg ? this.isPoolVerifiedDirect(cfg) : false;
+      })) priority += 500;
+
+      if (route.isIntraDex) priority += (route.cycleType === '3_LEG' ? 150 : 200);
+
+      const poolA = this.poolConfigs.get(route.poolAId);
+      const poolB = this.poolConfigs.get(route.poolBId);
+      priority += Math.min(
+        500,
+        Math.floor(((poolA?.initialLiquidityUsd || 0) + (poolB?.initialLiquidityUsd || 0)) / 100000)
+      );
+
+      route.priorityScore = priority;
+    }
+
+    this.allRoutes.sort((a, b) => b.priorityScore - a.priorityScore);
   }
 
   private isPoolVerifiedDirect(pool: PoolConfig): boolean {
@@ -108,6 +149,10 @@ export class RouteIndex {
   }
 
   private buildIndices(pools: PoolConfig[]): void {
+    for (const p of pools) {
+      this.poolConfigs.set(p.id, { ...p });
+    }
+
     // 1. Build Token-to-Pool index for allowlisted tokens
     for (const pool of pools) {
       if (!ALLOWLISTED_MINTS.has(pool.tokenAMint) && !ALLOWLISTED_MINTS.has(pool.tokenBMint)) {

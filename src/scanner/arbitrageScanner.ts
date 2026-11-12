@@ -58,6 +58,7 @@ export class ArbitrageScanner {
   private scanTimer: NodeJS.Timeout | null = null;
   private candidateListeners: CandidateListener[] = [];
   private vaultToPool = new Map<string, { poolId: string; isA: boolean }>();
+  private openOrdersToPool = new Map<string, string>();
 
   private qualifiedCount = 0;
   private rejectedCount = 0;
@@ -219,6 +220,8 @@ export class ArbitrageScanner {
           this.processPoolAccountUpdate(update);
         } else if (update.type === 'VAULT_ACCOUNT') {
           this.processVaultAccountUpdate(update);
+        } else if (update.type === 'OPENORDERS_ACCOUNT') {
+          this.processOpenOrdersAccountUpdate(update);
         }
       }
     } finally {
@@ -255,11 +258,58 @@ export class ArbitrageScanner {
         } catch {}
       }
 
-      // Preserve existing hydrated vault reserves if incoming update lacks them
+      // Preserve existing hydrated vault reserves and verify OpenOrders state freshness
       const existing = this.stateCache.getPoolState(update.key);
       if (existing) {
         if (decoded.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) decoded.reserveA = existing.reserveA;
         if (decoded.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) decoded.reserveB = existing.reserveB;
+
+        if (decoded.dex === 'RAYDIUM_AMM' && existing.extraData && decoded.extraData) {
+          const oldExtra = existing.extraData as any;
+          const newExtra = decoded.extraData as any;
+
+          // Check if critical account pointers changed (vaults, openOrders, market)
+          const pointersChanged =
+            oldExtra.baseVault !== newExtra.baseVault ||
+            oldExtra.quoteVault !== newExtra.quoteVault ||
+            oldExtra.openOrders !== newExtra.openOrders ||
+            oldExtra.marketId !== newExtra.marketId ||
+            oldExtra.marketProgramId !== newExtra.marketProgramId;
+
+          if (pointersChanged) {
+            // Invalidate verification immediately if pool pointers changed
+            newExtra.openOrdersVerified = false;
+            newExtra.unverifiedReason = 'ACCOUNT_POINTERS_CHANGED';
+            this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'ACCOUNT_POINTERS_CHANGED');
+            this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
+          } else if (oldExtra.openOrdersVerified === true) {
+            // Check slot compatibility: does the slot gap between AMM update and OpenOrders exceed MAX_SLOT_GAP?
+            const ooSlot = oldExtra.openOrdersSlot || existing.slot;
+            const slotGap = Math.abs(update.slot - ooSlot);
+            if (slotGap > this.config.MAX_SLOT_GAP) {
+              // Reject mixed-slot snapshot: OpenOrders state is too far behind or ahead
+              newExtra.openOrdersVerified = false;
+              newExtra.unverifiedReason = 'SLOT_MISMATCH';
+              newExtra.openOrdersSlot = ooSlot;
+              newExtra.openOrdersBaseTokenTotal = oldExtra.openOrdersBaseTokenTotal;
+              newExtra.openOrdersQuoteTokenTotal = oldExtra.openOrdersQuoteTokenTotal;
+              this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'SLOT_MISMATCH');
+              this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
+            } else {
+              // Slots are compatible: preserve verified OpenOrders metadata and status
+              newExtra.openOrdersVerified = true;
+              newExtra.openOrdersBaseTokenTotal = oldExtra.openOrdersBaseTokenTotal;
+              newExtra.openOrdersQuoteTokenTotal = oldExtra.openOrdersQuoteTokenTotal;
+              newExtra.openOrdersSlot = oldExtra.openOrdersSlot;
+              newExtra.verifiedSlot = update.slot;
+              newExtra.verifiedAt = oldExtra.verifiedAt;
+              delete newExtra.unverifiedReason;
+            }
+          } else {
+            newExtra.openOrdersVerified = false;
+            newExtra.unverifiedReason = oldExtra.unverifiedReason || 'UNVERIFIED';
+          }
+        }
       }
 
       this.stateCache.setPoolState(decoded);
@@ -269,6 +319,68 @@ export class ArbitrageScanner {
         this.evaluateAffectedRoutes(update.key, update.monotonicReceiptTime);
       }
     }
+  }
+
+  private processOpenOrdersAccountUpdate(update: QueuedAccountUpdate): void {
+    const poolId = this.openOrdersToPool.get(update.key);
+    if (!poolId) return;
+
+    const pool = this.stateCache.getPoolState(poolId);
+    if (!pool || pool.dex !== 'RAYDIUM_AMM' || !pool.extraData) return;
+
+    const extra = pool.extraData as any;
+    if (update.data.length < 3228) {
+      extra.openOrdersVerified = false;
+      extra.unverifiedReason = 'OPENORDERS_LAYOUT_INVALID';
+      this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_LAYOUT_INVALID');
+      this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+      return;
+    }
+
+    const market = new PublicKey(update.data.subarray(13, 45)).toBase58();
+    const authority = new PublicKey(update.data.subarray(45, 77)).toBase58();
+
+    if (market !== extra.marketId) {
+      extra.openOrdersVerified = false;
+      extra.unverifiedReason = 'OPENORDERS_MARKET_MISMATCH';
+      this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_MARKET_MISMATCH');
+      this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+      return;
+    }
+
+    const expectedAuthority = '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
+    if (authority !== expectedAuthority) {
+      extra.openOrdersVerified = false;
+      extra.unverifiedReason = 'OPENORDERS_AUTHORITY_MISMATCH';
+      this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_AUTHORITY_MISMATCH');
+      this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+      return;
+    }
+
+    const slotGap = Math.abs(update.slot - pool.slot);
+    if (slotGap > this.config.MAX_SLOT_GAP) {
+      extra.openOrdersVerified = false;
+      extra.unverifiedReason = 'SLOT_MISMATCH';
+      this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'SLOT_MISMATCH');
+      this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+      return;
+    }
+
+    const baseTokenTotal = update.data.readBigUInt64LE(85);
+    const quoteTokenTotal = update.data.readBigUInt64LE(101);
+
+    extra.openOrdersVerified = true;
+    extra.openOrdersBaseTokenTotal = baseTokenTotal.toString();
+    extra.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
+    extra.openOrdersSlot = update.slot;
+    extra.verifiedSlot = update.slot;
+    extra.verifiedAt = update.receivedAtMs;
+    delete extra.unverifiedReason;
+
+    this.poolRegistry.updatePoolVerification(poolId, 'VERIFIED_DIRECT');
+    this.routeIndex.updatePoolStatus(poolId, 'VERIFIED_DIRECT');
+
+    this.evaluateAffectedRoutes(poolId, update.monotonicReceiptTime);
   }
 
   private processVaultAccountUpdate(update: QueuedAccountUpdate): void {
@@ -356,8 +468,6 @@ export class ArbitrageScanner {
 
     this.quotesProducedCount += sizerResult.evaluatedSizesCount * route.legs.length;
 
-    if (sizerResult.optimalQuotes.length < 2) return;
-
     // Profit validation & audit metrics
     this.auditMetrics.totalEvaluated++;
     if (route.cycleType === '3_LEG') {
@@ -369,6 +479,20 @@ export class ArbitrageScanner {
       this.auditMetrics.intraDexEvaluated = (this.auditMetrics.intraDexEvaluated || 0) + 1;
     } else {
       this.auditMetrics.interDexEvaluated = (this.auditMetrics.interDexEvaluated || 0) + 1;
+    }
+
+    if (sizerResult.optimalQuotes.length < 2) {
+      this.rejectedCount++;
+      this.auditMetrics.rejectedRoutes++;
+      const reason = (sizerResult.allEvaluations[0]?.rejectionReason || 'INSUFFICIENT_LIQUIDITY') as RejectionReasonCode;
+      this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
+      if (reason === 'QUOTE_UNVERIFIED' || reason === 'MISSING_TICK_DATA' || reason === 'TICK_BOUNDARY_EXCEEDED') {
+        this.auditMetrics.quoteValidationFailures++;
+      }
+      if (reason === 'UNSUPPORTED_ROUTE') {
+        this.auditMetrics.unsupportedRoutes++;
+      }
+      return;
     }
 
     const validationStart = performance.now();
@@ -617,6 +741,7 @@ export class ArbitrageScanner {
           const ooStart = performance.now();
           const ooRes = await this.rpc.getMultipleAccountsAndContext(openOrdersToFetch.map(o => o.pubkey));
           this.latencyTracker.recordRpcLatency(performance.now() - ooStart);
+          const ooSlot = ooRes.slot;
           const ooAccounts = ooRes.value;
 
           for (let i = 0; i < openOrdersToFetch.length; i++) {
@@ -625,27 +750,68 @@ export class ArbitrageScanner {
             const pool = decodedPools[ooInfo.poolIndex];
             if (!pool) continue;
 
-            if (acc && acc.data && acc.data.length >= 3228) {
-              const ownerStr = acc.owner ? acc.owner.toBase58() : '';
-              if (ownerStr === ooInfo.expectedOwner || ownerStr === 'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX') {
-                const baseTokenTotal = acc.data.readBigUInt64LE(85);
-                const quoteTokenTotal = acc.data.readBigUInt64LE(101);
-                if (pool.extraData) {
-                  pool.extraData.openOrdersVerified = true;
-                  pool.extraData.openOrdersBaseTokenTotal = baseTokenTotal.toString();
-                  pool.extraData.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
-                }
-              } else {
-                if (pool.extraData) {
-                  pool.extraData.openOrdersVerified = false;
-                  pool.extraData.unverifiedReason = 'OPENORDERS_OWNER_MISMATCH';
-                }
-              }
+            const extra = pool.extraData as any;
+            let isVerified = false;
+            let blockerReason = 'QUOTE_UNVERIFIED';
+
+            if (!acc || !acc.data || acc.data.length < 3228) {
+              blockerReason = 'OPENORDERS_LAYOUT_INVALID';
             } else {
-              if (pool.extraData) {
-                pool.extraData.openOrdersVerified = false;
-                pool.extraData.unverifiedReason = 'OPENORDERS_LAYOUT_INVALID';
+              const ownerStr = acc.owner ? acc.owner.toBase58() : '';
+              const market = new PublicKey(acc.data.subarray(13, 45)).toBase58();
+              const authority = new PublicKey(acc.data.subarray(45, 77)).toBase58();
+              const expectedAuthority = '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
+
+              if (ownerStr !== ooInfo.expectedOwner && ownerStr !== 'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX') {
+                blockerReason = 'OPENORDERS_OWNER_MISMATCH';
+              } else if (market !== extra?.marketId) {
+                blockerReason = 'OPENORDERS_MARKET_MISMATCH';
+              } else if (authority !== expectedAuthority) {
+                blockerReason = 'OPENORDERS_AUTHORITY_MISMATCH';
+              } else {
+                // Check snapshot slot consistency between pool and OpenOrders
+                const slotGap = Math.abs(snapshotSlot - ooSlot);
+                if (slotGap > this.config.MAX_SLOT_GAP) {
+                  blockerReason = 'SLOT_MISMATCH';
+                } else {
+                  isVerified = true;
+                  const baseTokenTotal = acc.data.readBigUInt64LE(85);
+                  const quoteTokenTotal = acc.data.readBigUInt64LE(101);
+                  extra.openOrdersVerified = true;
+                  extra.openOrdersBaseTokenTotal = baseTokenTotal.toString();
+                  extra.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
+                  extra.openOrdersSlot = ooSlot;
+                  extra.verifiedSlot = snapshotSlot;
+                  extra.verifiedAt = Date.now();
+                  delete extra.unverifiedReason;
+
+                  this.poolRegistry.updatePoolVerification(pool.id, 'VERIFIED_DIRECT');
+                  this.routeIndex.updatePoolStatus(pool.id, 'VERIFIED_DIRECT');
+                }
               }
+            }
+
+            if (!isVerified) {
+              extra.openOrdersVerified = false;
+              extra.unverifiedReason = blockerReason;
+              this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', blockerReason);
+              this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+            }
+
+            // Map and subscribe to OpenOrders account for real-time WebSocket state maintenance
+            const ooPubkeyStr = ooInfo.pubkey.toBase58();
+            if (!this.openOrdersToPool.has(ooPubkeyStr)) {
+              this.openOrdersToPool.set(ooPubkeyStr, pool.id);
+              this.ws.subscribeAccount(ooPubkeyStr, (buf, s, rxTime, monoTime) => {
+                this.enqueueUpdate({
+                  type: 'OPENORDERS_ACCOUNT',
+                  key: ooPubkeyStr,
+                  data: buf,
+                  slot: s,
+                  receivedAtMs: rxTime || Date.now(),
+                  monotonicReceiptTime: monoTime || performance.now()
+                });
+              });
             }
           }
         } catch {
@@ -654,7 +820,9 @@ export class ArbitrageScanner {
             const pool = decodedPools[ooInfo.poolIndex];
             if (pool && pool.extraData) {
               pool.extraData.openOrdersVerified = false;
-              pool.extraData.unverifiedReason = 'BLOCKED_RPC_TIMEOUT';
+              pool.extraData.unverifiedReason = 'RPC_TIMEOUT';
+              this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'RPC_TIMEOUT');
+              this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
             }
           }
         }
@@ -759,6 +927,10 @@ export class ArbitrageScanner {
 
   public getRouteIndex(): RouteIndex {
     return this.routeIndex;
+  }
+
+  public getPoolRegistry(): PoolRegistry {
+    return this.poolRegistry;
   }
 
   public getRepository(): ArbitrageRepository {

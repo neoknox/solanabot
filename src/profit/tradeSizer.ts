@@ -82,6 +82,15 @@ export class TradeSizer {
 
       const quote = leg.adapter.quoteExactInput(leg.pool, leg.inputMint, currentInputUnits);
       if (!quote || quote.outAmount <= 0n) {
+        let rejectionReason: string = 'QUOTE_UNVERIFIED';
+        if (leg.pool.dex === 'ORCA_WHIRLPOOL') {
+          rejectionReason = 'TICK_BOUNDARY_EXCEEDED';
+        } else if (leg.pool.dex === 'METEORA_DLMM') {
+          rejectionReason = 'UNSUPPORTED_ROUTE';
+        } else if (leg.pool.dex === 'RAYDIUM_AMM') {
+          rejectionReason = (leg.pool.extraData as any)?.unverifiedReason || 'QUOTE_UNVERIFIED';
+        }
+
         return {
           sizeUSDC,
           inputUnits,
@@ -91,7 +100,7 @@ export class TradeSizer {
           conservativeNetUSDC: new Decimal(-999),
           quotes: [],
           isViable: false,
-          rejectionReason: 'QUOTE_UNVERIFIED'
+          rejectionReason
         };
       }
 

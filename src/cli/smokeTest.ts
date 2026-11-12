@@ -53,7 +53,7 @@ async function main() {
 
   await scanner.start();
 
-  const scanDurationSec = process.env.SCAN_DURATION_SEC ? parseInt(process.env.SCAN_DURATION_SEC, 10) : 45;
+  const scanDurationSec = process.env.SCAN_DURATION_SEC ? parseInt(process.env.SCAN_DURATION_SEC, 10) : 60;
   console.log(`Running sustained read-only scan against Solana mainnet for ${scanDurationSec} seconds...\n`);
   await new Promise(resolve => setTimeout(resolve, scanDurationSec * 1000));
 
@@ -74,6 +74,9 @@ async function main() {
   console.log(`Final Solana Slot:              ${health.currentSlot}`);
   console.log(`WebSocket Feed Status:          ${health.connectedWs ? 'CONNECTED' : 'DISCONNECTED'}`);
   console.log(`Active Monitored Pools:         ${health.activePoolCount}`);
+  console.log(`Configured Routes in Index:     ${routeIndex.getRouteCount()}`);
+  console.log(`  - Verified Runtime Routes:    ${routeIndex.getVerifiedDirectRouteCount()}`);
+  console.log(`  - Blocked Routes (Data/Gate): ${routeIndex.getBlockedRouteCount()}`);
   console.log(`Total Routes Evaluated:         ${audit.totalEvaluated}`);
   console.log(`  - 2-Leg Cycles Evaluated:     ${audit.twoLegEvaluated || 0}`);
   console.log(`  - 3-Leg Cycles Evaluated:     ${audit.threeLegEvaluated || 0}`);
@@ -87,6 +90,12 @@ async function main() {
   console.log(`  - INDICATIVE_ONLY:            ${audit.unsupportedRoutes + audit.quoteValidationFailures}`);
   console.log(`  - INVALID / REJECTED:         ${audit.rejectedRoutes}`);
   console.log(`Rejection Reasons Breakdown:    ${JSON.stringify(health.rejectionBreakdown, null, 2)}`);
+
+  console.log('\n--- RUNTIME POOL VERIFICATION STATUS ---');
+  const poolReg = scanner.getPoolRegistry();
+  for (const pool of poolReg.getAllPools()) {
+    console.log(`  [${pool.verificationStatus || 'QUOTE_UNVERIFIED'}] ${pool.dex} (${pool.id}) ${pool.blockerReason ? `| Blocker: ${pool.blockerReason}` : '| RUNTIME_VERIFIED'}`);
+  }
 
   console.log('\n--- CONTINUOUS OPPORTUNITY LIFECYCLE STATS ---');
   const lifecycle = scanner.getOpportunityTracker().getLifecycleStats();

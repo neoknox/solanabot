@@ -137,7 +137,7 @@ export class RaydiumAmmAdapter implements DexAdapter {
 
     if (!isOpenOrdersVerified) {
       (quote as any).isUnverified = true;
-      (quote as any).unverifiedReason = 'BLOCKED_RPC_TIMEOUT';
+      (quote as any).unverifiedReason = (extra as any)?.unverifiedReason || 'BLOCKED_RPC_TIMEOUT';
     }
 
     return quote;

@@ -29,7 +29,7 @@ export class PoolRegistry {
   }
 
   private registerDefaultPools(): void {
-    // 1. Raydium AMM V4 (Standard SOL/USDC - marked QUOTE_UNVERIFIED due to BLOCKED_RPC_TIMEOUT)
+    // 1. Raydium AMM V4 (Standard SOL/USDC - dynamic runtime verification)
     this.register({
       id: '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2',
       dex: 'RAYDIUM_AMM',
@@ -38,9 +38,9 @@ export class PoolRegistry {
       tokenBMint: CANONICAL_USDC_MINT,
       feeBps: 25,
       initialLiquidityUsd: 15000000,
-      description: 'Raydium AMM V4 Main SOL/USDC Pool (QUOTE_UNVERIFIED: OpenOrders BLOCKED_RPC_TIMEOUT)',
+      description: 'Raydium AMM V4 Main SOL/USDC Pool',
       verificationStatus: 'QUOTE_UNVERIFIED',
-      blockerReason: 'BLOCKED_RPC_TIMEOUT'
+      blockerReason: 'PENDING_RUNTIME_VERIFICATION'
     });
 
     // 2. Orca Whirlpool (0.04% / 4 bps primary SOL/USDC Whirlpool, verified on-chain)
@@ -97,7 +97,7 @@ export class PoolRegistry {
       verificationStatus: 'VERIFIED_DIRECT'
     });
 
-    // 6. Raydium AMM V4 WSOL/USDT (marked QUOTE_UNVERIFIED due to BLOCKED_RPC_TIMEOUT)
+    // 6. Raydium AMM V4 WSOL/USDT (dynamic runtime verification)
     this.register({
       id: '7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX',
       dex: 'RAYDIUM_AMM',
@@ -106,9 +106,9 @@ export class PoolRegistry {
       tokenBMint: CANONICAL_USDT_MINT,
       feeBps: 25,
       initialLiquidityUsd: 8500000,
-      description: 'Raydium AMM V4 Main SOL/USDT Pool (QUOTE_UNVERIFIED: OpenOrders BLOCKED_RPC_TIMEOUT)',
+      description: 'Raydium AMM V4 Main SOL/USDT Pool',
       verificationStatus: 'QUOTE_UNVERIFIED',
-      blockerReason: 'BLOCKED_RPC_TIMEOUT'
+      blockerReason: 'PENDING_RUNTIME_VERIFICATION'
     });
 
     // 7. Raydium CLMM (Concentrated Liquidity, verified on-chain)
@@ -154,5 +154,18 @@ export class PoolRegistry {
 
   public getPoolsByDex(dex: DexType): PoolConfig[] {
     return Array.from(this.pools.values()).filter(p => p.dex === dex);
+  }
+
+  public updatePoolVerification(id: string, status: VerificationStatus, blockerReason?: string): void {
+    const pool = this.pools.get(id);
+    if (pool) {
+      pool.verificationStatus = status;
+      pool.blockerReason = blockerReason;
+    }
+  }
+
+  public isPoolVerified(id: string): boolean {
+    const pool = this.pools.get(id);
+    return pool?.verificationStatus === 'VERIFIED_DIRECT';
   }
 }
