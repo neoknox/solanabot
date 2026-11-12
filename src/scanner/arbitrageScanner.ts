@@ -25,6 +25,9 @@ import { RouteIndex, IndexedDirectedRoute } from './routeIndex.js';
 import { BoundedEventQueue, QueuedAccountUpdate } from './eventQueue.js';
 import { LatencyTracker, LatencyReport } from '../telemetry/latencyTracker.js';
 import { TradeSizer, QuoterLeg } from '../profit/tradeSizer.js';
+import { CompetitorAnalyzer } from '../competition/analyzer.js';
+import { CompetitionScorer } from '../profit/competitionScorer.js';
+import { OpportunityTracker } from './opportunityTracker.js';
 
 export type CandidateListener = (candidate: ArbitrageCandidate) => void;
 
@@ -39,6 +42,11 @@ export class ArbitrageScanner {
   private calculator: ArbitrageProfitCalculator;
   private repository: ArbitrageRepository;
   private tradeSizer: TradeSizer;
+
+  // Competition-Aware Intelligence Components
+  private competitorAnalyzer: CompetitorAnalyzer;
+  private competitionScorer: CompetitionScorer;
+  private opportunityTracker: OpportunityTracker;
 
   // Performance Hardening & Routing Components
   private routeIndex: RouteIndex;
@@ -74,7 +82,9 @@ export class ArbitrageScanner {
     shadowQualifiedCount: 0,
     survivalCheckedCount: 0,
     survivalSurvivedCount: 0,
-    survivalDecayedCount: 0
+    survivalDecayedCount: 0,
+    competitorTxsAnalyzed: 0,
+    averageCompetitionScore: 0
   };
 
   private currentSolPriceUSDC = new Decimal(165.0);
@@ -97,6 +107,11 @@ export class ArbitrageScanner {
     this.calculator = new ArbitrageProfitCalculator(config);
     this.repository = customRepo || new ArbitrageRepository(config);
     this.tradeSizer = new TradeSizer(config);
+
+    // Initialize Competition-Aware Intelligence Components
+    this.competitorAnalyzer = new CompetitorAnalyzer(this.rpc);
+    this.competitionScorer = new CompetitionScorer();
+    this.opportunityTracker = new OpportunityTracker();
 
     // Initialize Route Index & Performance Pipelines
     this.routeIndex = new RouteIndex(this.poolRegistry.getAllPools());
@@ -158,7 +173,7 @@ export class ArbitrageScanner {
       });
     }
 
-    // 3. High-frequency background drain loop
+    // 4. High-frequency background drain loop
     const scanInterval = this.config.SCAN_INTERVAL_MS || 500;
     this.scanTimer = setInterval(async () => {
       if (!this.isRunning) return;
@@ -182,7 +197,6 @@ export class ArbitrageScanner {
 
   private enqueueUpdate(update: QueuedAccountUpdate): void {
     this.eventQueue.enqueue(update);
-    // Trigger drain asynchronously without blocking WebSocket read loop
     if (!this.isDrainingQueue) {
       setImmediate(() => this.drainEventQueue());
     }
@@ -362,6 +376,17 @@ export class ArbitrageScanner {
       wsConnected,
       solPriceTimestamp: this.lastSolPriceTime
     });
+
+    // Competition-Aware Opportunity Scoring (Section 4)
+    const poolMetrics = route.legs.map(l => this.competitorAnalyzer.getCachedMetrics(l.poolId));
+    const scoreResult = this.competitionScorer.scoreCandidate(candidate, poolMetrics);
+    candidate.competitionScore = scoreResult.score;
+    candidate.executionProbability = scoreResult.executionProbability;
+    candidate.scoringBreakdown = scoreResult.breakdown;
+
+    // Continuous Opportunity Duration Tracking (Section 5)
+    this.opportunityTracker.trackOpportunity(candidate, currentSlot);
+
     const validationDurationUs = (performance.now() - validationStart) * 1000;
     this.latencyTracker.recordValidationDuration(validationDurationUs);
 
@@ -634,7 +659,12 @@ export class ArbitrageScanner {
   }
 
   public getAuditMetrics(): AuditMetrics {
-    return { ...this.auditMetrics };
+    const lifecycleStats = this.opportunityTracker.getLifecycleStats();
+    return {
+      ...this.auditMetrics,
+      maxOpportunityVisibilityMs: lifecycleStats.maxVisibilityDurationMs,
+      meanOpportunityVisibilityMs: lifecycleStats.meanVisibilityDurationMs
+    };
   }
 
   public getLatencyReport(): LatencyReport {
@@ -651,6 +681,18 @@ export class ArbitrageScanner {
 
   public getRepository(): ArbitrageRepository {
     return this.repository;
+  }
+
+  public getCompetitorAnalyzer(): CompetitorAnalyzer {
+    return this.competitorAnalyzer;
+  }
+
+  public getCompetitionScorer(): CompetitionScorer {
+    return this.competitionScorer;
+  }
+
+  public getOpportunityTracker(): OpportunityTracker {
+    return this.opportunityTracker;
   }
 
   public stop(): void {

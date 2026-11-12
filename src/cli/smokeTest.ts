@@ -85,6 +85,31 @@ async function main() {
   console.log(`  - INVALID / REJECTED:         ${audit.rejectedRoutes}`);
   console.log(`Rejection Reasons Breakdown:    ${JSON.stringify(health.rejectionBreakdown, null, 2)}`);
 
+  console.log('\n--- CONTINUOUS OPPORTUNITY LIFECYCLE STATS ---');
+  const lifecycle = scanner.getOpportunityTracker().getLifecycleStats();
+  console.log(`Total Tracked Opportunities:    ${lifecycle.totalTrackedOpportunities}`);
+  console.log(`Active Opportunities:           ${lifecycle.activeOpportunitiesCount}`);
+  console.log(`Mean Visibility Duration:       ${lifecycle.meanVisibilityDurationMs} ms`);
+  console.log(`Max Visibility Duration:        ${lifecycle.maxVisibilityDurationMs} ms`);
+  console.log(`p50 Visibility Duration:        ${lifecycle.p50DurationMs} ms`);
+  console.log(`p95 Visibility Duration:        ${lifecycle.p95DurationMs} ms`);
+
+  console.log('\n--- COMPETITOR ACTIVITY & CONTENTION INTELLIGENCE ---');
+  const monitoredPools = [
+    { name: 'Orca Whirlpool (WSOL/USDC 4bps)', id: 'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE' },
+    { name: 'Orca Whirlpool (WSOL/USDC 2bps)', id: 'FpCMFDFGYotvufJ7HrFHCRbmjyWKsCP2vKemFYDxRejB' },
+    { name: 'Raydium AMM V4 (WSOL/USDC)', id: '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2' },
+    { name: 'Orca Whirlpool (USDC/USDT 1bps)', id: '4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4' },
+    { name: 'Raydium AMM V4 (WSOL/USDT)', id: '7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX' }
+  ];
+  for (const p of monitoredPools) {
+    const m = scanner.getCompetitorAnalyzer().getCachedMetrics(p.id);
+    console.log(`  Pool: ${p.name}`);
+    console.log(`    Contention: ${m.contentionLevel} | Historical Competition Score: ${m.historicalCompetitionScore}/100`);
+    console.log(`    Tx Analyzed: ${m.totalObservedTx} (Failed: ${m.failedTxCount}) | Est. Arb Freq: ${m.arbitrageLoopFrequencyPerHour}/hr`);
+    console.log(`    Fee p50: ${m.feeDistributionLamports.p50} lamports | Priority Fee p50: ${m.priorityFeeStatsMicroLamports.p50} μL`);
+  }
+
   console.log('\n--- LATENCY INSTRUMENTATION BENCHMARKS ---');
   const fmtUs = (stats: typeof latency.detectionToDecisionUs) =>
     `p50: ${(stats.p50).toFixed(1)}μs | p95: ${(stats.p95).toFixed(1)}μs | p99: ${(stats.p99).toFixed(1)}μs | max: ${(stats.max).toFixed(1)}μs | mean: ${(stats.mean).toFixed(1)}μs (n=${stats.count})`;

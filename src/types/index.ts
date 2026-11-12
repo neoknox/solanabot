@@ -1,5 +1,5 @@
 /**
- * Core Types and Enums for Solana Arbitrage Scanner (Phase 1.2: Competitive Opportunity Intelligence)
+ * Core Types and Enums for Solana Arbitrage Scanner (Phase 1.2: Competition-Aware Opportunity Engine)
  * Strictly READ-ONLY. No wallet, no signer, no transaction broadcast interfaces.
  */
 
@@ -48,6 +48,46 @@ export type OpportunityQualityLabel =
 export type SurvivalStatus = 'SURVIVED' | 'DECAYED' | 'UNCHECKED';
 
 export type TradeSizingMethod = 'COARSE_GRID' | 'COARSE_TO_FINE';
+
+export type ExecutionProbability = 'UNCALIBRATED';
+
+export type ContentionLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'EXTREME';
+
+export interface FeeDistribution {
+  min: number;
+  p50: number;
+  p95: number;
+  max: number;
+  mean: number;
+}
+
+export interface CompetitorActivityMetrics {
+  poolId: string;
+  totalObservedTx: number;
+  successfulTxCount: number;
+  failedTxCount: number;
+  failureRate: number;
+  feeDistributionLamports: FeeDistribution;
+  priorityFeeStatsMicroLamports: FeeDistribution;
+  jitoTipCount: number;
+  jitoTipDistributionLamports: { min: number; p50: number; p95: number; max: number };
+  contentionLevel: ContentionLevel;
+  historicalCompetitionScore: number; // 0 to 100
+  arbitrageLoopFrequencyPerHour: number;
+  sampleWindowSeconds: number;
+  lastAnalyzedSlot: number;
+  timestamp: number;
+}
+
+export interface ScoringBreakdown {
+  profitabilityScore: number;     // 0 to 35 pts based on conservative net profit
+  capitalEfficiencyScore: number; // 0 to 20 pts based on net profit / trade size
+  quoteFreshnessScore: number;    // 0 to 15 pts based on quote age & slot lag
+  competitionPenalty: number;     // 0 to 20 pts deducted for high pool contention
+  complexityScore: number;        // 0 to 10 pts based on route leg count & cross-DEX overhead
+  totalScore: number;             // 0 to 100 overall competition score
+  rationale: string[];
+}
 
 export type OpportunityStatus =
   | 'OBSERVED'                    // Pool state updated, not a completed quote
@@ -184,6 +224,13 @@ export interface ArbitrageCandidate {
   slotGap: number;
   quoteAgeMs: number;
   survivalStatus?: SurvivalStatus;
+
+  // Phase 1.2 Competition-Aware Intelligence Additions
+  competitionScore?: number;          // 0 to 100 deterministic competition & quality score
+  executionProbability?: ExecutionProbability; // Strictly 'UNCALIBRATED' prior to live execution
+  visibilityDurationMs?: number;      // Continuous observation duration across snapshots
+  observedSnapshotsCount?: number;    // Number of sequential snapshots where opportunity was visible
+  scoringBreakdown?: ScoringBreakdown;// Itemized deterministic score explanation
 }
 
 export interface ScanHealthStatus {
@@ -217,4 +264,10 @@ export interface AuditMetrics {
   survivalCheckedCount?: number;
   survivalSurvivedCount?: number;
   survivalDecayedCount?: number;
+
+  // Competition intelligence metrics
+  competitorTxsAnalyzed?: number;
+  averageCompetitionScore?: number;
+  maxOpportunityVisibilityMs?: number;
+  meanOpportunityVisibilityMs?: number;
 }

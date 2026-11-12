@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import { AppConfig } from '../config/index.js';
-import { ArbitrageCandidate, AuditMetrics } from '../types/index.js';
+import { ArbitrageCandidate, AuditMetrics, CompetitorActivityMetrics } from '../types/index.js';
 import { initDatabase } from './db.js';
 
 export interface StorageSummaryStats {
@@ -42,9 +42,11 @@ export class ArbitrageRepository {
         leg2_pool_id, leg2_dex, leg2_quote_source,
         costs_total_usdc, sol_price_usdc, recoverable_deposit_usdc,
         consumed_cost_usdc, potential_loss_failure_usdc, survival_status,
+        competition_score, execution_probability, visibility_duration_ms,
+        observed_snapshots_count, scoring_breakdown_json,
         costs_breakdown_json, quote_age_ms, slot_gap, timestamp
       ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
     `);
 
@@ -96,6 +98,11 @@ export class ArbitrageRepository {
         candidate.consumedCostUSDC || candidate.costs.totalCostsUSDC,
         candidate.potentialLossOnFailureUSDC || '0.000000',
         candidate.survivalStatus || 'UNCHECKED',
+        candidate.competitionScore || 0,
+        candidate.executionProbability || 'UNCALIBRATED',
+        candidate.visibilityDurationMs || 0,
+        candidate.observedSnapshotsCount || 1,
+        JSON.stringify(candidate.scoringBreakdown || {}),
         JSON.stringify(candidate.costs),
         candidate.quoteAgeMs,
         candidate.slotGap,
@@ -149,6 +156,71 @@ export class ArbitrageRepository {
     } catch {}
   }
 
+  public saveCompetitorMetrics(metrics: CompetitorActivityMetrics): void {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO competitor_metrics (
+        pool_id, total_observed_tx, successful_tx_count, failed_tx_count,
+        failure_rate, median_fee_lamports, p95_priority_fee, jito_tip_count,
+        contention_level, competition_score, sample_window_sec, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    try {
+      stmt.run(
+        metrics.poolId,
+        metrics.totalObservedTx,
+        metrics.successfulTxCount,
+        metrics.failedTxCount,
+        metrics.failureRate,
+        metrics.feeDistributionLamports.p50,
+        metrics.priorityFeeStatsMicroLamports.p95,
+        metrics.jitoTipCount,
+        metrics.contentionLevel,
+        metrics.historicalCompetitionScore,
+        metrics.sampleWindowSeconds,
+        Date.now()
+      );
+    } catch {}
+  }
+
+  public getCompetitorMetrics(poolId: string): CompetitorActivityMetrics | null {
+    const row = this.db.prepare(`
+      SELECT * FROM competitor_metrics WHERE pool_id = ?
+    `).get(poolId) as Record<string, unknown> | undefined;
+
+    if (!row) return null;
+
+    return {
+      poolId: String(row.pool_id),
+      totalObservedTx: Number(row.total_observed_tx),
+      successfulTxCount: Number(row.successful_tx_count),
+      failedTxCount: Number(row.failed_tx_count),
+      failureRate: Number(row.failure_rate),
+      feeDistributionLamports: {
+        min: 5000,
+        p50: Number(row.median_fee_lamports),
+        p95: Number(row.median_fee_lamports) * 2,
+        max: Number(row.median_fee_lamports) * 3,
+        mean: Number(row.median_fee_lamports)
+      },
+      priorityFeeStatsMicroLamports: {
+        min: 0,
+        p50: Math.round(Number(row.p95_priority_fee) / 2),
+        p95: Number(row.p95_priority_fee),
+        max: Number(row.p95_priority_fee) * 2,
+        mean: Math.round(Number(row.p95_priority_fee) * 0.6)
+      },
+      jitoTipCount: Number(row.jito_tip_count),
+      jitoTipDistributionLamports: { min: 0, p50: 0, p95: 0, max: 0 },
+      contentionLevel: row.contention_level as any,
+      historicalCompetitionScore: Number(row.competition_score),
+      arbitrageLoopFrequencyPerHour: 0,
+      sampleWindowSeconds: Number(row.sample_window_sec),
+      lastAnalyzedSlot: 0,
+      timestamp: Number(row.timestamp)
+    };
+  }
+
   public recordAuditMetrics(metrics: AuditMetrics): void {
     const runId = `AUDIT-${Date.now()}`;
     const stmt = this.db.prepare(`
@@ -157,8 +229,9 @@ export class ArbitrageRepository {
         candidates_gross_positive, candidates_conservative_qualified,
         rejected_routes, quote_validation_failures, unsupported_routes,
         stale_data_rejections, two_leg_evaluated, three_leg_evaluated,
-        intra_dex_evaluated, inter_dex_evaluated, timestamp
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        intra_dex_evaluated, inter_dex_evaluated, competitor_txs_analyzed,
+        average_competition_score, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     try {
@@ -176,6 +249,8 @@ export class ArbitrageRepository {
         metrics.threeLegEvaluated || 0,
         metrics.intraDexEvaluated || 0,
         metrics.interDexEvaluated || 0,
+        metrics.competitorTxsAnalyzed || 0,
+        metrics.averageCompetitionScore || 0,
         Date.now()
       );
     } catch {}
@@ -200,7 +275,9 @@ export class ArbitrageRepository {
       twoLegEvaluated: Number(row.two_leg_evaluated || 0),
       threeLegEvaluated: Number(row.three_leg_evaluated || 0),
       intraDexEvaluated: Number(row.intra_dex_evaluated || 0),
-      interDexEvaluated: Number(row.inter_dex_evaluated || 0)
+      interDexEvaluated: Number(row.inter_dex_evaluated || 0),
+      competitorTxsAnalyzed: Number(row.competitor_txs_analyzed || 0),
+      averageCompetitionScore: Number(row.average_competition_score || 0)
     };
   }
 
@@ -288,6 +365,11 @@ export class ArbitrageRepository {
       consumedCostUSDC: String(r.consumed_cost_usdc || '0'),
       potentialLossOnFailureUSDC: String(r.potential_loss_failure_usdc || '0'),
       survivalStatus: (r.survival_status as any) || 'UNCHECKED',
+      competitionScore: Number(r.competition_score || 0),
+      executionProbability: (r.execution_probability as any) || 'UNCALIBRATED',
+      visibilityDurationMs: Number(r.visibility_duration_ms || 0),
+      observedSnapshotsCount: Number(r.observed_snapshots_count || 1),
+      scoringBreakdown: JSON.parse(String(r.scoring_breakdown_json || '{}')),
       inputAmountUSDC: BigInt(String(r.input_amount_usdc)),
       leg1ExpectedOutWSOL: BigInt(String(r.leg1_expected_out_wsol)),
       leg1ConservativeOutWSOL: BigInt(String(r.leg1_conservative_out_wsol)),
@@ -340,6 +422,7 @@ export class ArbitrageRepository {
       SELECT 
         candidate_id, route_name, cycle_type, quality_label, optimal_size_usdc,
         input_amount_usdc, expected_net_usdc, min_conservative_net_usdc, status,
+        competition_score, execution_probability, visibility_duration_ms,
         leg1_dex, leg1_pool_id, leg2_dex, leg2_pool_id,
         costs_total_usdc, sol_price_usdc, potential_loss_failure_usdc,
         quote_age_ms, slot_gap,

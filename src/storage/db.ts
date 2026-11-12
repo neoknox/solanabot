@@ -43,6 +43,11 @@ export function initDatabase(config: AppConfig): Database.Database {
       consumed_cost_usdc TEXT DEFAULT '0',
       potential_loss_failure_usdc TEXT DEFAULT '0',
       survival_status TEXT DEFAULT 'UNCHECKED',
+      competition_score REAL DEFAULT 0,
+      execution_probability TEXT DEFAULT 'UNCALIBRATED',
+      visibility_duration_ms INTEGER DEFAULT 0,
+      observed_snapshots_count INTEGER DEFAULT 1,
+      scoring_breakdown_json TEXT DEFAULT '{}',
       costs_breakdown_json TEXT NOT NULL,
       quote_age_ms INTEGER NOT NULL,
       slot_gap INTEGER NOT NULL,
@@ -56,6 +61,21 @@ export function initDatabase(config: AppConfig): Database.Database {
       latency_ms INTEGER,
       slot INTEGER,
       message TEXT,
+      timestamp INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS competitor_metrics (
+      pool_id TEXT PRIMARY KEY,
+      total_observed_tx INTEGER NOT NULL,
+      successful_tx_count INTEGER NOT NULL,
+      failed_tx_count INTEGER NOT NULL,
+      failure_rate REAL NOT NULL,
+      median_fee_lamports INTEGER NOT NULL,
+      p95_priority_fee INTEGER NOT NULL,
+      jito_tip_count INTEGER NOT NULL,
+      contention_level TEXT NOT NULL,
+      competition_score INTEGER NOT NULL,
+      sample_window_sec INTEGER NOT NULL,
       timestamp INTEGER NOT NULL
     );
 
@@ -73,11 +93,13 @@ export function initDatabase(config: AppConfig): Database.Database {
       three_leg_evaluated INTEGER DEFAULT 0,
       intra_dex_evaluated INTEGER DEFAULT 0,
       inter_dex_evaluated INTEGER DEFAULT 0,
+      competitor_txs_analyzed INTEGER DEFAULT 0,
+      average_competition_score REAL DEFAULT 0,
       timestamp INTEGER NOT NULL
     );
   `);
 
-  // Safe incremental column migration if table already existed from Phase 1 / 1.1
+  // Safe incremental column migration if table already existed from earlier phases
   const candidateColumns = db.prepare("PRAGMA table_info(candidates)").all() as Array<{ name: string }>;
   const colNames = new Set(candidateColumns.map(c => c.name));
   if (!colNames.has('cycle_type')) db.exec("ALTER TABLE candidates ADD COLUMN cycle_type TEXT DEFAULT '2_LEG'");
@@ -87,6 +109,11 @@ export function initDatabase(config: AppConfig): Database.Database {
   if (!colNames.has('consumed_cost_usdc')) db.exec("ALTER TABLE candidates ADD COLUMN consumed_cost_usdc TEXT DEFAULT '0'");
   if (!colNames.has('potential_loss_failure_usdc')) db.exec("ALTER TABLE candidates ADD COLUMN potential_loss_failure_usdc TEXT DEFAULT '0'");
   if (!colNames.has('survival_status')) db.exec("ALTER TABLE candidates ADD COLUMN survival_status TEXT DEFAULT 'UNCHECKED'");
+  if (!colNames.has('competition_score')) db.exec("ALTER TABLE candidates ADD COLUMN competition_score REAL DEFAULT 0");
+  if (!colNames.has('execution_probability')) db.exec("ALTER TABLE candidates ADD COLUMN execution_probability TEXT DEFAULT 'UNCALIBRATED'");
+  if (!colNames.has('visibility_duration_ms')) db.exec("ALTER TABLE candidates ADD COLUMN visibility_duration_ms INTEGER DEFAULT 0");
+  if (!colNames.has('observed_snapshots_count')) db.exec("ALTER TABLE candidates ADD COLUMN observed_snapshots_count INTEGER DEFAULT 1");
+  if (!colNames.has('scoring_breakdown_json')) db.exec("ALTER TABLE candidates ADD COLUMN scoring_breakdown_json TEXT DEFAULT '{}'");
 
   const auditColumns = db.prepare("PRAGMA table_info(audit_metrics)").all() as Array<{ name: string }>;
   const auditColNames = new Set(auditColumns.map(c => c.name));
@@ -94,6 +121,8 @@ export function initDatabase(config: AppConfig): Database.Database {
   if (!auditColNames.has('three_leg_evaluated')) db.exec("ALTER TABLE audit_metrics ADD COLUMN three_leg_evaluated INTEGER DEFAULT 0");
   if (!auditColNames.has('intra_dex_evaluated')) db.exec("ALTER TABLE audit_metrics ADD COLUMN intra_dex_evaluated INTEGER DEFAULT 0");
   if (!auditColNames.has('inter_dex_evaluated')) db.exec("ALTER TABLE audit_metrics ADD COLUMN inter_dex_evaluated INTEGER DEFAULT 0");
+  if (!auditColNames.has('competitor_txs_analyzed')) db.exec("ALTER TABLE audit_metrics ADD COLUMN competitor_txs_analyzed INTEGER DEFAULT 0");
+  if (!auditColNames.has('average_competition_score')) db.exec("ALTER TABLE audit_metrics ADD COLUMN average_competition_score REAL DEFAULT 0");
 
   // Create indexes after ensuring columns exist
   db.exec(`
