@@ -1,0 +1,41 @@
+{
+  "name": "solana-arbitrage-bot",
+  "version": "1.0.0",
+  "description": "Phase 1: Read-Only, Multi-DEX Solana Arbitrage Scanner",
+  "main": "dist/cli/index.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "scanner": "tsx src/cli/index.ts",
+    "report": "tsx src/cli/report.ts",
+    "export:csv": "tsx src/cli/exportCsv.ts",
+    "build": "tsc"
+  },
+  "keywords": [
+    "solana",
+    "arbitrage",
+    "dex",
+    "scanner",
+    "read-only"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.95.8",
+    "better-sqlite3": "^11.8.1",
+    "decimal.js": "^10.5.0",
+    "dotenv": "^16.4.7",
+    "ws": "^8.18.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.7",
+    "@types/ws": "^8.5.14",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.4"
+  }
+}
