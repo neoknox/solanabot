@@ -51,8 +51,9 @@ async function main() {
 
   await scanner.start();
 
-  console.log('Running competitive event-driven scan against Solana mainnet for 25 seconds...\n');
-  await new Promise(resolve => setTimeout(resolve, 25000));
+  const scanDurationSec = process.env.SCAN_DURATION_SEC ? parseInt(process.env.SCAN_DURATION_SEC, 10) : 45;
+  console.log(`Running sustained read-only scan against Solana mainnet for ${scanDurationSec} seconds...\n`);
+  await new Promise(resolve => setTimeout(resolve, scanDurationSec * 1000));
 
   const totalRunTimeMs = performance.now() - startTimeMs;
   const cpuEnd = process.cpuUsage(cpuStart);

@@ -76,14 +76,23 @@ export class SolanaRpcProvider {
   }
 
   public async getMultipleAccounts(pubkeys: PublicKey[]): Promise<(AccountInfo<Buffer> | null)[]> {
-    if (pubkeys.length === 0) return [];
+    const res = await this.getMultipleAccountsAndContext(pubkeys);
+    return res.value;
+  }
+
+  public async getMultipleAccountsAndContext(pubkeys: PublicKey[]): Promise<{ slot: number; value: (AccountInfo<Buffer> | null)[] }> {
+    if (pubkeys.length === 0) return { slot: 0, value: [] };
     await this.throttle();
     const start = Date.now();
     try {
       this.stats.requestsTotal++;
-      const accounts = await this.connection.getMultipleAccountsInfo(pubkeys, 'confirmed');
+      const res = await this.connection.getMultipleAccountsInfoAndContext(pubkeys, 'confirmed');
       this.stats.lastLatencyMs = Date.now() - start;
-      return accounts;
+      this.stats.lastSlot = res.context.slot;
+      return {
+        slot: res.context.slot,
+        value: res.value
+      };
     } catch (err: unknown) {
       this.stats.requestsFailed++;
       const message = err instanceof Error ? err.message : String(err);

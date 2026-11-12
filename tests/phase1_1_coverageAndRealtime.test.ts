@@ -71,7 +71,8 @@ describe('Phase 1.1 Audit: Real-Time Vault Streaming, 12-DEX Inventory, and Cost
     const model = new CostModel(config);
 
     const res = model.calculateCosts({
-      solPriceUSDC: new Decimal(125.0)
+      solPriceUSDC: new Decimal(125.0),
+      solPriceTimestamp: Date.now()
     });
 
     expect(res.isComplete).toBe(true);

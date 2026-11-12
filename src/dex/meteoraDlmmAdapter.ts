@@ -1,7 +1,10 @@
 import { PublicKey } from '@solana/web3.js';
+import Decimal from 'decimal.js';
 import { DexAdapter } from './types.js';
 import { DexType, PoolState, SwapQuote } from '../types/index.js';
 import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT } from '../config/index.js';
+
+Decimal.set({ precision: 50, rounding: Decimal.ROUND_DOWN });
 
 export class MeteoraDlmmAdapter implements DexAdapter {
   public readonly dex: DexType = 'METEORA_DLMM';
@@ -45,7 +48,8 @@ export class MeteoraDlmmAdapter implements DexAdapter {
           binStep,
           activeId,
           reserveX,
-          reserveY
+          reserveY,
+          hasVerifiedBinArrays: false // Pending multi-bin account streaming
         }
       };
     } catch {
@@ -65,13 +69,26 @@ export class MeteoraDlmmAdapter implements DexAdapter {
       activeId?: number;
       binLiquidityX?: string;
       binLiquidityY?: string;
+      hasVerifiedBinArrays?: boolean;
     } | undefined;
 
     const binStep = extra?.binStep;
     const activeId = extra?.activeId;
+    const hasVerifiedBinArrays = extra?.hasVerifiedBinArrays === true;
+    const binLiquidityX = extra?.binLiquidityX;
+    const binLiquidityY = extra?.binLiquidityY;
 
-    // Fail closed: require verified bin parameters
-    if (binStep === undefined || activeId === undefined) {
+    // Fail closed: As mandated by Phase 1.1 accuracy gate, in the absence of complete
+    // verified bin arrays and explicit bin capacity data from RPC/SDK, mathematical approximations
+    // (Math.pow, placeholder liquidity) are strictly prohibited. Missing bin arrays NEVER
+    // produces a qualified direct quote.
+    if (
+      binStep === undefined ||
+      activeId === undefined ||
+      !hasVerifiedBinArrays ||
+      !binLiquidityX ||
+      !binLiquidityY
+    ) {
       return null;
     }
 
@@ -83,33 +100,33 @@ export class MeteoraDlmmAdapter implements DexAdapter {
     if (amountInAfterFee <= 0n) return null;
 
     try {
-      // Bin price ratio: P = (1 + binStep * 1e-4)^activeId
-      const binStepRatio = 1 + (binStep * 0.0001);
-      const rawPrice = Math.pow(binStepRatio, activeId);
-      if (isNaN(rawPrice) || rawPrice <= 0 || !isFinite(rawPrice)) {
+      // Check active bin reserve capacity
+      const activeBinCapacity = isInputA
+        ? BigInt(binLiquidityX)
+        : BigInt(binLiquidityY);
+
+      // If trade exceeds active bin capacity, multi-bin traversal across bin arrays is required.
+      if (amountInAfterFee > activeBinCapacity) {
         return null;
       }
 
-      // Check active bin reserve capacity if available
-      const activeBinResIn = isInputA
-        ? (extra?.binLiquidityX ? BigInt(extra.binLiquidityX) : undefined)
-        : (extra?.binLiquidityY ? BigInt(extra.binLiquidityY) : undefined);
-
-      // If active bin capacity is known and trade exceeds it, bin-array traversal is required.
-      // In the absence of complete multi-bin array state, fail closed to prevent assuming spot price = executable price.
-      if (activeBinResIn !== undefined && amountInAfterFee > activeBinResIn) {
+      // Exact high-precision price ratio using Decimal (50-digit precision):
+      // P = (1 + binStep * 1e-4)^activeId
+      const binStepDecimal = new Decimal(binStep).mul('0.0001').add(1);
+      const rawPrice = binStepDecimal.pow(activeId);
+      if (!rawPrice.isFinite() || rawPrice.lte(0)) {
         return null;
       }
 
       let amountOut: bigint;
       if (isInputA) {
-        // Token X (WSOL) -> Token Y (USDC): amountOut = amountIn * rawPrice
-        const outNum = Number(amountInAfterFee) * rawPrice;
-        amountOut = BigInt(Math.floor(outNum));
+        // Token X (WSOL) -> Token Y (USDC): amountOut = amountInAfterFee * rawPrice
+        const outDecimal = new Decimal(amountInAfterFee.toString()).mul(rawPrice).floor();
+        amountOut = BigInt(outDecimal.toFixed(0));
       } else {
-        // Token Y (USDC) -> Token X (WSOL): amountOut = amountIn / rawPrice
-        const outNum = Number(amountInAfterFee) / rawPrice;
-        amountOut = BigInt(Math.floor(outNum));
+        // Token Y (USDC) -> Token X (WSOL): amountOut = amountInAfterFee / rawPrice
+        const outDecimal = new Decimal(amountInAfterFee.toString()).div(rawPrice).floor();
+        amountOut = BigInt(outDecimal.toFixed(0));
       }
 
       if (amountOut <= 0n) return null;

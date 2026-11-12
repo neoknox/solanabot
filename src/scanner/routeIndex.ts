@@ -64,7 +64,9 @@ export class RouteIndex {
   }
 
   private isDirectDex(dex: DexType): boolean {
-    return dex === 'RAYDIUM_AMM' || dex === 'ORCA_WHIRLPOOL' || dex === 'METEORA_DLMM';
+    // Only Raydium AMM V4 and Orca Whirlpool have complete on-chain math & reserve streaming
+    // Meteora DLMM is marked QUOTE_UNVERIFIED until bin-array streaming is integrated
+    return dex === 'RAYDIUM_AMM' || dex === 'ORCA_WHIRLPOOL';
   }
 
   private getPoolPair(pool: PoolConfig): [string, string] {

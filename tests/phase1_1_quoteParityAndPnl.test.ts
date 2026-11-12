@@ -156,7 +156,35 @@ describe('Phase 1.1 Audit: Official Protocol Math & Quote Parity', () => {
   describe('Meteora DLMM Discrete Bin & Capacity Protection', () => {
     const adapter = new MeteoraDlmmAdapter();
 
-    it('Calculates discrete bin output within verified bin liquidity capacity', () => {
+    it('Fails closed: missing bin arrays or bin liquidity NEVER produces a qualified direct quote', () => {
+      // Unhydrated or raw decoded pool without bin arrays
+      const rawDecodedPool: PoolState = {
+        id: 'HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR',
+        dex: 'METEORA_DLMM',
+        programId: KNOWN_PROGRAM_IDS.METEORA_DLMM,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        tokenADecimals: 9,
+        tokenBDecimals: 6,
+        reserveA: 0n,
+        reserveB: 0n,
+        feeBps: 10,
+        slot: 100,
+        receivedAt: Date.now(),
+        liquidityUsd: 500000,
+        feedHealth: 'HEALTHY',
+        extraData: {
+          binStep: 10,
+          activeId: -24955,
+          hasVerifiedBinArrays: false
+        }
+      };
+
+      const quote = adapter.quoteExactInput(rawDecodedPool, CANONICAL_USDC_MINT, 100000000n);
+      expect(quote).toBeNull();
+    });
+
+    it('Calculates discrete bin output only within verified bin liquidity capacity with verified bin arrays', () => {
       const pool: PoolState = {
         id: 'HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR',
         dex: 'METEORA_DLMM',
@@ -175,6 +203,7 @@ describe('Phase 1.1 Audit: Official Protocol Math & Quote Parity', () => {
         extraData: {
           binStep: 10,
           activeId: -24955,
+          hasVerifiedBinArrays: true,
           binLiquidityX: '500000000000', // 500 SOL capacity
           binLiquidityY: '50000000000'   // 50,000 USDC capacity
         }
@@ -185,7 +214,7 @@ describe('Phase 1.1 Audit: Official Protocol Math & Quote Parity', () => {
       expect(quote!.outAmount).toBeGreaterThan(0n);
     });
 
-    it('Fails closed (returns null) when trade exceeds active bin capacity without bin arrays', () => {
+    it('Fails closed (returns null) when trade exceeds active bin capacity without multi-bin traversal', () => {
       const pool: PoolState = {
         id: 'HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR',
         dex: 'METEORA_DLMM',
@@ -204,6 +233,8 @@ describe('Phase 1.1 Audit: Official Protocol Math & Quote Parity', () => {
         extraData: {
           binStep: 10,
           activeId: -24955,
+          hasVerifiedBinArrays: true,
+          binLiquidityX: '500000000000',
           binLiquidityY: '10000000' // Only $10 USDC in active bin
         }
       };

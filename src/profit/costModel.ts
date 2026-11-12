@@ -33,8 +33,25 @@ export class CostModel {
       };
     }
 
+    // Fail closed: Missing, zero, future, or stale timestamps are strictly rejected
+    if (!input.solPriceTimestamp || input.solPriceTimestamp <= 0) {
+      return {
+        breakdown: null,
+        isComplete: false,
+        missingReason: 'Missing or zero SOL price timestamp'
+      };
+    }
+
     const now = Date.now();
-    if (input.solPriceTimestamp && (now - input.solPriceTimestamp) > this.config.MAX_QUOTE_AGE_MS * 2) {
+    if (input.solPriceTimestamp > now + 5000) {
+      return {
+        breakdown: null,
+        isComplete: false,
+        missingReason: 'SOL price timestamp is in the future'
+      };
+    }
+
+    if ((now - input.solPriceTimestamp) > this.config.MAX_QUOTE_AGE_MS * 2) {
       return {
         breakdown: null,
         isComplete: false,
@@ -43,14 +60,16 @@ export class CostModel {
     }
 
     const solPrice = input.solPriceUSDC;
-    const assumptions: string[] = [];
+    const assumptions: string[] = [
+      'Phase 1.1 execution fees (network, priority compute, tip) are ESTIMATED prior to on-chain transaction composition'
+    ];
 
     // 1. Network base signature fee (default 5,000 lamports per sig)
     const totalBaseFeeLamports = new Decimal(this.config.NETWORK_FEE_LAMPORTS_PER_SIGNATURE)
       .mul(this.config.ESTIMATED_SIGNATURES);
     const networkFeeUSDC = totalBaseFeeLamports.div(1e9).mul(solPrice);
     assumptions.push(
-      `Network base fee: ${this.config.ESTIMATED_SIGNATURES} sig(s) @ ${this.config.NETWORK_FEE_LAMPORTS_PER_SIGNATURE} lamports = $${networkFeeUSDC.toFixed(6)}`
+      `Estimated network base fee: ${this.config.ESTIMATED_SIGNATURES} sig(s) @ ${this.config.NETWORK_FEE_LAMPORTS_PER_SIGNATURE} lamports = $${networkFeeUSDC.toFixed(6)}`
     );
 
     // 2. Priority compute fee
@@ -59,14 +78,14 @@ export class CostModel {
     );
     const priorityFeeUSDC = priorityLamports.div(1e9).mul(solPrice);
     assumptions.push(
-      `Priority fee: ${priorityLamports.toString()} lamports = $${priorityFeeUSDC.toFixed(6)}`
+      `Estimated priority fee: ${priorityLamports.toString()} lamports = $${priorityFeeUSDC.toFixed(6)}`
     );
 
     // 3. Jito validator tip
     const jitoLamports = new Decimal(this.config.JITO_TIP_LAMPORTS);
     const jitoTipUSDC = jitoLamports.div(1e9).mul(solPrice);
     assumptions.push(
-      `Jito tip: ${jitoLamports.toString()} lamports = $${jitoTipUSDC.toFixed(6)} (Default 0 for read-only)`
+      `Estimated Jito tip: ${jitoLamports.toString()} lamports = $${jitoTipUSDC.toFixed(6)} (Default 0 for read-only)`
     );
 
     // 4. Token transfer fees (0 for canonical SPL, non-zero for Token-2022 if applicable)

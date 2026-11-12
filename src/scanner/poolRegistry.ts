@@ -62,7 +62,7 @@ export class PoolRegistry {
       description: 'Orca Whirlpool 0.02% SOL/USDC (Intra-DEX tier)'
     });
 
-    // 4. Meteora DLMM (Primary dynamic bin pool, verified on-chain)
+    // 4. Meteora DLMM (Primary dynamic bin pool - marked QUOTE_UNVERIFIED without bin-array streaming)
     this.register({
       id: 'HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR',
       dex: 'METEORA_DLMM',
@@ -71,7 +71,7 @@ export class PoolRegistry {
       tokenBMint: CANONICAL_USDC_MINT,
       feeBps: 10,
       initialLiquidityUsd: 500000,
-      description: 'Meteora DLMM Dynamic Bin SOL/USDC'
+      description: 'Meteora DLMM Dynamic Bin SOL/USDC (QUOTE_UNVERIFIED - pending bin-array streaming)'
     });
 
     // 5. Orca Whirlpool USDC/USDT 0.01% (verified on-chain, 653-byte layout)

@@ -47,7 +47,8 @@ describe('Test Matrix 5, 6, 7, 9: Cost Modeling, Deductions, and $0.50 Net Profi
 
   it('Matrix 5.1: Verifies pool fee & price impact are already deducted in quote and not charged twice in cost model', () => {
     const costResult = costModel.calculateCosts({
-      solPriceUSDC: new Decimal(125.0)
+      solPriceUSDC: new Decimal(125.0),
+      solPriceTimestamp: Date.now()
     });
     expect(costResult.isComplete).toBe(true);
     // Cost model only accounts for network, compute priority, jito tips, contingency, buffer.
@@ -58,6 +59,7 @@ describe('Test Matrix 5, 6, 7, 9: Cost Modeling, Deductions, and $0.50 Net Profi
   it('Matrix 6.1: Cost model accounts for network base fee, priority fee, jito tip, contingency, and safety buffer', () => {
     const costResult = costModel.calculateCosts({
       solPriceUSDC: new Decimal(125.0),
+      solPriceTimestamp: Date.now(),
       measuredPriorityFeeLamports: 15000
     });
 
@@ -73,10 +75,33 @@ describe('Test Matrix 5, 6, 7, 9: Cost Modeling, Deductions, and $0.50 Net Profi
   it('Matrix 7.1: Missing or stale price conversion blocks qualification', () => {
     // Missing SOL price
     const missingPrice = costModel.calculateCosts({
-      solPriceUSDC: undefined
+      solPriceUSDC: undefined,
+      solPriceTimestamp: Date.now()
     });
     expect(missingPrice.isComplete).toBe(false);
     expect(missingPrice.breakdown).toBeNull();
+
+    // Missing timestamp (fails closed)
+    const missingTimestamp = costModel.calculateCosts({
+      solPriceUSDC: new Decimal(125.0)
+    });
+    expect(missingTimestamp.isComplete).toBe(false);
+    expect(missingTimestamp.missingReason).toContain('Missing or zero SOL price timestamp');
+
+    // Zero timestamp (fails closed)
+    const zeroTimestamp = costModel.calculateCosts({
+      solPriceUSDC: new Decimal(125.0),
+      solPriceTimestamp: 0
+    });
+    expect(zeroTimestamp.isComplete).toBe(false);
+
+    // Future timestamp (fails closed)
+    const futureTimestamp = costModel.calculateCosts({
+      solPriceUSDC: new Decimal(125.0),
+      solPriceTimestamp: Date.now() + 60000
+    });
+    expect(futureTimestamp.isComplete).toBe(false);
+    expect(futureTimestamp.missingReason).toContain('future');
 
     // Stale SOL price
     const stalePrice = costModel.calculateCosts({
@@ -99,18 +124,7 @@ describe('Test Matrix 5, 6, 7, 9: Cost Modeling, Deductions, and $0.50 Net Profi
   });
 
   it('Matrix 9.1: Exact threshold test: $0.49 net rejected, $0.50 accepted, $0.51 accepted', () => {
-    // With 10 bps slippage on $100 trade:
-    // slippage on Leg 2 is: outUSDC * 10 / 10000 = outUSDC * 0.001
-    // conservativeOut = outUSDC * 0.999
-    // initial = 100
-    // costs = totalCosts (e.g. 0.021875)
-    // buffer = 0.25
-    // conservativeNet = conservativeOut - 100 - costs - 0.25
-    // target conservativeNet:
-    // For net = N: conservativeOut = 100 + costs + 0.25 + N
-    // outUSDC = conservativeOut / 0.999
-
-    const costs = costModel.calculateCosts({ solPriceUSDC: new Decimal(125.0) }).breakdown!;
+    const costs = costModel.calculateCosts({ solPriceUSDC: new Decimal(125.0), solPriceTimestamp: Date.now() }).breakdown!;
     const totalCosts = new Decimal(costs.totalCostsUSDC);
     const buffer = new Decimal(costs.safetyBufferUSDC);
 

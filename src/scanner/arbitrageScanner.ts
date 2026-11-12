@@ -87,8 +87,9 @@ export class ArbitrageScanner {
     averageCompetitionScore: 0
   };
 
-  private currentSolPriceUSDC = new Decimal(165.0);
-  private lastSolPriceTime = Date.now();
+  // Live timestamped SOL/USDC price (null initially: zero fictitious default price permitted)
+  private currentSolPriceUSDC: Decimal | null = null;
+  private lastSolPriceTime = 0;
 
   constructor(
     config: AppConfig,
@@ -155,7 +156,10 @@ export class ArbitrageScanner {
     // 1. Establish real-time WebSocket connection
     await this.ws.connect();
 
-    // 2. Initial snapshot hydration via RPC batch getMultipleAccounts
+    // 2. Fetch fresh live SOL price for non-fictitious fee conversion
+    await this.refreshSolPrice();
+
+    // 3. Initial snapshot hydration via RPC batch getMultipleAccountsAndContext
     await this.refreshAllPoolStates();
 
     // 3. Subscribe to real-time WebSocket updates for all pool accounts
@@ -330,6 +334,11 @@ export class ArbitrageScanner {
     const currentSlot = this.ws.getCurrentSlot();
     const wsConnected = this.ws.getHealth() !== 'DISCONNECTED';
 
+    // Fail closed: Require fresh, live, non-fictitious SOL/USDC price for fee conversions
+    if (!this.currentSolPriceUSDC || this.lastSolPriceTime <= 0) {
+      return;
+    }
+
     // Calculate current execution costs
     const costResult = this.costModel.calculateCosts({
       solPriceUSDC: this.currentSolPriceUSDC,
@@ -337,7 +346,7 @@ export class ArbitrageScanner {
       requiresAtaSetup: route.legs.some(l => l.inputMint === CANONICAL_WSOL_MINT || l.outputMint === CANONICAL_WSOL_MINT)
     });
 
-    if (!costResult.breakdown) return;
+    if (!costResult.isComplete || !costResult.breakdown) return;
 
     // Fast optimal trade sizing
     const quoteStart = performance.now();
@@ -501,10 +510,11 @@ export class ArbitrageScanner {
 
     try {
       const rpcStart = performance.now();
-      const accounts = await this.rpc.getMultipleAccounts(pubkeys);
+      const rpcRes = await this.rpc.getMultipleAccountsAndContext(pubkeys);
       this.latencyTracker.recordRpcLatency(performance.now() - rpcStart);
 
-      const currentSlot = this.ws.getCurrentSlot();
+      const snapshotSlot = rpcRes.slot;
+      const accounts = rpcRes.value;
       const decodedPools: PoolState[] = [];
       const vaultsToFetch: { pubkey: PublicKey; poolIndex: number; isA: boolean }[] = [];
 
@@ -515,7 +525,7 @@ export class ArbitrageScanner {
 
         const adapter = dexRegistry.getAdapter(poolConfig.dex);
         if (adapter) {
-          const decoded = adapter.decodePoolState(accountInfo.data, poolConfig.id, currentSlot);
+          const decoded = adapter.decodePoolState(accountInfo.data, poolConfig.id, snapshotSlot);
           if (decoded) {
             const extra = decoded.extraData as any;
             const vaultA = extra?.baseVault || extra?.tokenVaultA || extra?.reserveX;
@@ -557,22 +567,35 @@ export class ArbitrageScanner {
         }
       }
 
-      // Batch vault balance hydration (avoids 429 rate limit issues)
+      // Batch vault balance hydration with real RPC context slot and account owner verification
       if (vaultsToFetch.length > 0) {
         try {
           const vRpcStart = performance.now();
-          const vaultAccounts = await this.rpc.getMultipleAccounts(vaultsToFetch.map(v => v.pubkey));
+          const vRpcRes = await this.rpc.getMultipleAccountsAndContext(vaultsToFetch.map(v => v.pubkey));
           this.latencyTracker.recordRpcLatency(performance.now() - vRpcStart);
+          const vaultSlot = vRpcRes.slot;
+          const vaultAccounts = vRpcRes.value;
 
           for (let i = 0; i < vaultsToFetch.length; i++) {
             const vInfo = vaultsToFetch[i];
             const acc = vaultAccounts[i];
             if (acc && acc.data.length >= 72) {
+              // Verify owner is SPL Token Program
+              const ownerStr = acc.owner ? acc.owner.toBase58() : '';
+              if (
+                ownerStr &&
+                ownerStr !== 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' &&
+                ownerStr !== 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'
+              ) {
+                continue; // Ignore accounts with mismatched owner
+              }
+
               const amount = acc.data.readBigUInt64LE(64);
               const pool = decodedPools[vInfo.poolIndex];
               if (pool) {
                 if (vInfo.isA) pool.reserveA = amount;
                 else pool.reserveB = amount;
+                pool.slot = vaultSlot;
               }
             }
           }

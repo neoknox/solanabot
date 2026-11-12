@@ -1,14 +1,21 @@
 import { PublicKey } from '@solana/web3.js';
+import Decimal from 'decimal.js';
 import { DexAdapter } from './types.js';
 import { DexType, PoolState, SwapQuote } from '../types/index.js';
 import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT } from '../config/index.js';
 
+Decimal.set({ precision: 50, rounding: Decimal.ROUND_DOWN });
+
 const Q64 = 1n << 64n;
 
+/**
+ * Converts tick index to sqrtPriceX64 using 50-digit precision Decimal arithmetic,
+ * eliminating IEEE 754 floating-point drift from Math.pow(1.0001, tick/2).
+ */
 export function tickIndexToSqrtPriceX64(tickIndex: number): bigint {
-  const ratio = Math.pow(1.0001, tickIndex / 2);
-  const q64Num = 18446744073709551616; // 2^64
-  return BigInt(Math.floor(ratio * q64Num));
+  const q64 = new Decimal(2).pow(64);
+  const sqrtPrice = new Decimal(1.0001).pow(new Decimal(tickIndex).div(2)).mul(q64).floor();
+  return BigInt(sqrtPrice.toFixed(0));
 }
 
 export class OrcaWhirlpoolAdapter implements DexAdapter {
