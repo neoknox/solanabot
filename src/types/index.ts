@@ -125,6 +125,13 @@ export type RejectionReasonCode =
   | 'TICK_BOUNDARY_EXCEEDED'
   | 'SPREAD_PREFILTER_REJECTED'
   | 'SIMULATED_CAPITAL_EXHAUSTED'
+  | 'OBSERVATION_EXPIRED'
+  | 'ACCOUNT_POINTERS_CHANGED'
+  | 'OPENORDERS_LAYOUT_INVALID'
+  | 'OPENORDERS_MARKET_MISMATCH'
+  | 'OPENORDERS_AUTHORITY_MISMATCH'
+  | 'OPENORDERS_OWNER_MISMATCH'
+  | 'SUBSCRIPTION_LOSS'
   | 'QUOTE_UNVERIFIED'
   | 'UNSUPPORTED_ROUTE'
   | 'REUSED_IDENTICAL_POOL'
@@ -296,4 +303,9 @@ export interface AuditMetrics {
   averageCompetitionScore?: number;
   maxOpportunityVisibilityMs?: number;
   meanOpportunityVisibilityMs?: number;
+  // Diagnostic Rejection Counts (Orca & Raydium State Integrity)
+  orcaTickBoundaryAttempts?: number;
+  orcaOtherFailureAttempts?: number;
+  raydiumReconfirmationAttempts?: number;
+  raydiumReconfirmationSuccesses?: number;
 }

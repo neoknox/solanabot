@@ -286,23 +286,36 @@ export class ArbitrageScanner {
             this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'ACCOUNT_POINTERS_CHANGED');
             this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
           } else if (oldExtra.openOrdersVerified === true) {
-            // Check slot compatibility: does the slot gap between AMM update and OpenOrders exceed MAX_SLOT_GAP?
-            const ooSlot = oldExtra.openOrdersSlot || existing.slot;
-            const slotGap = Math.abs(update.slot - ooSlot);
-            if (slotGap > this.config.MAX_SLOT_GAP) {
-              // Reject mixed-slot snapshot: OpenOrders state is too far behind or ahead
+            // Raydium OpenOrders Observation Model:
+            // A quiet, unchanged OpenOrders account does NOT receive updates every slot.
+            // Check observation freshness: within TTL and WebSocket connection healthy.
+            const now = update.receivedAtMs || Date.now();
+            const lastConfirmedAt = oldExtra.lastConfirmedAt || oldExtra.verifiedAt || existing.receivedAt || 0;
+            const ttl = oldExtra.observationFreshnessTtlMs || this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
+            const isFresh = (now - lastConfirmedAt) <= ttl;
+            const wsHealthy = this.ws.getHealth() !== 'DISCONNECTED';
+
+            if (!wsHealthy) {
               newExtra.openOrdersVerified = false;
-              newExtra.unverifiedReason = 'SLOT_MISMATCH';
-              newExtra.openOrdersSlot = ooSlot;
-              newExtra.openOrdersBaseTokenTotal = oldExtra.openOrdersBaseTokenTotal;
-              newExtra.openOrdersQuoteTokenTotal = oldExtra.openOrdersQuoteTokenTotal;
-              this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'SLOT_MISMATCH');
+              newExtra.unverifiedReason = 'SUBSCRIPTION_LOSS';
+              this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'SUBSCRIPTION_LOSS');
               this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
+            } else if (!isFresh) {
+              // Observation expired: fail closed and trigger bounded reconfirmation
+              newExtra.openOrdersVerified = false;
+              newExtra.unverifiedReason = 'OBSERVATION_EXPIRED';
+              this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'OBSERVATION_EXPIRED');
+              this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
+              this.triggerRateLimitedReconfirmation(update.key);
             } else {
-              // Slots are compatible: preserve verified OpenOrders metadata and status
+              // Observation is fresh and dependencies are verified: preserve verified state without false SLOT_MISMATCH
               newExtra.openOrdersVerified = true;
               newExtra.openOrdersBaseTokenTotal = oldExtra.openOrdersBaseTokenTotal;
               newExtra.openOrdersQuoteTokenTotal = oldExtra.openOrdersQuoteTokenTotal;
+              newExtra.lastAccountChangeSlot = oldExtra.lastAccountChangeSlot || oldExtra.openOrdersSlot || existing.slot;
+              newExtra.lastRpcConfirmationContextSlot = oldExtra.lastRpcConfirmationContextSlot || oldExtra.verifiedSlot || existing.slot;
+              newExtra.lastConfirmedAt = lastConfirmedAt;
+              newExtra.observationFreshnessTtlMs = ttl;
               newExtra.openOrdersSlot = oldExtra.openOrdersSlot;
               newExtra.verifiedSlot = update.slot;
               newExtra.verifiedAt = oldExtra.verifiedAt;
@@ -360,12 +373,8 @@ export class ArbitrageScanner {
       return;
     }
 
-    const slotGap = Math.abs(update.slot - pool.slot);
-    if (slotGap > this.config.MAX_SLOT_GAP) {
-      extra.openOrdersVerified = false;
-      extra.unverifiedReason = 'SLOT_MISMATCH';
-      this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'SLOT_MISMATCH');
-      this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+    // Reject out-of-order notifications
+    if (extra.lastAccountChangeSlot && update.slot < extra.lastAccountChangeSlot) {
       return;
     }
 
@@ -375,9 +384,13 @@ export class ArbitrageScanner {
     extra.openOrdersVerified = true;
     extra.openOrdersBaseTokenTotal = baseTokenTotal.toString();
     extra.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
+    extra.lastAccountChangeSlot = update.slot;
+    extra.lastRpcConfirmationContextSlot = update.slot;
+    extra.lastConfirmedAt = update.receivedAtMs || Date.now();
+    extra.observationFreshnessTtlMs = this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
     extra.openOrdersSlot = update.slot;
     extra.verifiedSlot = update.slot;
-    extra.verifiedAt = update.receivedAtMs;
+    extra.verifiedAt = update.receivedAtMs || Date.now();
     delete extra.unverifiedReason;
 
     this.poolRegistry.updatePoolVerification(poolId, 'VERIFIED_DIRECT');
@@ -406,6 +419,106 @@ export class ArbitrageScanner {
           }
         }
       } catch {}
+    }
+  }
+
+  private lastReconfirmationTime = new Map<string, number>();
+
+  public async reconfirmOpenOrders(poolId: string): Promise<boolean> {
+    const pool = this.stateCache.getPoolState(poolId);
+    if (!pool || pool.dex !== 'RAYDIUM_AMM' || !pool.extraData) return false;
+
+    const extra = pool.extraData as any;
+    if (!extra.openOrders) return false;
+
+    const now = Date.now();
+    const lastAttempt = this.lastReconfirmationTime.get(poolId) || 0;
+    if (now - lastAttempt < 5000) return false;
+    this.lastReconfirmationTime.set(poolId, now);
+
+    this.auditMetrics.raydiumReconfirmationAttempts = (this.auditMetrics.raydiumReconfirmationAttempts || 0) + 1;
+
+    try {
+      const ooPubkey = new PublicKey(extra.openOrders);
+      const ooRes = await this.rpc.getMultipleAccountsAndContext([ooPubkey]);
+      const ooSlot = ooRes.slot;
+      const acc = ooRes.value[0];
+
+      if (!acc || !acc.data || acc.data.length < 3228) {
+        extra.openOrdersVerified = false;
+        extra.unverifiedReason = 'OPENORDERS_LAYOUT_INVALID';
+        this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_LAYOUT_INVALID');
+        this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        return false;
+      }
+
+      const expectedOwner = extra.marketProgramId || 'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX';
+      const ownerStr = acc.owner ? acc.owner.toBase58() : '';
+      if (ownerStr !== expectedOwner && ownerStr !== 'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX') {
+        extra.openOrdersVerified = false;
+        extra.unverifiedReason = 'OPENORDERS_OWNER_MISMATCH';
+        this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_OWNER_MISMATCH');
+        this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        return false;
+      }
+
+      const market = new PublicKey(acc.data.subarray(13, 45)).toBase58();
+      const authority = new PublicKey(acc.data.subarray(45, 77)).toBase58();
+      const expectedAuthority = '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
+
+      if (market !== extra.marketId) {
+        extra.openOrdersVerified = false;
+        extra.unverifiedReason = 'OPENORDERS_MARKET_MISMATCH';
+        this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_MARKET_MISMATCH');
+        this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        return false;
+      }
+
+      if (authority !== expectedAuthority) {
+        extra.openOrdersVerified = false;
+        extra.unverifiedReason = 'OPENORDERS_AUTHORITY_MISMATCH';
+        this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_AUTHORITY_MISMATCH');
+        this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        return false;
+      }
+
+      const baseTokenTotal = acc.data.readBigUInt64LE(85);
+      const quoteTokenTotal = acc.data.readBigUInt64LE(101);
+
+      extra.openOrdersVerified = true;
+      extra.openOrdersBaseTokenTotal = baseTokenTotal.toString();
+      extra.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
+      extra.lastAccountChangeSlot = ooSlot;
+      extra.lastRpcConfirmationContextSlot = ooSlot;
+      extra.lastConfirmedAt = Date.now();
+      extra.observationFreshnessTtlMs = this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
+      extra.openOrdersSlot = ooSlot;
+      extra.verifiedSlot = ooSlot;
+      extra.verifiedAt = Date.now();
+      delete extra.unverifiedReason;
+
+      this.poolRegistry.updatePoolVerification(poolId, 'VERIFIED_DIRECT');
+      this.routeIndex.updatePoolStatus(poolId, 'VERIFIED_DIRECT');
+      this.auditMetrics.raydiumReconfirmationSuccesses = (this.auditMetrics.raydiumReconfirmationSuccesses || 0) + 1;
+
+      this.evaluateAffectedRoutes(poolId);
+      return true;
+    } catch {
+      extra.openOrdersVerified = false;
+      extra.unverifiedReason = 'RPC_TIMEOUT';
+      this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'RPC_TIMEOUT');
+      this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+      return false;
+    }
+  }
+
+  private triggerRateLimitedReconfirmation(poolId: string): void {
+    const now = Date.now();
+    const last = this.lastReconfirmationTime.get(poolId) || 0;
+    if (now - last >= 5000) {
+      setImmediate(() => {
+        this.reconfirmOpenOrders(poolId).catch(() => {});
+      });
     }
   }
 
@@ -818,7 +931,7 @@ export class ArbitrageScanner {
               } else {
                 // Check snapshot slot consistency between pool and OpenOrders
                 const slotGap = Math.abs(snapshotSlot - ooSlot);
-                if (slotGap > this.config.MAX_SLOT_GAP) {
+                if (slotGap > 100) {
                   blockerReason = 'SLOT_MISMATCH';
                 } else {
                   isVerified = true;
@@ -827,6 +940,10 @@ export class ArbitrageScanner {
                   extra.openOrdersVerified = true;
                   extra.openOrdersBaseTokenTotal = baseTokenTotal.toString();
                   extra.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
+                  extra.lastAccountChangeSlot = ooSlot;
+                  extra.lastRpcConfirmationContextSlot = ooSlot;
+                  extra.lastConfirmedAt = Date.now();
+                  extra.observationFreshnessTtlMs = this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
                   extra.openOrdersSlot = ooSlot;
                   extra.verifiedSlot = snapshotSlot;
                   extra.verifiedAt = Date.now();
@@ -961,7 +1078,11 @@ export class ArbitrageScanner {
       ...this.auditMetrics,
       configuredRouteCount: this.routeIndex.getAllRoutes().length,
       maxOpportunityVisibilityMs: lifecycleStats.maxVisibilityDurationMs,
-      meanOpportunityVisibilityMs: lifecycleStats.meanVisibilityDurationMs
+      meanOpportunityVisibilityMs: lifecycleStats.meanVisibilityDurationMs,
+      orcaTickBoundaryAttempts: this.tradeSizer.orcaTickBoundaryAttempts,
+      orcaOtherFailureAttempts: this.tradeSizer.orcaOtherFailureAttempts,
+      raydiumReconfirmationAttempts: this.auditMetrics.raydiumReconfirmationAttempts || 0,
+      raydiumReconfirmationSuccesses: this.auditMetrics.raydiumReconfirmationSuccesses || 0
     };
   }
 

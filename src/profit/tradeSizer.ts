@@ -47,6 +47,8 @@ export interface TradeSizerResult {
 
 export class TradeSizer {
   private config: AppConfig;
+  public orcaTickBoundaryAttempts = 0;
+  public orcaOtherFailureAttempts = 0;
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -83,14 +85,22 @@ export class TradeSizer {
 
       const q = leg.adapter.quoteExactInput(leg.pool, leg.inputMint, currentExpectedUnits);
       if (!q || q.outAmount <= 0n) {
-        if (leg.pool.dex === 'ORCA_WHIRLPOOL') {
-          expectedFailedReason = 'TICK_BOUNDARY_EXCEEDED';
+        if (leg.adapter.getLastFailureReason) {
+          expectedFailedReason = leg.adapter.getLastFailureReason() || 'QUOTE_UNVERIFIED';
         } else if (leg.pool.dex === 'METEORA_DLMM') {
           expectedFailedReason = 'UNSUPPORTED_ROUTE';
         } else if (leg.pool.dex === 'RAYDIUM_AMM') {
           expectedFailedReason = (leg.pool.extraData as any)?.unverifiedReason || 'QUOTE_UNVERIFIED';
         } else {
           expectedFailedReason = 'QUOTE_UNVERIFIED';
+        }
+
+        if (leg.pool.dex === 'ORCA_WHIRLPOOL') {
+          if (expectedFailedReason === 'TICK_BOUNDARY_EXCEEDED') {
+            this.orcaTickBoundaryAttempts++;
+          } else {
+            this.orcaOtherFailureAttempts++;
+          }
         }
         break;
       }
@@ -113,8 +123,8 @@ export class TradeSizer {
 
       const q = leg.adapter.quoteExactInput(leg.pool, leg.inputMint, currentConservativeUnits);
       if (!q || q.outAmount <= 0n) {
-        if (leg.pool.dex === 'ORCA_WHIRLPOOL') {
-          conservativeFailedReason = 'TICK_BOUNDARY_EXCEEDED';
+        if (leg.adapter.getLastFailureReason) {
+          conservativeFailedReason = leg.adapter.getLastFailureReason() || 'QUOTE_UNVERIFIED';
         } else if (leg.pool.dex === 'METEORA_DLMM') {
           conservativeFailedReason = 'UNSUPPORTED_ROUTE';
         } else if (leg.pool.dex === 'RAYDIUM_AMM') {

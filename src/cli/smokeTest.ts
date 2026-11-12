@@ -116,6 +116,12 @@ async function main() {
   console.log(`p50 Visibility Duration:        ${lifecycle.p50DurationMs} ms`);
   console.log(`p95 Visibility Duration:        ${lifecycle.p95DurationMs} ms`);
 
+  console.log('\n--- ORCA & RAYDIUM STATE INTEGRITY DIAGNOSTICS ---');
+  console.log(`  Orca Proven Tick Boundary Exceeded Attempts: ${audit.orcaTickBoundaryAttempts || 0}`);
+  console.log(`  Orca Other Quote Failures (Data/Liquidity):   ${audit.orcaOtherFailureAttempts || 0}`);
+  console.log(`  Raydium Reconfirmation Attempts:             ${audit.raydiumReconfirmationAttempts || 0}`);
+  console.log(`  Raydium Reconfirmation Successes:            ${audit.raydiumReconfirmationSuccesses || 0}`);
+
   console.log('\n--- COMPETITOR ACTIVITY & CONTENTION INTELLIGENCE ---');
   const monitoredPools = [
     { name: 'Orca Whirlpool (WSOL/USDC 4bps)', id: 'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE' },

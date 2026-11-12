@@ -1,4 +1,4 @@
-import { DexType, PoolState, SwapQuote } from '../types/index.js';
+import { DexType, PoolState, SwapQuote, RejectionReasonCode } from '../types/index.js';
 
 export interface DexAdapter {
   readonly dex: DexType;
@@ -11,4 +11,6 @@ export interface DexAdapter {
     inputMint: string,
     amountIn: bigint
   ): SwapQuote | null;
+
+  getLastFailureReason?(): RejectionReasonCode | null;
 }

@@ -80,6 +80,7 @@ const rawConfigSchema = z.object({
   SLIPPAGE_BPS_LEG3: z.coerce.number().min(0).max(500).default(10),
   MAX_QUOTE_AGE_MS: z.coerce.number().min(100).max(60000).default(2500),
   MAX_SLOT_GAP: z.coerce.number().min(0).max(200).default(10),
+  OPENORDERS_OBSERVATION_TTL_MS: z.coerce.number().min(1000).default(30000),
   MIN_POOL_LIQUIDITY_USD: z.coerce.number().min(0).default(10000),
   MAX_PRICE_IMPACT_BPS: z.coerce.number().min(1).max(5000).default(200),
   MAX_EXECUTION_COST_USDC: z.coerce.number().min(0).default(0.30),

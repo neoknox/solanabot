@@ -1,7 +1,7 @@
 import { PublicKey } from '@solana/web3.js';
 import Decimal from 'decimal.js';
 import { DexAdapter } from './types.js';
-import { DexType, PoolState, SwapQuote } from '../types/index.js';
+import { DexType, PoolState, SwapQuote, RejectionReasonCode } from '../types/index.js';
 import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT, getKnownTokenDecimals } from '../config/index.js';
 
 Decimal.set({ precision: 50, rounding: Decimal.ROUND_DOWN });
@@ -21,6 +21,12 @@ export function tickIndexToSqrtPriceX64(tickIndex: number): bigint {
 export class OrcaWhirlpoolAdapter implements DexAdapter {
   public readonly dex: DexType = 'ORCA_WHIRLPOOL';
   public readonly programId: string = KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL;
+
+  private lastFailureReason: RejectionReasonCode | null = null;
+
+  public getLastFailureReason(): RejectionReasonCode | null {
+    return this.lastFailureReason;
+  }
 
   public decodePoolState(data: Buffer, poolId: string, slot: number): PoolState | null {
     if (data.length < 653) return null;
@@ -85,8 +91,19 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
     inputMint: string,
     amountIn: bigint
   ): SwapQuote | null {
-    if (amountIn <= 0n) return null;
-    if (!pool.receivedAt || pool.receivedAt <= 0) return null;
+    if (amountIn <= 0n) {
+      this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+      return null;
+    }
+    if (!pool.receivedAt || pool.receivedAt <= 0) {
+      this.lastFailureReason = 'STALE_QUOTE';
+      return null;
+    }
+
+    if (inputMint !== pool.tokenAMint && inputMint !== pool.tokenBMint) {
+      this.lastFailureReason = 'INVALID_MINT';
+      return null;
+    }
 
     const extra = pool.extraData as {
       liquidity?: string;
@@ -102,7 +119,16 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
     const tickSpacing = extra?.tickSpacing || 1;
 
     // Fail closed if pool concentrated liquidity parameters are missing or zero
-    if (liquidity <= 0n || sqrtPrice <= 0n || tickCurrent === undefined) {
+    if (tickCurrent === undefined || !extra?.sqrtPrice) {
+      this.lastFailureReason = 'MISSING_TICK_DATA';
+      return null;
+    }
+    if (liquidity <= 0n) {
+      this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+      return null;
+    }
+    if (sqrtPrice <= 0n) {
+      this.lastFailureReason = 'QUOTE_UNVERIFIED';
       return null;
     }
 
@@ -115,7 +141,10 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
     const feeAmount = (amountIn * feeRateRaw) / feeDenominator;
     const amountInAfterFee = amountIn - feeAmount;
 
-    if (amountInAfterFee <= 0n) return null;
+    if (amountInAfterFee <= 0n) {
+      this.lastFailureReason = 'EXCESSIVE_PRICE_IMPACT';
+      return null;
+    }
 
     // Boundary check: Verify whether trade exceeds the current initialized tick range
     // If trade crosses the boundary, tick arrays are required. If tick arrays are incomplete, fail closed.
@@ -133,7 +162,8 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
           const maxInA = (liquidity * deltaSqrt * Q64) / (sqrtPrice * sqrtPriceTarget);
           // If input exceeds active tick capacity and full tick-array traversal is not loaded, reject unverified quote
           if (amountInAfterFee > maxInA && maxInA > 0n) {
-            // Crossed tick array boundary without verified tick array state
+            // Proven tick array boundary exceeded without verified tick array state
+            this.lastFailureReason = 'TICK_BOUNDARY_EXCEEDED';
             return null;
           }
         }
@@ -142,7 +172,10 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
         // sqrtPriceNew = (L * sqrtPrice) / (L + amountIn * sqrtPrice / Q64)
         const product = (amountInAfterFee * sqrtPrice) / Q64;
         const denominator = liquidity + product;
-        if (denominator <= 0n) return null;
+        if (denominator <= 0n) {
+          this.lastFailureReason = 'EXCESSIVE_PRICE_IMPACT';
+          return null;
+        }
 
         const sqrtPriceNew = (liquidity * sqrtPrice) / denominator;
         const deltaSqrt = sqrtPrice - sqrtPriceNew;
@@ -161,6 +194,8 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
           const maxInB = (liquidity * deltaSqrt) / Q64;
           // If input exceeds active tick capacity, reject unverified quote without tick arrays
           if (amountInAfterFee > maxInB && maxInB > 0n) {
+            // Proven tick array boundary exceeded without verified tick array state
+            this.lastFailureReason = 'TICK_BOUNDARY_EXCEEDED';
             return null;
           }
         }
@@ -169,11 +204,17 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
         // sqrtPriceNew = sqrtPrice + (amountIn * Q64) / L
         const deltaSqrt = (amountInAfterFee * Q64) / liquidity;
         const sqrtPriceNew = sqrtPrice + deltaSqrt;
-        if (sqrtPriceNew <= 0n) return null;
+        if (sqrtPriceNew <= 0n) {
+          this.lastFailureReason = 'EXCESSIVE_PRICE_IMPACT';
+          return null;
+        }
 
         const numerator = liquidity * deltaSqrt * Q64;
         const denominator = sqrtPriceNew * sqrtPrice;
-        if (denominator <= 0n) return null;
+        if (denominator <= 0n) {
+          this.lastFailureReason = 'EXCESSIVE_PRICE_IMPACT';
+          return null;
+        }
 
         amountOut = numerator / denominator;
         if (sqrtPrice > 0n) {
@@ -181,11 +222,16 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
         }
       }
     } catch {
+      this.lastFailureReason = 'QUOTE_UNVERIFIED';
       return null;
     }
 
-    if (amountOut <= 0n) return null;
+    if (amountOut <= 0n) {
+      this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+      return null;
+    }
 
+    this.lastFailureReason = null;
     return {
       quoteSource: 'DIRECT_POOL',
       poolId: pool.id,
