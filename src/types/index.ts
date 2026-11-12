@@ -11,6 +11,8 @@ export type DexType =
   | 'METEORA_DLMM'
   | 'METEORA_DAMM'
   | 'PHOENIX'
+  | 'PANCAKESWAP'
+  | 'MANIFEST'
   | 'OPENBOOK_V2'
   | 'PUMP_FUN'
   | 'ZERO_FI'
@@ -60,6 +62,7 @@ export type RejectionReasonCode =
   | 'INSUFFICIENT_LIQUIDITY'
   | 'EXCESSIVE_PRICE_IMPACT'
   | 'MISSING_TICK_DATA'
+  | 'QUOTE_UNVERIFIED'
   | 'UNSUPPORTED_ROUTE'
   | 'REUSED_IDENTICAL_POOL'
   | 'MISSING_COST_ESTIMATE'
@@ -161,4 +164,15 @@ export interface ScanHealthStatus {
   rejectionBreakdown: Record<string, number>;
   activePoolCount: number;
   poolsPerDex: Record<string, number>;
+}
+
+export interface AuditMetrics {
+  totalEvaluated: number;
+  uniqueOpportunities: number;
+  candidatesGrossPositive: number;
+  candidatesConservativeQualified: number;
+  rejectedRoutes: number;
+  quoteValidationFailures: number;
+  unsupportedRoutes: number;
+  staleDataRejections: number;
 }

@@ -44,9 +44,9 @@ export class ArbitrageRepository {
   }
 
   public saveCandidate(candidate: ArbitrageCandidate): void {
-    // Always store QUALIFIED_SHADOW and CANDIDATE signals; sample 5% of rejected signals
+    // Store all QUALIFIED_SHADOW and CANDIDATE signals. Store all rejected if configured, else sample.
     const isSpecial = candidate.status === 'QUALIFIED_SHADOW' || candidate.status === 'CANDIDATE';
-    if (!isSpecial && Math.random() > 0.05) {
+    if (!isSpecial && !this.config.LOG_ALL_REJECTED && Math.random() > 0.15) {
       return;
     }
 
@@ -99,6 +99,80 @@ export class ArbitrageRepository {
         Date.now()
       );
     } catch {}
+  }
+
+  public recordAuditMetrics(metrics: {
+    totalEvaluated: number;
+    uniqueOpportunities: number;
+    candidatesGrossPositive: number;
+    candidatesConservativeQualified: number;
+    rejectedRoutes: number;
+    quoteValidationFailures: number;
+    unsupportedRoutes: number;
+    staleDataRejections: number;
+  }): void {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT OR REPLACE INTO audit_metrics (
+          run_id, total_evaluated, unique_opportunities,
+          candidates_gross_positive, candidates_conservative_qualified,
+          rejected_routes, quote_validation_failures,
+          unsupported_routes, stale_data_rejections, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(
+        `RUN-${Date.now()}`,
+        metrics.totalEvaluated,
+        metrics.uniqueOpportunities,
+        metrics.candidatesGrossPositive,
+        metrics.candidatesConservativeQualified,
+        metrics.rejectedRoutes,
+        metrics.quoteValidationFailures,
+        metrics.unsupportedRoutes,
+        metrics.staleDataRejections,
+        Date.now()
+      );
+    } catch {}
+  }
+
+  public getLatestAuditMetrics(): {
+    totalEvaluated: number;
+    uniqueOpportunities: number;
+    candidatesGrossPositive: number;
+    candidatesConservativeQualified: number;
+    rejectedRoutes: number;
+    quoteValidationFailures: number;
+    unsupportedRoutes: number;
+    staleDataRejections: number;
+  } | null {
+    try {
+      const row = this.db.prepare(`
+        SELECT 
+          SUM(total_evaluated) as totalEvaluated,
+          SUM(unique_opportunities) as uniqueOpportunities,
+          SUM(candidates_gross_positive) as candidatesGrossPositive,
+          SUM(candidates_conservative_qualified) as candidatesConservativeQualified,
+          SUM(rejected_routes) as rejectedRoutes,
+          SUM(quote_validation_failures) as quoteValidationFailures,
+          SUM(unsupported_routes) as unsupportedRoutes,
+          SUM(stale_data_rejections) as staleDataRejections
+        FROM audit_metrics
+      `).get() as any;
+
+      if (!row || row.totalEvaluated === null) return null;
+      return {
+        totalEvaluated: row.totalEvaluated || 0,
+        uniqueOpportunities: row.uniqueOpportunities || 0,
+        candidatesGrossPositive: row.candidatesGrossPositive || 0,
+        candidatesConservativeQualified: row.candidatesConservativeQualified || 0,
+        rejectedRoutes: row.rejectedRoutes || 0,
+        quoteValidationFailures: row.quoteValidationFailures || 0,
+        unsupportedRoutes: row.unsupportedRoutes || 0,
+        staleDataRejections: row.staleDataRejections || 0
+      };
+    } catch {
+      return null;
+    }
   }
 
   public purgeOldRecords(retentionHours?: number): number {

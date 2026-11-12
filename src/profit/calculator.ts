@@ -70,6 +70,21 @@ export class ArbitrageProfitCalculator {
       rejectionReasons.push('INSUFFICIENT_LIQUIDITY');
     }
 
+    // 4b. Composable Route & Verification checks
+    if (
+      leg1Quote.executionType === 'INDICATIVE_ONLY' ||
+      leg2Quote.executionType === 'INDICATIVE_ONLY'
+    ) {
+      rejectionReasons.push('UNSUPPORTED_ROUTE');
+    }
+
+    if (
+      (leg1Quote as any).isUnverified ||
+      (leg2Quote as any).isUnverified
+    ) {
+      rejectionReasons.push('QUOTE_UNVERIFIED');
+    }
+
     // 5. Price impact bounds
     if (
       leg1Quote.priceImpactBps > this.config.MAX_PRICE_IMPACT_BPS ||

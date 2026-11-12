@@ -35,6 +35,7 @@ export class ArbitrageScanner {
   private isRunning = false;
   private scanTimer: NodeJS.Timeout | null = null;
   private candidateListeners: CandidateListener[] = [];
+  private vaultToPool = new Map<string, { poolId: string; isA: boolean }>();
 
   private qualifiedCount = 0;
   private rejectedCount = 0;
@@ -42,6 +43,17 @@ export class ArbitrageScanner {
   private quotesProducedCount = 0;
   private lastQuoteCountResetTime = Date.now();
   private currentQuotesPerSec = 0;
+
+  private auditMetrics = {
+    totalEvaluated: 0,
+    uniqueOpportunities: 0,
+    candidatesGrossPositive: 0,
+    candidatesConservativeQualified: 0,
+    rejectedRoutes: 0,
+    quoteValidationFailures: 0,
+    unsupportedRoutes: 0,
+    staleDataRejections: 0
+  };
 
   private currentSolPriceUSDC = new Decimal(125.0);
   private lastSolPriceTime = 0;
@@ -145,6 +157,8 @@ export class ArbitrageScanner {
     try {
       const accounts = await this.rpc.getMultipleAccounts(pubkeys);
       const currentSlot = this.ws.getCurrentSlot();
+      const decodedPools: PoolState[] = [];
+      const vaultsToFetch: { pubkey: PublicKey; poolIndex: number; isA: boolean }[] = [];
 
       for (let i = 0; i < pools.length; i++) {
         const poolConfig = pools[i];
@@ -155,23 +169,83 @@ export class ArbitrageScanner {
         if (adapter) {
           const decoded = adapter.decodePoolState(accountInfo.data, poolConfig.id, currentSlot);
           if (decoded) {
-            // Fetch token vault balances for AMM pools if available
-            if (decoded.extraData && (decoded.extraData as any).baseVault && (decoded.extraData as any).quoteVault) {
-              try {
-                const [balA, balB] = await Promise.all([
-                  this.rpc.getTokenAccountBalance(new PublicKey((decoded.extraData as any).baseVault)),
-                  this.rpc.getTokenAccountBalance(new PublicKey((decoded.extraData as any).quoteVault))
-                ]);
-                decoded.reserveA = balA.amount;
-                decoded.reserveB = balB.amount;
-              } catch {}
+            const extra = decoded.extraData as any;
+            const vaultA = extra?.baseVault || extra?.tokenVaultA || extra?.reserveX;
+            const vaultB = extra?.quoteVault || extra?.tokenVaultB || extra?.reserveY;
+
+            if (vaultA && vaultB) {
+              if (!this.vaultToPool.has(vaultA)) {
+                this.vaultToPool.set(vaultA, { poolId: decoded.id, isA: true });
+                this.ws.subscribeAccount(vaultA, (buf, s) => this.handleVaultAccountUpdate(vaultA, buf, s));
+              }
+              if (!this.vaultToPool.has(vaultB)) {
+                this.vaultToPool.set(vaultB, { poolId: decoded.id, isA: false });
+                this.ws.subscribeAccount(vaultB, (buf, s) => this.handleVaultAccountUpdate(vaultB, buf, s));
+              }
+
+              vaultsToFetch.push({ pubkey: new PublicKey(vaultA), poolIndex: decodedPools.length, isA: true });
+              vaultsToFetch.push({ pubkey: new PublicKey(vaultB), poolIndex: decodedPools.length, isA: false });
             }
-            this.stateCache.setPoolState(decoded);
+            decodedPools.push(decoded);
           }
         }
       }
+
+      // Fetch all vault accounts in a single batch RPC request (avoids 429 rate limit errors)
+      if (vaultsToFetch.length > 0) {
+        try {
+          const vaultAccounts = await this.rpc.getMultipleAccounts(vaultsToFetch.map(v => v.pubkey));
+          for (let i = 0; i < vaultsToFetch.length; i++) {
+            const vInfo = vaultsToFetch[i];
+            const acc = vaultAccounts[i];
+            if (acc && acc.data.length >= 72) {
+              const amount = acc.data.readBigUInt64LE(64);
+              const pool = decodedPools[vInfo.poolIndex];
+              if (pool) {
+                if (vInfo.isA) pool.reserveA = amount;
+                else pool.reserveB = amount;
+              }
+            }
+          }
+        } catch {
+          // If batch vault fetch fails, preserve current state
+        }
+      }
+
+      for (const pool of decodedPools) {
+        const existing = this.stateCache.getPoolState(pool.id);
+        if (existing) {
+          if (pool.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) pool.reserveA = existing.reserveA;
+          if (pool.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) pool.reserveB = existing.reserveB;
+        }
+        this.stateCache.setPoolState(pool);
+      }
     } catch {
       // Handled gracefully
+    }
+  }
+
+  private handleVaultAccountUpdate(vaultPubkey: string, data: Buffer, slot: number): void {
+    // Parse raw SPL token account balance at offset 64 (u64, 8 bytes)
+    if (data.length >= 72) {
+      try {
+        const rawAmount = data.readBigUInt64LE(64);
+        const mapping = this.vaultToPool.get(vaultPubkey);
+        if (mapping) {
+          const pool = this.stateCache.getPoolState(mapping.poolId);
+          if (pool) {
+            if (mapping.isA) pool.reserveA = rawAmount;
+            else pool.reserveB = rawAmount;
+            pool.slot = slot;
+            pool.receivedAt = Date.now();
+
+            // Only evaluate if both reserves are populated for AMM pools
+            if (pool.dex !== 'RAYDIUM_AMM' || ((pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n)) {
+              this.evaluatePoolAgainstOthers(pool).catch(() => {});
+            }
+          }
+        }
+      } catch {}
     }
   }
 
@@ -184,9 +258,20 @@ export class ArbitrageScanner {
 
     const decoded = adapter.decodePoolState(data, poolId, slot);
     if (decoded) {
+      const existing = this.stateCache.getPoolState(poolId);
+      if (existing) {
+        if (decoded.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) {
+          decoded.reserveA = existing.reserveA;
+        }
+        if (decoded.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) {
+          decoded.reserveB = existing.reserveB;
+        }
+      }
       this.stateCache.setPoolState(decoded);
-      // Trigger evaluation for this updated pool
-      this.evaluatePoolAgainstOthers(decoded).catch(() => {});
+      // Trigger evaluation for this updated pool only if hydrated
+      if (decoded.dex !== 'RAYDIUM_AMM' || ((decoded.reserveA ?? 0n) > 0n && (decoded.reserveB ?? 0n) > 0n)) {
+        this.evaluatePoolAgainstOthers(decoded).catch(() => {});
+      }
     }
   }
 
@@ -206,6 +291,7 @@ export class ArbitrageScanner {
         await this.evaluatePair(currentStates[i], currentStates[j]);
       }
     }
+    this.repository.recordAuditMetrics(this.auditMetrics);
   }
 
   private async evaluatePoolAgainstOthers(updatedPool: PoolState): Promise<void> {
@@ -242,9 +328,8 @@ export class ArbitrageScanner {
       let leg1Quote: SwapQuote | null = null;
       if (adapterA) {
         leg1Quote = adapterA.quoteExactInput(poolA, CANONICAL_USDC_MINT, inputAmountUSDC);
-      }
-      if (!leg1Quote) {
-        // Fallback to Jupiter quote if direct adapter quote returned null
+      } else {
+        // Route through Jupiter for venues without direct on-chain math adapters
         leg1Quote = await this.jupiter.getQuote(CANONICAL_USDC_MINT, CANONICAL_WSOL_MINT, inputAmountUSDC);
       }
       if (!leg1Quote) continue;
@@ -260,13 +345,16 @@ export class ArbitrageScanner {
       let leg2Quote: SwapQuote | null = null;
       if (adapterB) {
         leg2Quote = adapterB.quoteExactInput(poolB, CANONICAL_WSOL_MINT, conservativeWSOLIn);
-      }
-      if (!leg2Quote) {
+      } else {
+        // Route through Jupiter for venues without direct on-chain math adapters
         leg2Quote = await this.jupiter.getQuote(CANONICAL_WSOL_MINT, CANONICAL_USDC_MINT, conservativeWSOLIn);
       }
       if (!leg2Quote) continue;
 
       this.quotesProducedCount++;
+
+      // Increment total evaluations
+      this.auditMetrics.totalEvaluated++;
 
       // Evaluate Candidate
       const candidate = this.calculator.evaluateCandidate({
@@ -279,6 +367,11 @@ export class ArbitrageScanner {
         solPriceTimestamp: this.lastSolPriceTime
       });
 
+      // Track gross profitability
+      if (parseFloat(candidate.expectedNetUSDC) > 0) {
+        this.auditMetrics.candidatesGrossPositive++;
+      }
+
       // Deduplicate identical repeated opportunities
       const isDupe = this.stateCache.isDuplicate({
         route: `${poolA.id}->${poolB.id}`,
@@ -286,18 +379,33 @@ export class ArbitrageScanner {
         netProfitUSDC: candidate.minConservativeNetUSDC
       });
 
-      if (isDupe && candidate.status !== 'QUALIFIED_SHADOW') {
-        continue;
+      if (!isDupe) {
+        this.auditMetrics.uniqueOpportunities++;
       }
 
-      // Track statistics
+      // Track statistics and categorized audit metrics
       if (candidate.status === 'QUALIFIED_SHADOW') {
         this.qualifiedCount++;
+        this.auditMetrics.candidatesConservativeQualified++;
       } else {
         this.rejectedCount++;
+        this.auditMetrics.rejectedRoutes++;
         for (const reason of candidate.rejectionReasons) {
           this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
+          if (reason === 'QUOTE_UNVERIFIED' || reason === 'MISSING_TICK_DATA') {
+            this.auditMetrics.quoteValidationFailures++;
+          }
+          if (reason === 'UNSUPPORTED_ROUTE') {
+            this.auditMetrics.unsupportedRoutes++;
+          }
+          if (reason === 'STALE_QUOTE' || reason === 'SLOT_MISMATCH' || reason === 'PRICE_CONVERSION_STALE') {
+            this.auditMetrics.staleDataRejections++;
+          }
         }
+      }
+
+      if (isDupe && candidate.status !== 'QUALIFIED_SHADOW') {
+        continue;
       }
 
       // Persist in SQLite
@@ -337,6 +445,10 @@ export class ArbitrageScanner {
       activePoolCount: allStates.length,
       poolsPerDex
     };
+  }
+
+  public getAuditMetrics() {
+    return { ...this.auditMetrics };
   }
 
   public getRepository(): ArbitrageRepository {

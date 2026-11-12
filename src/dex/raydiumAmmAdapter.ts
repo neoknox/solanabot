@@ -13,11 +13,14 @@ export class RaydiumAmmAdapter implements DexAdapter {
     try {
       const swapFeeNumerator = data.readBigUInt64LE(176);
       const swapFeeDenominator = data.readBigUInt64LE(184);
+      const baseNeedTakePnl = data.readBigUInt64LE(192);
+      const quoteNeedTakePnl = data.readBigUInt64LE(200);
 
       const baseVault = new PublicKey(data.subarray(336, 368)).toBase58();
       const quoteVault = new PublicKey(data.subarray(368, 400)).toBase58();
       const baseMint = new PublicKey(data.subarray(400, 432)).toBase58();
       const quoteMint = new PublicKey(data.subarray(432, 464)).toBase58();
+      const openOrders = new PublicKey(data.subarray(496, 528)).toBase58();
 
       const feeBps = swapFeeDenominator > 0n
         ? Number((swapFeeNumerator * 10000n) / swapFeeDenominator)
@@ -45,6 +48,9 @@ export class RaydiumAmmAdapter implements DexAdapter {
         extraData: {
           baseVault,
           quoteVault,
+          openOrders,
+          baseNeedTakePnl: baseNeedTakePnl.toString(),
+          quoteNeedTakePnl: quoteNeedTakePnl.toString(),
           swapFeeNumerator: swapFeeNumerator.toString(),
           swapFeeDenominator: swapFeeDenominator.toString()
         }
@@ -61,8 +67,21 @@ export class RaydiumAmmAdapter implements DexAdapter {
   ): SwapQuote | null {
     if (amountIn <= 0n) return null;
 
-    const reserveA = pool.reserveA ?? 0n;
-    const reserveB = pool.reserveB ?? 0n;
+    const rawReserveA = pool.reserveA ?? 0n;
+    const rawReserveB = pool.reserveB ?? 0n;
+    if (rawReserveA <= 0n || rawReserveB <= 0n) return null;
+
+    const extra = pool.extraData as {
+      baseNeedTakePnl?: string;
+      quoteNeedTakePnl?: string;
+    } | undefined;
+
+    const basePnl = BigInt(extra?.baseNeedTakePnl || '0');
+    const quotePnl = BigInt(extra?.quoteNeedTakePnl || '0');
+
+    // Effective reserves after deducting uncollected accrued protocol PnL
+    const reserveA = rawReserveA > basePnl ? rawReserveA - basePnl : 0n;
+    const reserveB = rawReserveB > quotePnl ? rawReserveB - quotePnl : 0n;
     if (reserveA <= 0n || reserveB <= 0n) return null;
 
     const isInputA = inputMint === pool.tokenAMint;

@@ -36,7 +36,9 @@ export const KNOWN_PROGRAM_IDS = {
   METEORA_DLMM: 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo',
   METEORA_DAMM: 'Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB',
   PHOENIX: 'PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY',
-  OPENBOOK_V2: 'opnbkNmquXGDVnvrgnvbmvswYcDqNtFtxYnhNPprZGF',
+  OPENBOOK_V2: 'opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb',
+  PANCAKESWAP: 'HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq',
+  MANIFEST: 'MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms',
   PUMP_FUN: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
   JUPITER_V6: 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4'
 } as const;
@@ -69,6 +71,7 @@ const rawConfigSchema = z.object({
   RPC_RATE_LIMIT_RPS: z.coerce.number().min(0.5).default(5),
   DB_PATH: z.string().default('./data/arbitrage_scanner.db'),
   DB_RETENTION_HOURS: z.coerce.number().min(1).default(24),
+  LOG_ALL_REJECTED: z.coerce.boolean().default(false),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info')
 });
 

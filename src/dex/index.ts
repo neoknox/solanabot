@@ -44,6 +44,8 @@ export class DexRegistry {
       case 'RAYDIUM_CLMM':
       case 'METEORA_DAMM':
       case 'PHOENIX':
+      case 'PANCAKESWAP':
+      case 'MANIFEST':
         return 'JUPITER_BUILD_METIS';
 
       case 'ZERO_FI':

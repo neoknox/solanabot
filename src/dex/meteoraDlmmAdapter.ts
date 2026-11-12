@@ -23,7 +23,7 @@ export class MeteoraDlmmAdapter implements DexAdapter {
       const tokenADecimals = isBaseWSOL ? 9 : 6;
       const tokenBDecimals = isBaseWSOL ? 6 : 9;
 
-      // Meteora DLMM base fee is dynamic; estimate starting default 10 bps if not in dynamic bin
+      // Meteora DLMM base fee parameter
       const feeBps = Math.max(1, Math.min(100, Math.round(binStep / 10)));
 
       return {
@@ -63,10 +63,17 @@ export class MeteoraDlmmAdapter implements DexAdapter {
     const extra = pool.extraData as {
       binStep?: number;
       activeId?: number;
+      binLiquidityX?: string;
+      binLiquidityY?: string;
     } | undefined;
 
-    const binStep = extra?.binStep ?? 10;
+    const binStep = extra?.binStep;
     const activeId = extra?.activeId;
+
+    // Fail closed: require verified bin parameters
+    if (binStep === undefined || activeId === undefined) {
+      return null;
+    }
 
     const isInputA = inputMint === pool.tokenAMint;
     const outputMint = isInputA ? pool.tokenBMint : pool.tokenAMint;
@@ -75,84 +82,55 @@ export class MeteoraDlmmAdapter implements DexAdapter {
     const amountInAfterFee = amountIn - feeAmount;
     if (amountInAfterFee <= 0n) return null;
 
-    // If we have activeId, use DLMM price math: price = (1 + binStep * 1e-4)^activeId
-    if (activeId !== undefined) {
-      try {
-        const binStepRatio = 1 + (binStep * 0.0001);
-        const rawPrice = Math.pow(binStepRatio, activeId); // Token Y per Token X (in atomic units ratio)
-        if (isNaN(rawPrice) || rawPrice <= 0 || !isFinite(rawPrice)) {
-          return this.fallbackReservesQuote(pool, inputMint, amountIn, feeAmount, amountInAfterFee);
-        }
-
-        let amountOut: bigint;
-        if (isInputA) {
-          // Token X (WSOL) -> Token Y (USDC): amountOut = amountIn * rawPrice
-          const outNum = Number(amountInAfterFee) * rawPrice;
-          amountOut = BigInt(Math.floor(outNum));
-        } else {
-          // Token Y (USDC) -> Token X (WSOL): amountOut = amountIn / rawPrice
-          const outNum = Number(amountInAfterFee) / rawPrice;
-          amountOut = BigInt(Math.floor(outNum));
-        }
-
-        if (amountOut <= 0n) return null;
-
-        return {
-          quoteSource: 'DIRECT_POOL',
-          poolId: pool.id,
-          dex: this.dex,
-          inputMint,
-          outputMint,
-          inAmount: amountIn,
-          outAmount: amountOut,
-          feeIncluded: true,
-          feeAmount,
-          priceImpactBps: Math.min(pool.feeBps, 50),
-          slot: pool.slot,
-          timestamp: Date.now(),
-          executionType: 'POTENTIAL_ATOMIC'
-        };
-      } catch {
-        return this.fallbackReservesQuote(pool, inputMint, amountIn, feeAmount, amountInAfterFee);
+    try {
+      // Bin price ratio: P = (1 + binStep * 1e-4)^activeId
+      const binStepRatio = 1 + (binStep * 0.0001);
+      const rawPrice = Math.pow(binStepRatio, activeId);
+      if (isNaN(rawPrice) || rawPrice <= 0 || !isFinite(rawPrice)) {
+        return null;
       }
+
+      // Check active bin reserve capacity if available
+      const activeBinResIn = isInputA
+        ? (extra?.binLiquidityX ? BigInt(extra.binLiquidityX) : undefined)
+        : (extra?.binLiquidityY ? BigInt(extra.binLiquidityY) : undefined);
+
+      // If active bin capacity is known and trade exceeds it, bin-array traversal is required.
+      // In the absence of complete multi-bin array state, fail closed to prevent assuming spot price = executable price.
+      if (activeBinResIn !== undefined && amountInAfterFee > activeBinResIn) {
+        return null;
+      }
+
+      let amountOut: bigint;
+      if (isInputA) {
+        // Token X (WSOL) -> Token Y (USDC): amountOut = amountIn * rawPrice
+        const outNum = Number(amountInAfterFee) * rawPrice;
+        amountOut = BigInt(Math.floor(outNum));
+      } else {
+        // Token Y (USDC) -> Token X (WSOL): amountOut = amountIn / rawPrice
+        const outNum = Number(amountInAfterFee) / rawPrice;
+        amountOut = BigInt(Math.floor(outNum));
+      }
+
+      if (amountOut <= 0n) return null;
+
+      return {
+        quoteSource: 'DIRECT_POOL',
+        poolId: pool.id,
+        dex: this.dex,
+        inputMint,
+        outputMint,
+        inAmount: amountIn,
+        outAmount: amountOut,
+        feeIncluded: true,
+        feeAmount,
+        priceImpactBps: Math.min(pool.feeBps, 50),
+        slot: pool.slot,
+        timestamp: Date.now(),
+        executionType: 'POTENTIAL_ATOMIC'
+      };
+    } catch {
+      return null;
     }
-
-    return this.fallbackReservesQuote(pool, inputMint, amountIn, feeAmount, amountInAfterFee);
-  }
-
-  private fallbackReservesQuote(
-    pool: PoolState,
-    inputMint: string,
-    amountIn: bigint,
-    feeAmount: bigint,
-    amountInAfterFee: bigint
-  ): SwapQuote | null {
-    const isInputA = inputMint === pool.tokenAMint;
-    const reserveIn = isInputA ? (pool.reserveA ?? 0n) : (pool.reserveB ?? 0n);
-    const reserveOut = isInputA ? (pool.reserveB ?? 0n) : (pool.reserveA ?? 0n);
-    const outputMint = isInputA ? pool.tokenBMint : pool.tokenAMint;
-
-    if (reserveIn <= 0n || reserveOut <= 0n) return null;
-
-    const amountOut = (reserveOut * amountInAfterFee) / (reserveIn + amountInAfterFee);
-    if (amountOut <= 0n || amountOut >= reserveOut) return null;
-
-    const priceImpactBps = Number((amountInAfterFee * 10000n) / (reserveIn + amountInAfterFee));
-
-    return {
-      quoteSource: 'DIRECT_POOL',
-      poolId: pool.id,
-      dex: this.dex,
-      inputMint,
-      outputMint,
-      inAmount: amountIn,
-      outAmount: amountOut,
-      feeIncluded: true,
-      feeAmount,
-      priceImpactBps,
-      slot: pool.slot,
-      timestamp: Date.now(),
-      executionType: 'POTENTIAL_ATOMIC'
-    };
   }
 }

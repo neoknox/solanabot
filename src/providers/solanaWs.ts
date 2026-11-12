@@ -29,6 +29,8 @@ export class SolanaWsProvider {
   private subscriptionCounter = 1;
   private accountSubscriptions = new Map<string, { id?: number; handler: AccountUpdateHandler }>();
   private subIdToPubkey = new Map<number, string>();
+  private reqIdToPubkey = new Map<number, string>();
+  private reqIdForSlot: number | null = null;
   private slotSubId: number | null = null;
 
   private onReconnectCallbacks: Array<() => void> = [];
@@ -80,6 +82,8 @@ export class SolanaWsProvider {
   private handleDisconnect(): void {
     this.slotSubId = null;
     this.subIdToPubkey.clear();
+    this.reqIdToPubkey.clear();
+    this.reqIdForSlot = null;
     for (const [key, val] of this.accountSubscriptions.entries()) {
       val.id = undefined;
     }
@@ -105,6 +109,7 @@ export class SolanaWsProvider {
   private subscribeSlot(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const reqId = this.subscriptionCounter++;
+    this.reqIdForSlot = reqId;
     this.ws.send(JSON.stringify({
       jsonrpc: '2.0',
       id: reqId,
@@ -123,6 +128,7 @@ export class SolanaWsProvider {
   private sendAccountSubscribe(pubkey: string): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const reqId = this.subscriptionCounter++;
+    this.reqIdToPubkey.set(reqId, pubkey);
     this.ws.send(JSON.stringify({
       jsonrpc: '2.0',
       id: reqId,
@@ -149,9 +155,21 @@ export class SolanaWsProvider {
 
       // Subscription confirmation result
       if (msg.id && typeof msg.result === 'number') {
-        // Could be slot or account sub
-        if (this.slotSubId === null) {
+        if (msg.id === this.reqIdForSlot) {
           this.slotSubId = msg.result;
+          this.reqIdForSlot = null;
+          return;
+        }
+
+        const pubkey = this.reqIdToPubkey.get(msg.id);
+        if (pubkey) {
+          const sub = this.accountSubscriptions.get(pubkey);
+          if (sub) {
+            sub.id = msg.result;
+          }
+          this.subIdToPubkey.set(msg.result, pubkey);
+          this.reqIdToPubkey.delete(msg.id);
+          return;
         }
         return;
       }
@@ -174,17 +192,24 @@ export class SolanaWsProvider {
         const slot = msg.params?.result?.context?.slot || this.currentSlot;
         if (val && val.data && Array.isArray(val.data)) {
           const buffer = Buffer.from(val.data[0], 'base64');
-          // If we mapped subId, notify that specific handler, or broadcast to matching accounts
+          // Dispatch ONLY to the exact subscribed account handler
+          const pubkey = this.subIdToPubkey.get(subId);
+          if (pubkey) {
+            const sub = this.accountSubscriptions.get(pubkey);
+            if (sub) {
+              sub.handler(buffer, slot);
+              return;
+            }
+          }
+
+          // Secondary lookup by matching sub.id
           for (const sub of this.accountSubscriptions.values()) {
             if (sub.id === subId) {
               sub.handler(buffer, slot);
               return;
             }
           }
-          // Fallback if subId wasn't mapped explicitly
-          for (const sub of this.accountSubscriptions.values()) {
-            sub.handler(buffer, slot);
-          }
+          // Do NOT broadcast to arbitrary handlers if subId is unmapped
         }
       }
     } catch {

@@ -5,6 +5,12 @@ import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT } from '../config/index.js';
 
 const Q64 = 1n << 64n;
 
+export function tickIndexToSqrtPriceX64(tickIndex: number): bigint {
+  const ratio = Math.pow(1.0001, tickIndex / 2);
+  const q64Num = 18446744073709551616; // 2^64
+  return BigInt(Math.floor(ratio * q64Num));
+}
+
 export class OrcaWhirlpoolAdapter implements DexAdapter {
   public readonly dex: DexType = 'ORCA_WHIRLPOOL';
   public readonly programId: string = KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL;
@@ -17,7 +23,7 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
       const feeRateRaw = data.readUInt16LE(43); // hundredths of a basis point (e.g. 400 = 4 bps)
       const feeBps = Math.max(1, Math.round(feeRateRaw / 100));
 
-      // Read liquidity (u128 at offset 49 or 47..63)
+      // Read liquidity (u128 at offset 49..65)
       const liquidityLow = data.readBigUInt64LE(49);
       const liquidityHigh = data.readBigUInt64LE(57);
       const liquidity = (liquidityHigh << 64n) | liquidityLow;
@@ -79,22 +85,24 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
       liquidity?: string;
       sqrtPrice?: string;
       feeRateRaw?: number;
+      tickCurrent?: number;
+      tickSpacing?: number;
     } | undefined;
 
     const liquidity = BigInt(extra?.liquidity || '0');
     const sqrtPrice = BigInt(extra?.sqrtPrice || '0');
-    if (liquidity <= 0n || sqrtPrice <= 0n) {
-      // If tick data not yet loaded or reserves available fallback to constant-product approx with pool reserves
-      if ((pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n) {
-        return this.quoteFromReserves(pool, inputMint, amountIn);
-      }
+    const tickCurrent = extra?.tickCurrent;
+    const tickSpacing = extra?.tickSpacing || 1;
+
+    // Fail closed if pool concentrated liquidity parameters are missing or zero
+    if (liquidity <= 0n || sqrtPrice <= 0n || tickCurrent === undefined) {
       return null;
     }
 
     const isInputA = inputMint === pool.tokenAMint;
     const outputMint = isInputA ? pool.tokenBMint : pool.tokenAMint;
 
-    // Fee deduction (feeRateRaw is in 1/1,000,000, i.e. 100 = 1 bps)
+    // Adaptive fee deduction (feeRateRaw is in hundredths of bps: 100 = 1 bps, 1,000,000 = 100%)
     const feeRateRaw = BigInt(extra?.feeRateRaw ?? pool.feeBps * 100);
     const feeDenominator = 1000000n;
     const feeAmount = (amountIn * feeRateRaw) / feeDenominator;
@@ -102,13 +110,29 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
 
     if (amountInAfterFee <= 0n) return null;
 
+    // Boundary check: Verify whether trade exceeds the current initialized tick range
+    // If trade crosses the boundary, tick arrays are required. If tick arrays are incomplete, fail closed.
     let amountOut = 0n;
     let priceImpactBps = 0;
 
     try {
       if (isInputA) {
-        // Swapping Token A -> Token B (e.g. WSOL -> USDC)
-        // Price decreases: sqrtPriceNew = (L * sqrtPrice) / (L + amountIn * sqrtPrice / Q64)
+        // Swapping Token A -> Token B (WSOL -> USDC): price moves down towards lower tick boundary
+        const nextLowerTick = Math.floor(tickCurrent / tickSpacing) * tickSpacing;
+        const sqrtPriceTarget = tickIndexToSqrtPriceX64(nextLowerTick);
+
+        if (sqrtPriceTarget < sqrtPrice) {
+          const deltaSqrt = sqrtPrice - sqrtPriceTarget;
+          const maxInA = (liquidity * deltaSqrt * Q64) / (sqrtPrice * sqrtPriceTarget);
+          // If input exceeds active tick capacity and full tick-array traversal is not loaded, reject unverified quote
+          if (amountInAfterFee > maxInA && maxInA > 0n) {
+            // Crossed tick array boundary without verified tick array state
+            return null;
+          }
+        }
+
+        // Exact concentrated liquidity math within active tick:
+        // sqrtPriceNew = (L * sqrtPrice) / (L + amountIn * sqrtPrice / Q64)
         const product = (amountInAfterFee * sqrtPrice) / Q64;
         const denominator = liquidity + product;
         if (denominator <= 0n) return null;
@@ -121,13 +145,25 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
           priceImpactBps = Number(((sqrtPrice - sqrtPriceNew) * 20000n) / sqrtPrice);
         }
       } else {
-        // Swapping Token B -> Token A (e.g. USDC -> WSOL)
-        // Price increases: sqrtPriceNew = sqrtPrice + (amountIn * Q64) / L
+        // Swapping Token B -> Token A (USDC -> WSOL): price moves up towards upper tick boundary
+        const nextUpperTick = (Math.floor(tickCurrent / tickSpacing) + 1) * tickSpacing;
+        const sqrtPriceTarget = tickIndexToSqrtPriceX64(nextUpperTick);
+
+        if (sqrtPriceTarget > sqrtPrice) {
+          const deltaSqrt = sqrtPriceTarget - sqrtPrice;
+          const maxInB = (liquidity * deltaSqrt) / Q64;
+          // If input exceeds active tick capacity, reject unverified quote without tick arrays
+          if (amountInAfterFee > maxInB && maxInB > 0n) {
+            return null;
+          }
+        }
+
+        // Exact concentrated liquidity math within active tick:
+        // sqrtPriceNew = sqrtPrice + (amountIn * Q64) / L
         const deltaSqrt = (amountInAfterFee * Q64) / liquidity;
         const sqrtPriceNew = sqrtPrice + deltaSqrt;
         if (sqrtPriceNew <= 0n) return null;
 
-        // amountOut = (L * deltaSqrt * Q64) / (sqrtPriceNew * sqrtPrice)
         const numerator = liquidity * deltaSqrt * Q64;
         const denominator = sqrtPriceNew * sqrtPrice;
         if (denominator <= 0n) return null;
@@ -154,39 +190,6 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
       feeIncluded: true,
       feeAmount,
       priceImpactBps: Math.max(0, priceImpactBps),
-      slot: pool.slot,
-      timestamp: Date.now(),
-      executionType: 'POTENTIAL_ATOMIC'
-    };
-  }
-
-  private quoteFromReserves(pool: PoolState, inputMint: string, amountIn: bigint): SwapQuote | null {
-    const isInputA = inputMint === pool.tokenAMint;
-    const reserveIn = isInputA ? (pool.reserveA ?? 0n) : (pool.reserveB ?? 0n);
-    const reserveOut = isInputA ? (pool.reserveB ?? 0n) : (pool.reserveA ?? 0n);
-    const outputMint = isInputA ? pool.tokenBMint : pool.tokenAMint;
-
-    if (reserveIn <= 0n || reserveOut <= 0n) return null;
-
-    const feeDeduction = (amountIn * BigInt(pool.feeBps)) / 10000n;
-    const inAfterFee = amountIn - feeDeduction;
-    const outAmount = (reserveOut * inAfterFee) / (reserveIn + inAfterFee);
-
-    if (outAmount <= 0n || outAmount >= reserveOut) return null;
-
-    const priceImpactBps = Number((inAfterFee * 10000n) / (reserveIn + inAfterFee));
-
-    return {
-      quoteSource: 'DIRECT_POOL',
-      poolId: pool.id,
-      dex: this.dex,
-      inputMint,
-      outputMint,
-      inAmount: amountIn,
-      outAmount,
-      feeIncluded: true,
-      feeAmount: feeDeduction,
-      priceImpactBps,
       slot: pool.slot,
       timestamp: Date.now(),
       executionType: 'POTENTIAL_ATOMIC'

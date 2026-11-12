@@ -56,6 +56,19 @@ export function initDatabase(config: AppConfig): Database.Database {
     );
 
     CREATE INDEX IF NOT EXISTS idx_events_timestamp ON provider_events(timestamp);
+
+    CREATE TABLE IF NOT EXISTS audit_metrics (
+      run_id TEXT PRIMARY KEY,
+      total_evaluated INTEGER NOT NULL,
+      unique_opportunities INTEGER NOT NULL,
+      candidates_gross_positive INTEGER NOT NULL,
+      candidates_conservative_qualified INTEGER NOT NULL,
+      rejected_routes INTEGER NOT NULL,
+      quote_validation_failures INTEGER NOT NULL,
+      unsupported_routes INTEGER NOT NULL,
+      stale_data_rejections INTEGER NOT NULL,
+      timestamp INTEGER NOT NULL
+    );
   `);
 
   return db;
