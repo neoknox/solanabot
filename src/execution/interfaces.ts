@@ -94,6 +94,11 @@ export interface AlternativeRpcSender {
  * 
  * Strict specifications for eventual atomic multi-hop transaction composition.
  * No signing, no transaction broadcast, and no keypairs in Phase 1.1 / Phase 1.2.
+ * 
+ * CRITICAL EXECUTION HONESTY NOTICE:
+ * The on-chain profit guard currently exists solely as an architectural interface
+ * specification. It is NOT implemented on-chain, NOT simulated on-chain, and does
+ * NOT protect real capital. All opportunities remain strictly EXECUTION_UNVERIFIED.
  */
 
 export interface ExecutionInstructionLayout {

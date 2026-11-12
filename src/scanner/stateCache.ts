@@ -10,9 +10,13 @@ export interface DedupeKey {
 export class StateCache {
   private poolStates = new Map<string, PoolState>();
   private dedupeCache = new Map<string, number>();
+  private poolRevisions = new Map<string, number>();
   private readonly dedupeWindowMs = 5000;
 
   public setPoolState(state: PoolState): void {
+    const rev = (this.poolRevisions.get(state.id) || 0) + 1;
+    this.poolRevisions.set(state.id, rev);
+    state.stateRevision = rev;
     this.poolStates.set(state.id, state);
   }
 

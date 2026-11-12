@@ -109,6 +109,24 @@ export class TradeSizer {
       currentExpectedUnits = q.outAmount;
     }
 
+    // If expected path failed on ANY leg, fail closed immediately
+    if (expectedFailedReason || expectedQuotes.length < legs.length || currentExpectedUnits <= 0n) {
+      const reason = expectedFailedReason || 'QUOTE_UNVERIFIED';
+      return {
+        sizeUSDC,
+        inputUnits,
+        finalExpectedUnits: 0n,
+        finalConservativeUnits: 0n,
+        expectedNetUSDC: new Decimal(-999),
+        conservativeNetUSDC: new Decimal(-999),
+        expectedQuotes: [],
+        conservativeQuotes: [],
+        quotes: [],
+        isViable: false,
+        rejectionReason: reason
+      };
+    }
+
     // 2. CONSERVATIVE MINIMUM OUTPUT PATH (Exact chained quotes with per-leg slippage deduction)
     const conservativeQuotes: SwapQuote[] = [];
     let currentConservativeUnits = inputUnits;
@@ -132,6 +150,14 @@ export class TradeSizer {
         } else {
           conservativeFailedReason = 'QUOTE_UNVERIFIED';
         }
+
+        if (leg.pool.dex === 'ORCA_WHIRLPOOL') {
+          if (conservativeFailedReason === 'TICK_BOUNDARY_EXCEEDED') {
+            this.orcaTickBoundaryAttempts++;
+          } else {
+            this.orcaOtherFailureAttempts++;
+          }
+        }
         break;
       }
 
@@ -140,8 +166,14 @@ export class TradeSizer {
       currentConservativeUnits = q.outAmount - slippage;
     }
 
-    if (expectedFailedReason || expectedQuotes.length < legs.length) {
-      const reason = expectedFailedReason || 'QUOTE_UNVERIFIED';
+    // MANDATORY SAFETY GATE: Conservative path MUST complete every route leg.
+    // If ANY leg fails, reject immediately. Never substitute expected output.
+    if (
+      conservativeFailedReason ||
+      conservativeQuotes.length < legs.length ||
+      currentConservativeUnits <= 0n
+    ) {
+      const reason = conservativeFailedReason || 'QUOTE_UNVERIFIED';
       return {
         sizeUSDC,
         inputUnits,
@@ -159,6 +191,22 @@ export class TradeSizer {
 
     const finalExpectedUnits = currentExpectedUnits;
     const finalConservativeUnits = currentConservativeUnits;
+
+    if (finalExpectedUnits <= 0n || finalConservativeUnits <= 0n) {
+      return {
+        sizeUSDC,
+        inputUnits,
+        finalExpectedUnits: 0n,
+        finalConservativeUnits: 0n,
+        expectedNetUSDC: new Decimal(-999),
+        conservativeNetUSDC: new Decimal(-999),
+        expectedQuotes: [],
+        conservativeQuotes: [],
+        quotes: [],
+        isViable: false,
+        rejectionReason: 'INSUFFICIENT_LIQUIDITY'
+      };
+    }
 
     const finalExpectedDecimal = new Decimal(finalExpectedUnits.toString()).div(1e6);
     const finalConservativeDecimal = new Decimal(finalConservativeUnits.toString()).div(1e6);

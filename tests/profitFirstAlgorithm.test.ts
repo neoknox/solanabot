@@ -313,10 +313,65 @@ describe('Profit-First Opportunity Management Algorithm Acceptance', () => {
 
     const scored = scorer.scoreCandidate(candidate, [metrics]);
     expect(scored.executionProbability).toBe('UNCALIBRATED');
+    expect(scored.breakdown.competitionPenalty).toBe(10); // Strictly neutral default (10/20), NOT 20/20 low-competition bonus
+    expect(scored.breakdown.competitionPenalty).not.toBe(20);
     expect(scored.score).toBeGreaterThan(0);
   });
 
-  it('8. Mixed / Incompatible Snapshot Slot Rejection (SLOT_MISMATCH)', () => {
+  it('8. Incomplete Conservative Quote Path Regression Gate: NEVER qualifies for profit', () => {
+    const sizer = new TradeSizer(config);
+
+    // Mock adapter where expected quote succeeds, but conservative input (after slippage) fails
+    const failingConservativeAdapter = {
+      quoteExactInput: (pool: PoolState, inputMint: string, amount: bigint) => {
+        // If amount has slippage deducted (e.g. less than the expected leg 1 outAmount), simulate failure
+        if (amount < 666666666n) {
+          return null; // Conservative path fails on leg 2
+        }
+        return {
+          quoteSource: 'DIRECT_POOL' as const,
+          poolId: pool.id,
+          dex: pool.dex,
+          inputMint,
+          outputMint: CANONICAL_USDC_MINT,
+          inAmount: amount,
+          outAmount: 110000000n, // $110 USDC (profitable if it were to succeed)
+          feeIncluded: true,
+          feeAmount: 25000n,
+          priceImpactBps: 5,
+          slot: 1000,
+          timestamp: Date.now(),
+          executionType: 'POTENTIAL_ATOMIC' as const
+        };
+      },
+      getLastFailureReason: () => 'TICK_BOUNDARY_EXCEEDED' as const,
+      decodePoolState: () => null
+    };
+
+    const legsWithFailingConservative: QuoterLeg[] = [
+      { pool: poolA, adapter: new RaydiumAmmAdapter(), inputMint: CANONICAL_USDC_MINT, outputMint: CANONICAL_WSOL_MINT, slippageBps: 10 },
+      { pool: poolB, adapter: failingConservativeAdapter as any, inputMint: CANONICAL_WSOL_MINT, outputMint: CANONICAL_USDC_MINT, slippageBps: 10 }
+    ];
+
+    const evalResult = sizer.evaluateSize(100, legsWithFailingConservative, dummyCosts, 1000);
+
+    // CRITICAL INVARIANT: Incomplete conservative path MUST fail closed
+    expect(evalResult.isViable).toBe(false);
+    expect(evalResult.finalConservativeUnits).toBe(0n);
+    expect(evalResult.finalExpectedUnits).toBe(0n);
+    expect(evalResult.conservativeNetUSDC.toNumber()).toBeLessThan(0);
+    expect(evalResult.conservativeQuotes.length).toBe(0);
+    expect(evalResult.expectedQuotes.length).toBe(0);
+    expect(evalResult.rejectionReason).toBe('TICK_BOUNDARY_EXCEEDED');
+
+    // findOptimalSize must reject completely and return zero quotes
+    const optResult = sizer.findOptimalSize(legsWithFailingConservative, dummyCosts, 1000);
+    expect(optResult.optimalQuotes.length).toBe(0);
+    expect(optResult.conservativeQuotes.length).toBe(0);
+    expect(optResult.maxConservativeNetUSDC.toNumber()).toBeLessThan(0);
+  });
+
+  it('9. Mixed / Incompatible Snapshot Slot Rejection (SLOT_MISMATCH)', () => {
     const calc = new ArbitrageProfitCalculator(config);
     // Leg 1 is at slot 1000, Leg 2 is at slot 1050 (gap = 50 > MAX_SLOT_GAP 10)
     const quoteIn = { inAmount: 100000000n, outAmount: 666666666n, poolId: poolA.id, dex: poolA.dex, slot: 1000, timestamp: Date.now() } as SwapQuote;
@@ -338,7 +393,7 @@ describe('Profit-First Opportunity Management Algorithm Acceptance', () => {
     expect(res.qualityLabel).toBe('INVALID');
   });
 
-  it('9. Unsupported Venue Rejection (UNSUPPORTED_ROUTE)', () => {
+  it('10. Unsupported Venue Rejection (UNSUPPORTED_ROUTE)', () => {
     const calc = new ArbitrageProfitCalculator(config);
     const quoteIn = { inAmount: 100000000n, outAmount: 666666666n, poolId: poolA.id, dex: poolA.dex, slot: 1000, timestamp: Date.now() } as SwapQuote;
     const quoteOut = {
@@ -368,7 +423,7 @@ describe('Profit-First Opportunity Management Algorithm Acceptance', () => {
     expect(res.qualityLabel).toBe('INDICATIVE_ONLY');
   });
 
-  it('10. Execution Contract Specification & Atomic Profit Guard Readiness', () => {
+  it('11. Execution Contract Specification & Execution Honesty Notice', () => {
     const candidate: ArbitrageCandidate = {
       candidateId: 'opp-atomic',
       routeName: 'Raydium->Orca WSOL/USDC',
@@ -394,7 +449,64 @@ describe('Profit-First Opportunity Management Algorithm Acceptance', () => {
       costs: dummyCosts
     };
 
+    // Strict execution honesty: on-chain profit guard is an architectural specification only,
+    // not implemented on-chain, not simulated, and protecting zero real funds.
     expect(candidate.executionStatus).toBe('EXECUTION_UNVERIFIED');
     expect(Number(candidate.minConservativeNetUSDC)).toBeGreaterThanOrEqual(0.50);
+  });
+
+  it('12. State Version Revision Fingerprinting & Funnel Monotonicity Gate', () => {
+    const cache = new StateCache();
+    const tracker = new OpportunityTracker();
+
+    // 1. Two updates to the same pool within the same slot receive distinct revision numbers
+    const stateA1: PoolState = { ...poolA, slot: 2000 };
+    cache.setPoolState(stateA1);
+    expect(stateA1.stateRevision).toBe(1);
+
+    const stateA2: PoolState = { ...poolA, slot: 2000, reserveA: 1000500000000n };
+    cache.setPoolState(stateA2);
+    expect(stateA2.stateRevision).toBe(2);
+
+    // 2. Same snapshot recalculation does NOT count as independent survival
+    const candidateSameSnap: ArbitrageCandidate = {
+      candidateId: 'cand-same',
+      routeName: 'Route',
+      direction: 'USDC->WSOL->USDC',
+      cycleType: '2_LEG',
+      timestamp: 2000000,
+      status: 'QUALIFIED_SHADOW',
+      qualityLabel: 'SHADOW_QUALIFIED',
+      executionStatus: 'EXECUTION_UNVERIFIED',
+      inputAmountUSDC: 100000000n,
+      optimalSizeUSDC: 100,
+      leg1ExpectedOutWSOL: 666666666n,
+      leg1ConservativeOutWSOL: 666000000n,
+      leg2ExpectedOutUSDC: 102000000n,
+      leg2ConservativeOutUSDC: 101500000n,
+      expectedNetUSDC: '2.00',
+      minConservativeNetUSDC: '1.50',
+      rejectionReasons: [],
+      quoteAgeMs: 5,
+      slotGap: 0,
+      stateVersion: 'poolA@s2000:r1|poolB@s2000:r1',
+      leg1Quote: { poolId: 'poolA', dex: 'RAYDIUM_AMM' } as any,
+      leg2Quote: { poolId: 'poolB', dex: 'ORCA_WHIRLPOOL' } as any,
+      costs: dummyCosts
+    };
+
+    const seen1 = tracker.trackOpportunity(candidateSameSnap, 2000);
+    expect(seen1.observedSnapshotsCount).toBe(1);
+
+    // Re-evaluating identical stateVersion in same or subsequent tick
+    candidateSameSnap.timestamp = 2000500;
+    const seen2 = tracker.trackOpportunity(candidateSameSnap, 2000);
+    expect(seen2.observedSnapshotsCount).toBe(1); // Did not increase
+
+    // Only advancing stateVersion increments observed snapshots count
+    candidateSameSnap.timestamp = 2001000;
+    candidateSameSnap.stateVersion = 'poolA@s2000:r2|poolB@s2000:r1';
+    const seen3 = tracker.trackOpportunity(candidateSameSnap, 2000);
+    expect(seen3.observedSnapshotsCount).toBe(2);
   });
 });

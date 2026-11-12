@@ -522,6 +522,18 @@ export class ArbitrageScanner {
     }
   }
 
+  private computePoolFingerprint(pool: PoolState): string {
+    const extra = (pool.extraData || {}) as any;
+    const rev = pool.stateRevision || 0;
+    if (pool.dex === 'ORCA_WHIRLPOOL') {
+      return `${pool.id}@s${pool.slot}:r${rev}:p${extra.sqrtPrice || 0}:t${extra.tickCurrent || 0}`;
+    }
+    if (pool.dex === 'RAYDIUM_AMM') {
+      return `${pool.id}@s${pool.slot}:r${rev}:a${pool.reserveA || 0}:b${pool.reserveB || 0}:oo${extra.openOrdersSlot || 0}`;
+    }
+    return `${pool.id}@s${pool.slot}:r${rev}:a${pool.reserveA || 0}:b${pool.reserveB || 0}`;
+  }
+
   private evaluateAffectedRoutes(poolId: string, monotonicReceiptTime?: number): void {
     const affectedRoutes = this.routeIndex.getRoutesAffectedByPool(poolId);
     for (const route of affectedRoutes) {
@@ -531,6 +543,20 @@ export class ArbitrageScanner {
 
   private evaluateIndexedRoute(route: IndexedDirectedRoute, monotonicReceiptTime?: number): void {
     this.auditMetrics.configuredRouteCount = this.routeIndex.getAllRoutes().length;
+
+    // 1. TOTAL ATTEMPTS EVALUATED: Every candidate route evaluation entering the pipeline
+    this.auditMetrics.totalEvaluated++;
+    if (route.cycleType === '3_LEG') {
+      this.auditMetrics.threeLegEvaluated = (this.auditMetrics.threeLegEvaluated || 0) + 1;
+    } else {
+      this.auditMetrics.twoLegEvaluated = (this.auditMetrics.twoLegEvaluated || 0) + 1;
+    }
+    if (route.isIntraDex) {
+      this.auditMetrics.intraDexEvaluated = (this.auditMetrics.intraDexEvaluated || 0) + 1;
+    } else {
+      this.auditMetrics.interDexEvaluated = (this.auditMetrics.interDexEvaluated || 0) + 1;
+    }
+
     const quoterLegs: QuoterLeg[] = [];
     let oldestSlot = Infinity;
 
@@ -547,13 +573,25 @@ export class ArbitrageScanner {
       }
 
       const pool = this.stateCache.getPoolState(legDef.poolId);
-      if (!pool) return;
+      if (!pool) {
+        this.rejectedCount++;
+        this.auditMetrics.rejectedRoutes++;
+        return;
+      }
 
       // Fail closed if AMM reserves are not yet hydrated
-      if (pool.dex === 'RAYDIUM_AMM' && ((pool.reserveA ?? 0n) <= 0n || (pool.reserveB ?? 0n) <= 0n)) return;
+      if (pool.dex === 'RAYDIUM_AMM' && ((pool.reserveA ?? 0n) <= 0n || (pool.reserveB ?? 0n) <= 0n)) {
+        this.rejectedCount++;
+        this.auditMetrics.rejectedRoutes++;
+        return;
+      }
 
       const adapter = dexRegistry.getAdapter(legDef.dex);
-      if (!adapter) return;
+      if (!adapter) {
+        this.rejectedCount++;
+        this.auditMetrics.rejectedRoutes++;
+        return;
+      }
 
       let slippageBps = this.config.SLIPPAGE_BPS_LEG1;
       if (idx === 1) slippageBps = this.config.SLIPPAGE_BPS_LEG2;
@@ -570,16 +608,19 @@ export class ArbitrageScanner {
       if (pool.slot < oldestSlot) oldestSlot = pool.slot;
     }
 
-    if (quoterLegs.length < route.legs.length) return;
-
-    // All pool dependencies are verified, hydrated, and compatible
-    this.auditMetrics.stateReadyRouteCount = (this.auditMetrics.stateReadyRouteCount || 0) + 1;
+    if (quoterLegs.length < route.legs.length) {
+      this.rejectedCount++;
+      this.auditMetrics.rejectedRoutes++;
+      return;
+    }
 
     const currentSlot = this.ws.getCurrentSlot();
     const wsConnected = this.ws.getHealth() !== 'DISCONNECTED';
 
     // Fail closed: Require fresh, live, non-fictitious SOL/USDC price for fee conversions
     if (!this.currentSolPriceUSDC || this.lastSolPriceTime <= 0) {
+      this.rejectedCount++;
+      this.auditMetrics.rejectedRoutes++;
       return;
     }
 
@@ -590,10 +631,17 @@ export class ArbitrageScanner {
       requiresAtaSetup: route.legs.some(l => l.inputMint === CANONICAL_WSOL_MINT || l.outputMint === CANONICAL_WSOL_MINT)
     });
 
-    if (!costResult.isComplete || !costResult.breakdown) return;
+    if (!costResult.isComplete || !costResult.breakdown) {
+      this.rejectedCount++;
+      this.auditMetrics.rejectedRoutes++;
+      return;
+    }
 
-    // Deterministic state version uniquely identifies this exact multi-pool snapshot
-    const stateVersion = quoterLegs.map(l => `${l.pool.id}@${l.pool.slot}`).join(':');
+    // 2. STATE-READY STAGE: All pool dependencies are verified, hydrated, compatible, and cost breakdown is complete
+    this.auditMetrics.stateReadyRouteCount = (this.auditMetrics.stateReadyRouteCount || 0) + 1;
+
+    // Deterministic state fingerprint uniquely identifies verified account revisions and state snapshots
+    const stateVersion = quoterLegs.map(l => this.computePoolFingerprint(l.pool)).join('|');
 
     // Fast optimal trade sizing
     const quoteStart = performance.now();
@@ -603,20 +651,11 @@ export class ArbitrageScanner {
 
     this.quotesProducedCount += sizerResult.evaluatedSizesCount * route.legs.length;
 
-    // Profit validation & audit metrics
-    this.auditMetrics.totalEvaluated++;
-    if (route.cycleType === '3_LEG') {
-      this.auditMetrics.threeLegEvaluated = (this.auditMetrics.threeLegEvaluated || 0) + 1;
-    } else {
-      this.auditMetrics.twoLegEvaluated = (this.auditMetrics.twoLegEvaluated || 0) + 1;
-    }
-    if (route.isIntraDex) {
-      this.auditMetrics.intraDexEvaluated = (this.auditMetrics.intraDexEvaluated || 0) + 1;
-    } else {
-      this.auditMetrics.interDexEvaluated = (this.auditMetrics.interDexEvaluated || 0) + 1;
-    }
-
-    if (sizerResult.optimalQuotes.length < route.legs.length) {
+    // Both expected quotes and conservative quotes MUST complete every route leg
+    if (
+      sizerResult.optimalQuotes.length < route.legs.length ||
+      sizerResult.conservativeQuotes.length < route.legs.length
+    ) {
       this.rejectedCount++;
       this.auditMetrics.rejectedRoutes++;
       const reason = (sizerResult.allEvaluations[0]?.rejectionReason || 'INSUFFICIENT_LIQUIDITY') as RejectionReasonCode;
@@ -630,7 +669,7 @@ export class ArbitrageScanner {
       return;
     }
 
-    // Exact quotes successfully produced for all legs
+    // 3. QUOTE-VALID STAGE: Exact quotes successfully produced for all legs on both expected and conservative paths
     this.auditMetrics.quoteValidRouteCount = (this.auditMetrics.quoteValidRouteCount || 0) + 1;
 
     const validationStart = performance.now();

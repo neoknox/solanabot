@@ -168,6 +168,7 @@ export interface PoolState {
   feeBps: number;                     // Base fee in basis points (1 bps = 0.01%)
   slot: number;                       // Slot at which state was read
   receivedAt: number;                 // Local millisecond timestamp
+  stateRevision?: number;             // Monotonic account update revision counter
   liquidityUsd: number;               // Estimated TVL in USD
   feedHealth: FeedHealth;
   extraData?: Record<string, unknown>; // DEX-specific (tickSpacing, sqrtPrice, activeBinId, etc.)

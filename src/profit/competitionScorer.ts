@@ -50,18 +50,26 @@ export class CompetitionScorer {
     rationale.push(`Quote freshness: age ${candidate.quoteAgeMs}ms (-${agePenalty}), slot gap ${candidate.slotGap} (-${slotPenalty}) = ${quoteFreshnessScore}/15 pts`);
 
     // 4. Competition & Pool Contention Factor (0 to 20 pts awarded)
-    // Lower pool competition score gives higher awarded score
-    // With no observed competitor transactions, contention is UNKNOWN and no artificial penalty is applied.
-    let avgPoolCompetition = 0;
+    // Lower pool competition score gives higher awarded score.
+    // If no competitor transactions are observed, contention is UNKNOWN and uncalibrated.
+    // MANDATORY FIX: Do NOT reward UNKNOWN as LOW competition (20/20 pts).
+    // Instead, assign a neutral uncalibrated score of 10/20 pts without inventing market advantages.
+    let competitionPenalty = 10; // Neutral default for UNKNOWN / UNCALIBRATED
+    let avgPoolCompetition = -1;
+
     if (poolMetricsList.length > 0) {
       const observedMetrics = poolMetricsList.filter(m => m.totalObservedTx > 0);
       if (observedMetrics.length > 0) {
         const sumComp = observedMetrics.reduce((acc, m) => acc + m.historicalCompetitionScore, 0);
         avgPoolCompetition = Math.round(sumComp / observedMetrics.length);
+        competitionPenalty = Math.max(0, Math.min(20, Math.round(20 - (avgPoolCompetition * 0.20))));
+        rationale.push(`Competition: observed pool competition score ${avgPoolCompetition}/100 = ${competitionPenalty}/20 pts awarded`);
+      } else {
+        rationale.push(`Competition: UNKNOWN / UNCALIBRATED (0 observed tx samples) = ${competitionPenalty}/20 pts (neutral default, no unearned low-competition bonus)`);
       }
+    } else {
+      rationale.push(`Competition: UNKNOWN / UNCALIBRATED (no metrics available) = ${competitionPenalty}/20 pts (neutral default, no unearned low-competition bonus)`);
     }
-    const competitionPenalty = Math.max(0, Math.min(20, Math.round(20 - (avgPoolCompetition * 0.20))));
-    rationale.push(`Competition: observed pool competition score ${avgPoolCompetition}/100 = ${competitionPenalty}/20 pts awarded`);
 
     // 5. Route Complexity Score (0 to 10 pts)
     let complexityScore = 8;
