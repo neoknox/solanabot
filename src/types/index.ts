@@ -32,7 +32,8 @@ export type DexSupportStatus =
 export type RouteCategory =
   | 'DIRECT_POOL'
   | 'JUPITER_BUILD_METIS'
-  | 'JUPITER_ORDER_INDICATIVE';
+  | 'JUPITER_ORDER_INDICATIVE'
+  | 'UNVERIFIED';
 
 export type ExecutionTag =
   | 'POTENTIAL_ATOMIC'            // Plausible future single-tx atomic execution route
@@ -169,6 +170,8 @@ export interface SwapQuote {
   timestamp: number;                  // Local unix timestamp in milliseconds
   executionType: ExecutionTag;
   rawRouteInfo?: unknown;
+  isUnverified?: boolean;
+  unverifiedReason?: string;
 }
 
 export interface CostBreakdown {

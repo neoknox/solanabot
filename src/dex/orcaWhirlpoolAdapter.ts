@@ -198,7 +198,7 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
       feeAmount,
       priceImpactBps: Math.max(0, priceImpactBps),
       slot: pool.slot,
-      timestamp: Date.now(),
+      timestamp: pool.receivedAt || Date.now(),
       executionType: 'POTENTIAL_ATOMIC'
     };
   }

@@ -88,6 +88,50 @@ describe('Phase 1.1 Final Gate: Independent Quote Parity & State Invariants', ()
       const emptyPool: PoolState = { ...pool, reserveA: 0n, reserveB: 0n };
       expect(adapter.quoteExactInput(emptyPool, CANONICAL_USDC_MINT, 100000000n)).toBeNull();
     });
+
+    it('Marks quote as UNVERIFIED with BLOCKED_RPC_TIMEOUT when OpenOrders account verification is incomplete', () => {
+      const quote = adapter.quoteExactInput(pool, CANONICAL_USDC_MINT, 100000000n);
+      expect(quote).not.toBeNull();
+      expect(quote!.quoteSource).toBe('UNVERIFIED');
+      expect(quote!.executionType).toBe('INDICATIVE_ONLY');
+      expect((quote as any).isUnverified).toBe(true);
+      expect((quote as any).unverifiedReason).toBe('BLOCKED_RPC_TIMEOUT');
+
+      // Evaluator must reject this quote as UNSUPPORTED / INDICATIVE_ONLY with reason QUOTE_UNVERIFIED
+      const costs = costModel.calculateCosts({
+        solPriceUSDC: new Decimal(165.0),
+        solPriceTimestamp: Date.now()
+      }).breakdown!;
+
+      const candidate = calculator.evaluateCandidate({
+        initialAmountUSDC: 100000000n,
+        leg1Quote: quote!,
+        leg2Quote: quote!,
+        cycleType: '2_LEG',
+        costs,
+        currentSlot: 468550000,
+        wsConnected: true,
+        solPriceTimestamp: Date.now()
+      });
+      expect(candidate.status).toBe('UNSUPPORTED');
+      expect(candidate.qualityLabel).toBe('INDICATIVE_ONLY');
+      expect(candidate.rejectionReasons).toContain('QUOTE_UNVERIFIED');
+    });
+
+    it('Marks quote as DIRECT_POOL and POTENTIAL_ATOMIC when OpenOrders is verified', () => {
+      const verifiedPool: PoolState = {
+        ...pool,
+        extraData: {
+          ...pool.extraData,
+          openOrdersVerified: true
+        }
+      };
+      const quote = adapter.quoteExactInput(verifiedPool, CANONICAL_USDC_MINT, 100000000n);
+      expect(quote).not.toBeNull();
+      expect(quote!.quoteSource).toBe('DIRECT_POOL');
+      expect(quote!.executionType).toBe('POTENTIAL_ATOMIC');
+      expect((quote as any).isUnverified).toBeFalsy();
+    });
   });
 
   describe('2. Orca Whirlpool Fixed-Point Math & Active Tick Parity', () => {

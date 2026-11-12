@@ -63,10 +63,18 @@ export class RouteIndex {
     this.buildIndices(pools);
   }
 
+  private isPoolVerifiedDirect(pool: PoolConfig): boolean {
+    if (pool.verificationStatus) {
+      return pool.verificationStatus === 'VERIFIED_DIRECT';
+    }
+    return pool.dex === 'ORCA_WHIRLPOOL';
+  }
+
   private isDirectDex(dex: DexType): boolean {
-    // Only Raydium AMM V4 and Orca Whirlpool have complete on-chain math & reserve streaming
-    // Meteora DLMM is marked QUOTE_UNVERIFIED until bin-array streaming is integrated
-    return dex === 'RAYDIUM_AMM' || dex === 'ORCA_WHIRLPOOL';
+    // Only Orca Whirlpool is verified direct
+    // Raydium AMM V4 is marked QUOTE_UNVERIFIED due to BLOCKED_RPC_TIMEOUT on public OpenOrders account
+    // Meteora DLMM is marked QUOTE_UNVERIFIED due to missing bin-array streaming
+    return dex === 'ORCA_WHIRLPOOL';
   }
 
   private getPoolPair(pool: PoolConfig): [string, string] {
@@ -129,8 +137,8 @@ export class RouteIndex {
           const poolA = candidatePools[i];
           const poolB = candidatePools[j];
 
-          const isDirectA = this.isDirectDex(poolA.dex);
-          const isDirectB = this.isDirectDex(poolB.dex);
+          const isDirectA = this.isPoolVerifiedDirect(poolA);
+          const isDirectB = this.isPoolVerifiedDirect(poolB);
           const isDirectToDirect = isDirectA && isDirectB;
           const isIntraDex = poolA.dex === poolB.dex;
 
@@ -198,9 +206,9 @@ export class RouteIndex {
             // Prevent repeated pool in the same atomic cycle
             if (p1.id === p2.id || p2.id === p3.id || p1.id === p3.id) continue;
 
-            const isDirect1 = this.isDirectDex(p1.dex);
-            const isDirect2 = this.isDirectDex(p2.dex);
-            const isDirect3 = this.isDirectDex(p3.dex);
+            const isDirect1 = this.isPoolVerifiedDirect(p1);
+            const isDirect2 = this.isPoolVerifiedDirect(p2);
+            const isDirect3 = this.isPoolVerifiedDirect(p3);
             const isDirectToDirect = isDirect1 && isDirect2 && isDirect3;
             const isIntraDex = p1.dex === p2.dex && p2.dex === p3.dex;
 

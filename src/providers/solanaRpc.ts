@@ -9,6 +9,9 @@ export interface RpcStats {
   lastLatencyMs: number;
 }
 
+const DEFAULT_RPC_TIMEOUT_MS = 8000; // 8-second cancellable request timeout
+const MAX_TOTAL_OPERATION_DEADLINE_MS = 30000; // 30-second total operation deadline
+
 export class SolanaRpcProvider {
   private connection: Connection;
   private config: AppConfig;
@@ -26,9 +29,35 @@ export class SolanaRpcProvider {
     this.config = config;
     this.connection = customConnection || new Connection(config.SOLANA_RPC_HTTP, {
       commitment: 'confirmed',
-      confirmTransactionInitialTimeout: 10000
+      confirmTransactionInitialTimeout: DEFAULT_RPC_TIMEOUT_MS,
+      fetch: (url, options) => {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => {
+          controller.abort(new Error(`RPC_TIMEOUT_${DEFAULT_RPC_TIMEOUT_MS}MS`));
+        }, DEFAULT_RPC_TIMEOUT_MS);
+
+        return fetch(url, {
+          ...options,
+          signal: controller.signal
+        }).finally(() => clearTimeout(timeoutId));
+      }
     });
     this.minIntervalMs = 1000 / config.RPC_RATE_LIMIT_RPS;
+  }
+
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs = DEFAULT_RPC_TIMEOUT_MS, opName = 'RPC_OP'): Promise<T> {
+    let timer: NodeJS.Timeout;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`${opName}_TIMEOUT_EXCEEDED_${timeoutMs}MS`));
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      clearTimeout(timer!);
+    }
   }
 
   private async throttle(): Promise<void> {
@@ -45,7 +74,7 @@ export class SolanaRpcProvider {
     const start = Date.now();
     try {
       this.stats.requestsTotal++;
-      const slot = await this.connection.getSlot('confirmed');
+      const slot = await this.withTimeout(this.connection.getSlot('confirmed'), DEFAULT_RPC_TIMEOUT_MS, 'GET_SLOT');
       this.stats.lastSlot = slot;
       this.stats.lastLatencyMs = Date.now() - start;
       return slot;
@@ -64,7 +93,7 @@ export class SolanaRpcProvider {
     const start = Date.now();
     try {
       this.stats.requestsTotal++;
-      const info = await this.connection.getAccountInfo(pubkey, 'confirmed');
+      const info = await this.withTimeout(this.connection.getAccountInfo(pubkey, 'confirmed'), DEFAULT_RPC_TIMEOUT_MS, 'GET_ACCOUNT_INFO');
       this.stats.lastLatencyMs = Date.now() - start;
       return info;
     } catch (err: unknown) {
@@ -86,7 +115,11 @@ export class SolanaRpcProvider {
     const start = Date.now();
     try {
       this.stats.requestsTotal++;
-      const res = await this.connection.getMultipleAccountsInfoAndContext(pubkeys, 'confirmed');
+      const res = await this.withTimeout(
+        this.connection.getMultipleAccountsInfoAndContext(pubkeys, 'confirmed'),
+        DEFAULT_RPC_TIMEOUT_MS,
+        'GET_MULTIPLE_ACCOUNTS'
+      );
       this.stats.lastLatencyMs = Date.now() - start;
       this.stats.lastSlot = res.context.slot;
       return {
@@ -105,7 +138,11 @@ export class SolanaRpcProvider {
     await this.throttle();
     try {
       this.stats.requestsTotal++;
-      const balance = await this.connection.getTokenAccountBalance(pubkey, 'confirmed');
+      const balance = await this.withTimeout(
+        this.connection.getTokenAccountBalance(pubkey, 'confirmed'),
+        DEFAULT_RPC_TIMEOUT_MS,
+        'GET_TOKEN_BALANCE'
+      );
       return {
         amount: BigInt(balance.value.amount),
         decimals: balance.value.decimals
@@ -119,7 +156,11 @@ export class SolanaRpcProvider {
   public async getEstimatePriorityFee(): Promise<number> {
     try {
       await this.throttle();
-      const fees = await this.connection.getRecentPrioritizationFees();
+      const fees = await this.withTimeout(
+        this.connection.getRecentPrioritizationFees(),
+        DEFAULT_RPC_TIMEOUT_MS,
+        'GET_PRIORITY_FEES'
+      );
       if (!fees || fees.length === 0) return this.config.PRIORITY_FEE_LAMPORTS;
       // Calculate median prioritization fee
       const sorted = fees.map(f => f.prioritizationFee).sort((a, b) => a - b);

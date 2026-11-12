@@ -6,6 +6,8 @@ import {
   KNOWN_PROGRAM_IDS
 } from '../config/index.js';
 
+export type VerificationStatus = 'VERIFIED_DIRECT' | 'QUOTE_UNVERIFIED';
+
 export interface PoolConfig {
   id: string;
   dex: DexType;
@@ -15,6 +17,8 @@ export interface PoolConfig {
   feeBps: number;
   initialLiquidityUsd?: number;
   description?: string;
+  verificationStatus?: VerificationStatus;
+  blockerReason?: string;
 }
 
 export class PoolRegistry {
@@ -25,7 +29,7 @@ export class PoolRegistry {
   }
 
   private registerDefaultPools(): void {
-    // 1. Raydium AMM V4 (Standard SOL/USDC, verified on-chain, 752-byte layout)
+    // 1. Raydium AMM V4 (Standard SOL/USDC - marked QUOTE_UNVERIFIED due to BLOCKED_RPC_TIMEOUT)
     this.register({
       id: '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2',
       dex: 'RAYDIUM_AMM',
@@ -34,7 +38,9 @@ export class PoolRegistry {
       tokenBMint: CANONICAL_USDC_MINT,
       feeBps: 25,
       initialLiquidityUsd: 15000000,
-      description: 'Raydium AMM V4 Main SOL/USDC Pool'
+      description: 'Raydium AMM V4 Main SOL/USDC Pool (QUOTE_UNVERIFIED: OpenOrders BLOCKED_RPC_TIMEOUT)',
+      verificationStatus: 'QUOTE_UNVERIFIED',
+      blockerReason: 'BLOCKED_RPC_TIMEOUT'
     });
 
     // 2. Orca Whirlpool (0.04% / 4 bps primary SOL/USDC Whirlpool, verified on-chain)
@@ -46,7 +52,8 @@ export class PoolRegistry {
       tokenBMint: CANONICAL_USDC_MINT,
       feeBps: 4,
       initialLiquidityUsd: 32000000,
-      description: 'Orca Whirlpool 0.04% SOL/USDC'
+      description: 'Orca Whirlpool 0.04% SOL/USDC',
+      verificationStatus: 'VERIFIED_DIRECT'
     });
 
     // 3. Orca Whirlpool Secondary (FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q, verified on-chain 2 bps)
@@ -59,7 +66,8 @@ export class PoolRegistry {
       tokenBMint: CANONICAL_USDC_MINT,
       feeBps: 2,
       initialLiquidityUsd: 1200000,
-      description: 'Orca Whirlpool 0.02% SOL/USDC (Intra-DEX tier)'
+      description: 'Orca Whirlpool 0.02% SOL/USDC (Intra-DEX tier)',
+      verificationStatus: 'VERIFIED_DIRECT'
     });
 
     // 4. Meteora DLMM (Primary dynamic bin pool - marked QUOTE_UNVERIFIED without bin-array streaming)
@@ -71,7 +79,9 @@ export class PoolRegistry {
       tokenBMint: CANONICAL_USDC_MINT,
       feeBps: 10,
       initialLiquidityUsd: 500000,
-      description: 'Meteora DLMM Dynamic Bin SOL/USDC (QUOTE_UNVERIFIED - pending bin-array streaming)'
+      description: 'Meteora DLMM Dynamic Bin SOL/USDC (QUOTE_UNVERIFIED: pending bin-array streaming)',
+      verificationStatus: 'QUOTE_UNVERIFIED',
+      blockerReason: 'MISSING_BIN_ARRAYS'
     });
 
     // 5. Orca Whirlpool USDC/USDT 0.01% (verified on-chain, 653-byte layout)
@@ -83,10 +93,11 @@ export class PoolRegistry {
       tokenBMint: CANONICAL_USDT_MINT,
       feeBps: 1,
       initialLiquidityUsd: 25000000,
-      description: 'Orca Whirlpool 0.01% USDC/USDT Stable Pair'
+      description: 'Orca Whirlpool 0.01% USDC/USDT Stable Pair',
+      verificationStatus: 'VERIFIED_DIRECT'
     });
 
-    // 6. Raydium AMM V4 WSOL/USDT (verified on-chain, 752-byte layout)
+    // 6. Raydium AMM V4 WSOL/USDT (marked QUOTE_UNVERIFIED due to BLOCKED_RPC_TIMEOUT)
     this.register({
       id: '7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX',
       dex: 'RAYDIUM_AMM',
@@ -95,7 +106,9 @@ export class PoolRegistry {
       tokenBMint: CANONICAL_USDT_MINT,
       feeBps: 25,
       initialLiquidityUsd: 8500000,
-      description: 'Raydium AMM V4 Main SOL/USDT Pool'
+      description: 'Raydium AMM V4 Main SOL/USDT Pool (QUOTE_UNVERIFIED: OpenOrders BLOCKED_RPC_TIMEOUT)',
+      verificationStatus: 'QUOTE_UNVERIFIED',
+      blockerReason: 'BLOCKED_RPC_TIMEOUT'
     });
 
     // 7. Raydium CLMM (Concentrated Liquidity, verified on-chain)
@@ -107,7 +120,9 @@ export class PoolRegistry {
       tokenBMint: CANONICAL_USDC_MINT,
       feeBps: 4,
       initialLiquidityUsd: 4000000,
-      description: 'Raydium CLMM SOL/USDC'
+      description: 'Raydium CLMM SOL/USDC',
+      verificationStatus: 'QUOTE_UNVERIFIED',
+      blockerReason: 'PENDING_ORDERBOOK_STREAMING'
     });
 
     // 8. Phoenix Market (Orderbook DEX on Solana, verified on-chain)
@@ -119,7 +134,9 @@ export class PoolRegistry {
       tokenBMint: CANONICAL_USDC_MINT,
       feeBps: 2,
       initialLiquidityUsd: 8000000,
-      description: 'Phoenix Orderbook SOL/USDC Market'
+      description: 'Phoenix Orderbook SOL/USDC Market',
+      verificationStatus: 'QUOTE_UNVERIFIED',
+      blockerReason: 'PENDING_ORDERBOOK_STREAMING'
     });
   }
 

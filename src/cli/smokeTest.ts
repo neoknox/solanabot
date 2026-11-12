@@ -98,7 +98,7 @@ async function main() {
   console.log('\n--- COMPETITOR ACTIVITY & CONTENTION INTELLIGENCE ---');
   const monitoredPools = [
     { name: 'Orca Whirlpool (WSOL/USDC 4bps)', id: 'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE' },
-    { name: 'Orca Whirlpool (WSOL/USDC 2bps)', id: 'FpCMFDFGYotvufJ7HrFHCRbmjyWKsCP2vKemFYDxRejB' },
+    { name: 'Orca Whirlpool (WSOL/USDC 2bps)', id: 'FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q' },
     { name: 'Raydium AMM V4 (WSOL/USDC)', id: '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2' },
     { name: 'Orca Whirlpool (USDC/USDT 1bps)', id: '4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4' },
     { name: 'Raydium AMM V4 (WSOL/USDT)', id: '7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX' }

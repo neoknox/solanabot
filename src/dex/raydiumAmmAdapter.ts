@@ -74,10 +74,12 @@ export class RaydiumAmmAdapter implements DexAdapter {
     const extra = pool.extraData as {
       baseNeedTakePnl?: string;
       quoteNeedTakePnl?: string;
+      openOrdersVerified?: boolean;
     } | undefined;
 
     const basePnl = BigInt(extra?.baseNeedTakePnl || '0');
     const quotePnl = BigInt(extra?.quoteNeedTakePnl || '0');
+    const isOpenOrdersVerified = extra?.openOrdersVerified === true;
 
     // Effective reserves after deducting uncollected accrued protocol PnL
     const reserveA = rawReserveA > basePnl ? rawReserveA - basePnl : 0n;
@@ -106,8 +108,8 @@ export class RaydiumAmmAdapter implements DexAdapter {
     // Exact price impact: (amountInWithFee * 10000) / (reserveIn + amountInWithFee)
     const priceImpactBps = Number((amountInAfterFee * 10000n) / denominator);
 
-    return {
-      quoteSource: 'DIRECT_POOL',
+    const quote: SwapQuote = {
+      quoteSource: isOpenOrdersVerified ? 'DIRECT_POOL' : 'UNVERIFIED',
       poolId: pool.id,
       dex: this.dex,
       inputMint,
@@ -118,8 +120,15 @@ export class RaydiumAmmAdapter implements DexAdapter {
       feeAmount: feeDeduction,
       priceImpactBps,
       slot: pool.slot,
-      timestamp: Date.now(),
-      executionType: 'POTENTIAL_ATOMIC'
+      timestamp: pool.receivedAt || Date.now(),
+      executionType: isOpenOrdersVerified ? 'POTENTIAL_ATOMIC' : 'INDICATIVE_ONLY'
     };
+
+    if (!isOpenOrdersVerified) {
+      (quote as any).isUnverified = true;
+      (quote as any).unverifiedReason = 'BLOCKED_RPC_TIMEOUT';
+    }
+
+    return quote;
   }
 }

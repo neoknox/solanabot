@@ -143,7 +143,7 @@ export class MeteoraDlmmAdapter implements DexAdapter {
         feeAmount,
         priceImpactBps: Math.min(pool.feeBps, 50),
         slot: pool.slot,
-        timestamp: Date.now(),
+        timestamp: pool.receivedAt || Date.now(),
         executionType: 'POTENTIAL_ATOMIC'
       };
     } catch {
