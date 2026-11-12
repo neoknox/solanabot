@@ -7,15 +7,39 @@ export interface DedupeKey {
   stateVersion?: string;
 }
 
+export function getQuoteRelevantSignature(state: PoolState): string {
+  const extra = (state.extraData || {}) as any;
+  const basePart = `rA:${state.reserveA?.toString() ?? '0'},rB:${state.reserveB?.toString() ?? '0'},fee:${state.feeBps}`;
+  if (state.dex === 'ORCA_WHIRLPOOL') {
+    return `${basePart},p:${extra.sqrtPrice ?? '0'},t:${extra.tickCurrent ?? '0'},L:${extra.liquidity ?? '0'},ts:${extra.tickSpacing ?? '0'}`;
+  }
+  if (state.dex === 'RAYDIUM_AMM') {
+    return `${basePart},ooB:${extra.openOrdersBaseTokenTotal ?? '0'},ooQ:${extra.openOrdersQuoteTokenTotal ?? '0'},ooSlot:${extra.openOrdersSlot ?? '0'},vASlot:${extra.vaultASlot ?? '0'},vBSlot:${extra.vaultBSlot ?? '0'}`;
+  }
+  return `${basePart},extra:${JSON.stringify(extra)}`;
+}
+
 export class StateCache {
   private poolStates = new Map<string, PoolState>();
   private dedupeCache = new Map<string, number>();
   private poolRevisions = new Map<string, number>();
+  private lastQuoteStateSignatures = new Map<string, string>();
   private readonly dedupeWindowMs = 5000;
 
   public setPoolState(state: PoolState): void {
-    const rev = (this.poolRevisions.get(state.id) || 0) + 1;
-    this.poolRevisions.set(state.id, rev);
+    const existing = this.poolStates.get(state.id);
+    const newSig = getQuoteRelevantSignature(state);
+    const prevSig = this.lastQuoteStateSignatures.get(state.id);
+
+    let rev = this.poolRevisions.get(state.id) || 1;
+    if (!existing || prevSig !== newSig) {
+      if (existing) {
+        rev = rev + 1;
+      }
+      this.poolRevisions.set(state.id, rev);
+      this.lastQuoteStateSignatures.set(state.id, newSig);
+    }
+
     state.stateRevision = rev;
     this.poolStates.set(state.id, state);
   }

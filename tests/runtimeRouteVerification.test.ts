@@ -255,7 +255,11 @@ describe('Runtime Route Verification & Dynamic Classification Gate', () => {
           marketId: '8BnEgHoWFysVcuFFX7QztDmzuH8r5ZFvyP3sYwn1XTh6',
           marketProgramId: 'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX',
           openOrdersVerified: false,
-          unverifiedReason: 'OBSERVATION_EXPIRED'
+          unverifiedReason: 'OBSERVATION_EXPIRED',
+          vaultASlot: 1000,
+          vaultBSlot: 1000,
+          vaultAReceivedAt: Date.now(),
+          vaultBReceivedAt: Date.now()
         }
       };
 
@@ -297,6 +301,74 @@ describe('Runtime Route Verification & Dynamic Classification Gate', () => {
       expect(scanner.getPoolRegistry().isPoolVerified(poolId)).toBe(false);
       expect(scanner.getPoolRegistry().getPool(poolId)?.verificationStatus).toBe('QUOTE_UNVERIFIED');
       expect(scanner.getPoolRegistry().getPool(poolId)?.blockerReason).toBe('RPC_TIMEOUT');
+    });
+
+    it('OpenOrders reconfirmation fails closed if vault reserves are unhydrated or inconsistent', async () => {
+      const scanner = new ArbitrageScanner(config);
+      const poolId = '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2';
+      const ooKey = 'HmiHHzq4Fym9e1D4qzLS6LDDM3tNsCTBPDWHTLZ763jY';
+
+      // 1. Unhydrated vault reserves (reserves = 0n)
+      const poolUnhydrated: PoolState = {
+        id: poolId,
+        dex: 'RAYDIUM_AMM',
+        programId: KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        tokenADecimals: 9,
+        tokenBDecimals: 6,
+        reserveA: 0n,
+        reserveB: 0n,
+        feeBps: 25,
+        slot: 1000,
+        receivedAt: Date.now(),
+        liquidityUsd: 0,
+        feedHealth: 'HEALTHY',
+        extraData: {
+          openOrders: ooKey,
+          marketId: '8BnEgHoWFysVcuFFX7QztDmzuH8r5ZFvyP3sYwn1XTh6',
+          marketProgramId: 'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX',
+          openOrdersVerified: false
+        }
+      };
+
+      (scanner as any).stateCache.setPoolState(poolUnhydrated);
+      scanner.getPoolRegistry().updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'VAULT_RESERVES_UNHYDRATED');
+
+      const validOoData = Buffer.alloc(3228);
+      new PublicKey('8BnEgHoWFysVcuFFX7QztDmzuH8r5ZFvyP3sYwn1XTh6').toBuffer().copy(validOoData, 13);
+      new PublicKey('5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1').toBuffer().copy(validOoData, 45);
+      validOoData.writeBigUInt64LE(1000000n, 85);
+      validOoData.writeBigUInt64LE(2000000n, 101);
+
+      (scanner as any).rpc.getMultipleAccountsAndContext = async () => ({
+        slot: 1050,
+        value: [{
+          data: validOoData,
+          owner: new PublicKey('srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX'),
+          executable: false,
+          lamports: 10000000
+        }]
+      });
+
+      const reconfirmUnhydrated = await scanner.reconfirmOpenOrders(poolId);
+      expect(reconfirmUnhydrated).toBe(false);
+      expect(scanner.getPoolRegistry().isPoolVerified(poolId)).toBe(false);
+      expect(scanner.getPoolRegistry().getPool(poolId)?.blockerReason).toBe('VAULT_RESERVES_UNHYDRATED');
+
+      // 2. Inconsistent / stale vault slots (gap > 100 slots)
+      (scanner as any).lastReconfirmationTime.set(poolId, 0);
+      poolUnhydrated.reserveA = 100000000000n;
+      poolUnhydrated.reserveB = 15000000000n;
+      (poolUnhydrated.extraData as any).vaultASlot = 1000;
+      (poolUnhydrated.extraData as any).vaultBSlot = 1250; // Gap = 250 > 100
+      (poolUnhydrated.extraData as any).vaultAReceivedAt = Date.now();
+      (poolUnhydrated.extraData as any).vaultBReceivedAt = Date.now();
+
+      const reconfirmInconsistent = await scanner.reconfirmOpenOrders(poolId);
+      expect(reconfirmInconsistent).toBe(false);
+      expect(scanner.getPoolRegistry().isPoolVerified(poolId)).toBe(false);
+      expect(scanner.getPoolRegistry().getPool(poolId)?.blockerReason).toBe('STALE_VAULT_SNAPSHOT');
     });
 
     it('Fails closed on OpenOrders data corruption or authority mismatch', () => {

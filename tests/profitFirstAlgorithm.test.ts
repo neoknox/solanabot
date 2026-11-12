@@ -509,4 +509,118 @@ describe('Profit-First Opportunity Management Algorithm Acceptance', () => {
     const seen3 = tracker.trackOpportunity(candidateSameSnap, 2000);
     expect(seen3.observedSnapshotsCount).toBe(2);
   });
+
+  it('13. Quote-Relevant State Fingerprints and Strict Survival Lifecycle', () => {
+    const cache = new StateCache();
+    const tracker = new OpportunityTracker();
+
+    // 1. Identical account data does NOT bump stateRevision
+    const baseState: PoolState = { ...poolA, slot: 3000 };
+    cache.setPoolState(baseState);
+    const initialRev = baseState.stateRevision ?? 1;
+    expect(initialRev).toBe(1);
+
+    // Identical update (no quote-relevant change)
+    const identicalState: PoolState = { ...poolA, slot: 3000 };
+    cache.setPoolState(identicalState);
+    expect(identicalState.stateRevision).toBe(initialRev);
+
+    // 2. Underlying quote-relevant changes DO bump stateRevision (even within same slot)
+    const reserveChange: PoolState = { ...poolA, slot: 3000, reserveB: poolA.reserveB! + 1000n };
+    cache.setPoolState(reserveChange);
+    expect(reserveChange.stateRevision).toBe(initialRev + 1);
+
+    // Orca whirlpool pool with tickCurrent change
+    const orcaPool: PoolState = {
+      ...poolA,
+      id: 'whirlpool-test',
+      dex: 'ORCA_WHIRLPOOL',
+      slot: 3000,
+      extraData: { sqrtPrice: '1000', tickCurrent: 100, liquidity: '5000' }
+    };
+    cache.setPoolState(orcaPool);
+    const orcaRev = orcaPool.stateRevision ?? 1;
+
+    const orcaTickChange: PoolState = {
+      ...orcaPool,
+      slot: 3000,
+      extraData: { ...orcaPool.extraData, tickCurrent: 200 }
+    };
+    cache.setPoolState(orcaTickChange);
+    expect(orcaTickChange.stateRevision).toBe(orcaRev + 1);
+
+    const ooChange: PoolState = {
+      ...poolA,
+      slot: 3000,
+      extraData: { ...poolA.extraData, openOrdersBaseTokenTotal: '500' }
+    };
+    cache.setPoolState(ooChange);
+    expect(ooChange.stateRevision).toBe(initialRev + 2);
+
+    // 3. Rejected routes are NOT reported in profitable opportunity stats
+    const rejectedCand: ArbitrageCandidate = {
+      candidateId: 'cand-rejected',
+      routeName: 'Rejected Route',
+      direction: 'USDC->WSOL->USDC',
+      cycleType: '2_LEG',
+      timestamp: Date.now(),
+      status: 'REJECTED',
+      qualityLabel: 'INVALID',
+      executionStatus: 'EXECUTION_UNVERIFIED',
+      inputAmountUSDC: 100000000n,
+      optimalSizeUSDC: 100,
+      leg1ExpectedOutWSOL: 0n,
+      leg1ConservativeOutWSOL: 0n,
+      leg2ExpectedOutUSDC: 0n,
+      leg2ConservativeOutUSDC: 0n,
+      expectedNetUSDC: '-1.00',
+      minConservativeNetUSDC: '-1.50',
+      rejectionReasons: ['LOW_CONSERVATIVE_NET'],
+      quoteAgeMs: 5,
+      slotGap: 0,
+      stateVersion: 'poolA@s3000:r1|poolB@s3000:r1',
+      leg1Quote: { poolId: 'poolA', dex: 'RAYDIUM_AMM' } as any,
+      leg2Quote: { poolId: 'poolB', dex: 'ORCA_WHIRLPOOL' } as any,
+      costs: dummyCosts
+    };
+
+    // Tracking rejected candidate does not pollute profitable stats
+    tracker.trackOpportunity(rejectedCand, 3000);
+    const statsRejected = tracker.getLifecycleStats();
+    expect(statsRejected.totalTrackedOpportunities).toBe(0);
+    expect(statsRejected.activeOpportunitiesCount).toBe(0);
+
+    // 4. Survival strictly requires observedSnapshotsCount >= 2 on QUALIFIED_SHADOW across different snapshots
+    const profitableCand: ArbitrageCandidate = {
+      ...rejectedCand,
+      candidateId: 'cand-profitable',
+      status: 'QUALIFIED_SHADOW',
+      qualityLabel: 'SHADOW_QUALIFIED',
+      expectedNetUSDC: '2.50',
+      minConservativeNetUSDC: '1.80',
+      rejectionReasons: [],
+      stateVersion: 'poolA@s3000:r1|poolB@s3000:r1'
+    };
+
+    const res1 = tracker.trackOpportunity(profitableCand, 3000);
+    expect(res1.isSurvival).toBe(false);
+    expect(res1.observedSnapshotsCount).toBe(1);
+
+    // Same state recalculation: isSurvival must still be false
+    profitableCand.timestamp += 100;
+    const resSame = tracker.trackOpportunity(profitableCand, 3000);
+    expect(resSame.isSurvival).toBe(false);
+    expect(resSame.observedSnapshotsCount).toBe(1);
+
+    // Genuinely new snapshot: isSurvival becomes true
+    profitableCand.timestamp += 400;
+    profitableCand.stateVersion = 'poolA@s3001:r2|poolB@s3001:r1';
+    const resNew = tracker.trackOpportunity(profitableCand, 3001);
+    expect(resNew.isSurvival).toBe(true);
+    expect(resNew.observedSnapshotsCount).toBe(2);
+
+    const statsProfitable = tracker.getLifecycleStats();
+    expect(statsProfitable.totalTrackedOpportunities).toBe(1);
+    expect(statsProfitable.activeOpportunitiesCount).toBe(1);
+  });
 });

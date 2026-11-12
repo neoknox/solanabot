@@ -407,10 +407,19 @@ export class ArbitrageScanner {
         if (mapping) {
           const pool = this.stateCache.getPoolState(mapping.poolId);
           if (pool) {
-            if (mapping.isA) pool.reserveA = rawAmount;
-            else pool.reserveB = rawAmount;
+            const extra = (pool.extraData || {}) as any;
+            if (mapping.isA) {
+              pool.reserveA = rawAmount;
+              extra.vaultASlot = update.slot;
+              extra.vaultAReceivedAt = update.receivedAtMs;
+            } else {
+              pool.reserveB = rawAmount;
+              extra.vaultBSlot = update.slot;
+              extra.vaultBReceivedAt = update.receivedAtMs;
+            }
             pool.slot = update.slot;
             pool.receivedAt = update.receivedAtMs;
+            this.stateCache.setPoolState(pool);
 
             // Reevaluate only routes affected by this vault update
             if (pool.dex !== 'RAYDIUM_AMM' || ((pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n)) {
@@ -449,6 +458,7 @@ export class ArbitrageScanner {
         extra.unverifiedReason = 'OPENORDERS_LAYOUT_INVALID';
         this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_LAYOUT_INVALID');
         this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        this.stateCache.setPoolState(pool);
         return false;
       }
 
@@ -459,6 +469,7 @@ export class ArbitrageScanner {
         extra.unverifiedReason = 'OPENORDERS_OWNER_MISMATCH';
         this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_OWNER_MISMATCH');
         this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        this.stateCache.setPoolState(pool);
         return false;
       }
 
@@ -471,6 +482,7 @@ export class ArbitrageScanner {
         extra.unverifiedReason = 'OPENORDERS_MARKET_MISMATCH';
         this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_MARKET_MISMATCH');
         this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        this.stateCache.setPoolState(pool);
         return false;
       }
 
@@ -479,6 +491,7 @@ export class ArbitrageScanner {
         extra.unverifiedReason = 'OPENORDERS_AUTHORITY_MISMATCH';
         this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_AUTHORITY_MISMATCH');
         this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        this.stateCache.setPoolState(pool);
         return false;
       }
 
@@ -497,8 +510,37 @@ export class ArbitrageScanner {
       extra.verifiedAt = Date.now();
       delete extra.unverifiedReason;
 
+      // CRITICAL DEPENDENCY INTEGRITY CHECK:
+      // OpenOrders reconfirmation must NOT automatically validate stale or unhydrated vaults.
+      const reservesHydrated = (pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n;
+      if (!reservesHydrated) {
+        extra.unverifiedReason = 'VAULT_RESERVES_UNHYDRATED';
+        this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'VAULT_RESERVES_UNHYDRATED');
+        this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        this.stateCache.setPoolState(pool);
+        return false;
+      }
+
+      const nowAfter = Date.now();
+      const vASlot = extra.vaultASlot || pool.slot;
+      const vBSlot = extra.vaultBSlot || pool.slot;
+      const vAConfirmedAt = extra.vaultAReceivedAt || pool.receivedAt || 0;
+      const vBConfirmedAt = extra.vaultBReceivedAt || pool.receivedAt || 0;
+      const vaultTtl = this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
+      const vaultsFresh = (nowAfter - vAConfirmedAt <= vaultTtl) && (nowAfter - vBConfirmedAt <= vaultTtl);
+      const vaultSlotGap = Math.abs(vASlot - vBSlot);
+
+      if (!vaultsFresh || vaultSlotGap > 100) {
+        extra.unverifiedReason = 'STALE_VAULT_SNAPSHOT';
+        this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'STALE_VAULT_SNAPSHOT');
+        this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        this.stateCache.setPoolState(pool);
+        return false;
+      }
+
       this.poolRegistry.updatePoolVerification(poolId, 'VERIFIED_DIRECT');
       this.routeIndex.updatePoolStatus(poolId, 'VERIFIED_DIRECT');
+      this.stateCache.setPoolState(pool);
       this.auditMetrics.raydiumReconfirmationSuccesses = (this.auditMetrics.raydiumReconfirmationSuccesses || 0) + 1;
 
       this.evaluateAffectedRoutes(poolId);
@@ -508,6 +550,7 @@ export class ArbitrageScanner {
       extra.unverifiedReason = 'RPC_TIMEOUT';
       this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'RPC_TIMEOUT');
       this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+      this.stateCache.setPoolState(pool);
       return false;
     }
   }
@@ -524,14 +567,14 @@ export class ArbitrageScanner {
 
   private computePoolFingerprint(pool: PoolState): string {
     const extra = (pool.extraData || {}) as any;
-    const rev = pool.stateRevision || 0;
+    const rev = pool.stateRevision || 1;
     if (pool.dex === 'ORCA_WHIRLPOOL') {
-      return `${pool.id}@s${pool.slot}:r${rev}:p${extra.sqrtPrice || 0}:t${extra.tickCurrent || 0}`;
+      return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}:p${extra.sqrtPrice || 0}:t${extra.tickCurrent || 0}:L${extra.liquidity || 0}`;
     }
     if (pool.dex === 'RAYDIUM_AMM') {
-      return `${pool.id}@s${pool.slot}:r${rev}:a${pool.reserveA || 0}:b${pool.reserveB || 0}:oo${extra.openOrdersSlot || 0}`;
+      return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}:ooB${extra.openOrdersBaseTokenTotal || 0}:ooQ${extra.openOrdersQuoteTokenTotal || 0}:ooSlot${extra.openOrdersSlot || 0}:vA${extra.vaultASlot || 0}:vB${extra.vaultBSlot || 0}`;
     }
-    return `${pool.id}@s${pool.slot}:r${rev}:a${pool.reserveA || 0}:b${pool.reserveB || 0}`;
+    return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}`;
   }
 
   private evaluateAffectedRoutes(poolId: string, monotonicReceiptTime?: number): void {
@@ -712,9 +755,6 @@ export class ArbitrageScanner {
     candidate.executionProbability = scoreResult.executionProbability;
     candidate.scoringBreakdown = scoreResult.breakdown;
 
-    // Continuous Opportunity Duration Tracking (Section 5)
-    this.opportunityTracker.trackOpportunity(candidate, currentSlot);
-
     const validationDurationUs = (performance.now() - validationStart) * 1000;
     this.latencyTracker.recordValidationDuration(validationDurationUs);
 
@@ -753,14 +793,18 @@ export class ArbitrageScanner {
       candidate.executionStatus = 'EXECUTION_UNVERIFIED';
       this.auditMetrics.executionUnverifiedRouteCount = (this.auditMetrics.executionUnverifiedRouteCount || 0) + 1;
 
-      // Survival re-check against current state
-      const survival = this.recheckSurvivalSync(candidate, quoterLegs, costResult.breakdown, currentSlot);
-      candidate.survivalStatus = survival;
+      // Track profitable opportunities separately from ordinary rejected route observations
+      const trackerRes = this.opportunityTracker.trackOpportunity(candidate, currentSlot);
+      candidate.visibilityDurationMs = trackerRes.visibilityDurationMs;
+      candidate.observedSnapshotsCount = trackerRes.observedSnapshotsCount;
+
+      // Real survival counting: only after a genuinely new independent market snapshot
       this.auditMetrics.survivalCheckedCount = (this.auditMetrics.survivalCheckedCount || 0) + 1;
-      if (survival === 'SURVIVED') {
+      if (trackerRes.isSurvival) {
+        candidate.survivalStatus = 'SURVIVED';
         this.auditMetrics.survivalSurvivedCount = (this.auditMetrics.survivalSurvivedCount || 0) + 1;
       } else {
-        this.auditMetrics.survivalDecayedCount = (this.auditMetrics.survivalDecayedCount || 0) + 1;
+        candidate.survivalStatus = 'UNCHECKED';
       }
     } else {
       this.rejectedCount++;
@@ -925,8 +969,16 @@ export class ArbitrageScanner {
               const amount = acc.data.readBigUInt64LE(64);
               const pool = decodedPools[vInfo.poolIndex];
               if (pool) {
-                if (vInfo.isA) pool.reserveA = amount;
-                else pool.reserveB = amount;
+                const extra = (pool.extraData || {}) as any;
+                if (vInfo.isA) {
+                  pool.reserveA = amount;
+                  extra.vaultASlot = vaultSlot;
+                  extra.vaultAReceivedAt = Date.now();
+                } else {
+                  pool.reserveB = amount;
+                  extra.vaultBSlot = vaultSlot;
+                  extra.vaultBReceivedAt = Date.now();
+                }
                 pool.slot = vaultSlot;
               }
             }
@@ -968,9 +1020,18 @@ export class ArbitrageScanner {
               } else if (authority !== expectedAuthority) {
                 blockerReason = 'OPENORDERS_AUTHORITY_MISMATCH';
               } else {
-                // Check snapshot slot consistency between pool and OpenOrders
+                // Check snapshot slot consistency between pool and OpenOrders, and verify vault hydration
                 const slotGap = Math.abs(snapshotSlot - ooSlot);
-                if (slotGap > 100) {
+                const reservesHydrated = (pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n;
+                const vASlot = extra.vaultASlot || snapshotSlot;
+                const vBSlot = extra.vaultBSlot || snapshotSlot;
+                const vaultSlotGap = Math.abs(vASlot - vBSlot);
+
+                if (!reservesHydrated) {
+                  blockerReason = 'VAULT_RESERVES_UNHYDRATED';
+                } else if (vaultSlotGap > 100) {
+                  blockerReason = 'INCONSISTENT_VAULT_SNAPSHOT';
+                } else if (slotGap > 100) {
                   blockerReason = 'SLOT_MISMATCH';
                 } else {
                   isVerified = true;

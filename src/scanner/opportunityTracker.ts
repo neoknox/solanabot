@@ -35,6 +35,7 @@ export class OpportunityTracker {
   public trackOpportunity(candidate: ArbitrageCandidate, currentSlot: number): {
     visibilityDurationMs: number;
     observedSnapshotsCount: number;
+    isSurvival: boolean;
   } {
     const inputSize = candidate.optimalSizeUSDC || Number(candidate.inputAmountUSDC) / 1e6;
     const poolKeys = [candidate.leg1Quote.poolId, candidate.leg2Quote.poolId, candidate.leg3Quote?.poolId]
@@ -44,21 +45,28 @@ export class OpportunityTracker {
 
     const now = candidate.timestamp || Date.now();
     let record = this.opportunities.get(routeKey);
+    let isSurvival = false;
 
     if (record) {
-      const slotChanged = currentSlot !== record.lastSeenSlot;
+      const prevSlot = record.lastSeenSlot;
       record.lastSeenTimestamp = now;
       record.lastSeenSlot = currentSlot;
       record.visibilityDurationMs = Math.max(0, record.lastSeenTimestamp - record.firstSeenTimestamp);
-      // Track persistence strictly across NEW independently observed pool states;
-      // repeated recalculation of the same snapshot does not count as survival.
+      // Track persistence strictly across genuinely NEW independently observed pool states;
+      // immediate recalculation of the same snapshot does not count as survival.
       if (candidate.stateVersion) {
         if (candidate.stateVersion !== record.lastStateVersion) {
           record.observedSnapshotsCount += 1;
           record.lastStateVersion = candidate.stateVersion;
+          if (record.observedSnapshotsCount >= 2 && candidate.status === 'QUALIFIED_SHADOW') {
+            isSurvival = true;
+          }
         }
-      } else if (slotChanged) {
+      } else if (currentSlot !== prevSlot) {
         record.observedSnapshotsCount += 1;
+        if (record.observedSnapshotsCount >= 2 && candidate.status === 'QUALIFIED_SHADOW') {
+          isSurvival = true;
+        }
       }
       record.sizeUSDC = inputSize;
       record.lastConservativeNetUSDC = candidate.minConservativeNetUSDC;
@@ -86,7 +94,8 @@ export class OpportunityTracker {
 
     return {
       visibilityDurationMs: record.visibilityDurationMs,
-      observedSnapshotsCount: record.observedSnapshotsCount
+      observedSnapshotsCount: record.observedSnapshotsCount,
+      isSurvival
     };
   }
 
@@ -107,7 +116,9 @@ export class OpportunityTracker {
   }
 
   public getLifecycleStats(): OpportunityLifecycleStats {
-    const allRecords = [...this.opportunities.values(), ...this.completedLifecycles];
+    // Only track profitable opportunities (QUALIFIED_SHADOW) in opportunity lifecycle stats
+    const allRecords = [...this.opportunities.values(), ...this.completedLifecycles]
+      .filter(r => r.status === 'QUALIFIED_SHADOW');
     if (allRecords.length === 0) {
       return {
         totalTrackedOpportunities: 0,
@@ -129,7 +140,7 @@ export class OpportunityTracker {
 
     return {
       totalTrackedOpportunities: allRecords.length,
-      activeOpportunitiesCount: this.opportunities.size,
+      activeOpportunitiesCount: [...this.opportunities.values()].filter(r => r.status === 'QUALIFIED_SHADOW').length,
       meanVisibilityDurationMs,
       maxVisibilityDurationMs,
       p50DurationMs,

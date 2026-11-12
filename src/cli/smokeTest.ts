@@ -93,6 +93,9 @@ async function main() {
   console.log(`  3. Quote-Valid Attempts (Math Exec):   ${audit.quoteValidRouteCount || 0}`);
   console.log(`  4. Profit-Qualified Attempts (>= $0.50): ${audit.profitQualifiedRouteCount || 0}`);
   console.log(`  5. Execution-Unverified (Phase 1.2):   ${audit.executionUnverifiedRouteCount || 0}`);
+  console.log(`  Survival Checks Conducted:             ${audit.survivalCheckedCount || 0}`);
+  console.log(`  Real Opportunities Survived:           ${audit.survivalSurvivedCount || 0}`);
+  console.log(`  Unique Snapshot Fingerprints:          ${audit.uniqueOpportunities || 0}`);
   console.log(`  Simulated Capital Limit:               $${config.VIRTUAL_CAPITAL_USDC} USDC`);
   console.log(`  Active Allocated Simulated Capital:    $${scanner.getOpportunityTracker().getActiveAllocatedCapital()} USDC`);
   console.log(`  Execution Guard Status:                SPECIFICATION_ONLY (Not implemented, zero capital protected)`);
