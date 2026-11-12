@@ -2,7 +2,12 @@ import WebSocket from 'ws';
 import { FeedHealth } from '../types/index.js';
 import { AppConfig } from '../config/index.js';
 
-export type AccountUpdateHandler = (accountData: Buffer, slot: number) => void;
+export type AccountUpdateHandler = (
+  accountData: Buffer,
+  slot: number,
+  receivedAtMs?: number,
+  monotonicReceiptTime?: number
+) => void;
 export type SlotUpdateHandler = (slot: number) => void;
 
 export interface WsStats {
@@ -137,7 +142,7 @@ export class SolanaWsProvider {
         pubkey,
         {
           encoding: 'base64',
-          commitment: 'confirmed'
+          commitment: this.config.WS_COMMITMENT || 'processed'
         }
       ]
     }));
@@ -187,6 +192,8 @@ export class SolanaWsProvider {
       }
 
       if (msg.method === 'accountNotification') {
+        const receiptMonotonic = performance.now();
+        const receiptMs = Date.now();
         const subId = msg.params?.subscription;
         const val = msg.params?.result?.value;
         const slot = msg.params?.result?.context?.slot || this.currentSlot;
@@ -197,7 +204,7 @@ export class SolanaWsProvider {
           if (pubkey) {
             const sub = this.accountSubscriptions.get(pubkey);
             if (sub) {
-              sub.handler(buffer, slot);
+              sub.handler(buffer, slot, receiptMs, receiptMonotonic);
               return;
             }
           }
@@ -205,7 +212,7 @@ export class SolanaWsProvider {
           // Secondary lookup by matching sub.id
           for (const sub of this.accountSubscriptions.values()) {
             if (sub.id === subId) {
-              sub.handler(buffer, slot);
+              sub.handler(buffer, slot, receiptMs, receiptMonotonic);
               return;
             }
           }

@@ -72,6 +72,10 @@ const rawConfigSchema = z.object({
   DB_PATH: z.string().default('./data/arbitrage_scanner.db'),
   DB_RETENTION_HOURS: z.coerce.number().min(1).default(24),
   LOG_ALL_REJECTED: z.coerce.boolean().default(false),
+  WS_COMMITMENT: z.enum(['processed', 'confirmed', 'finalized']).default('processed'),
+  MAX_EVENT_QUEUE_CAPACITY: z.coerce.number().min(100).default(2000),
+  ASYNC_DB_FLUSH_INTERVAL_MS: z.coerce.number().min(10).default(100),
+  SCAN_INTERVAL_MS: z.coerce.number().min(50).default(500),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info')
 });
 

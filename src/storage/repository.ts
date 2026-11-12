@@ -17,6 +17,9 @@ export class ArbitrageRepository {
   private config: AppConfig;
   private insertCandidateStmt: Database.Statement;
   private insertEventStmt: Database.Statement;
+  private batchInsertTransaction: Database.Transaction<(items: ArbitrageCandidate[]) => void>;
+  private candidateQueue: ArbitrageCandidate[] = [];
+  private flushTimer: NodeJS.Timeout | null = null;
 
   constructor(config: AppConfig, customDb?: Database.Database) {
     this.config = config;
@@ -41,15 +44,21 @@ export class ArbitrageRepository {
       INSERT INTO provider_events (provider, event_type, latency_ms, slot, message, timestamp)
       VALUES (?, ?, ?, ?, ?, ?)
     `);
+
+    this.batchInsertTransaction = this.db.transaction((items: ArbitrageCandidate[]) => {
+      for (const candidate of items) {
+        this.executeInsertCandidate(candidate);
+      }
+    });
+
+    // Background flush timer to keep SQLite writes off the quote hot path
+    this.flushTimer = setInterval(() => {
+      this.flushSync();
+    }, 100);
+    this.flushTimer.unref();
   }
 
-  public saveCandidate(candidate: ArbitrageCandidate): void {
-    // Store all QUALIFIED_SHADOW and CANDIDATE signals. Store all rejected if configured, else sample.
-    const isSpecial = candidate.status === 'QUALIFIED_SHADOW' || candidate.status === 'CANDIDATE';
-    if (!isSpecial && !this.config.LOG_ALL_REJECTED && Math.random() > 0.15) {
-      return;
-    }
-
+  private executeInsertCandidate(candidate: ArbitrageCandidate): void {
     try {
       this.insertCandidateStmt.run(
         candidate.candidateId,
@@ -77,9 +86,33 @@ export class ArbitrageRepository {
         candidate.slotGap,
         candidate.timestamp
       );
-    } catch {
-      // Database write error handled gracefully
+    } catch {}
+  }
+
+  public saveCandidate(candidate: ArbitrageCandidate): void {
+    // Store all QUALIFIED_SHADOW and CANDIDATE signals. Store all rejected if configured, else sample.
+    const isSpecial = candidate.status === 'QUALIFIED_SHADOW' || candidate.status === 'CANDIDATE';
+    if (!isSpecial && !this.config.LOG_ALL_REJECTED && Math.random() > 0.15) {
+      return;
     }
+
+    // Bounded in-memory write buffer for sub-microsecond non-blocking saves
+    if (this.candidateQueue.length >= 5000) {
+      this.candidateQueue.shift(); // Drop oldest under extreme backpressure
+    }
+    this.candidateQueue.push(candidate);
+
+    if (this.candidateQueue.length >= 100) {
+      this.flushSync();
+    }
+  }
+
+  public flushSync(): void {
+    if (this.candidateQueue.length === 0) return;
+    const batch = this.candidateQueue.splice(0, this.candidateQueue.length);
+    try {
+      this.batchInsertTransaction(batch);
+    } catch {}
   }
 
   public logProviderEvent(
@@ -176,6 +209,7 @@ export class ArbitrageRepository {
   }
 
   public purgeOldRecords(retentionHours?: number): number {
+    this.flushSync();
     const hours = retentionHours || this.config.DB_RETENTION_HOURS;
     const cutoff = Date.now() - hours * 3600 * 1000;
     const stmt = this.db.prepare('DELETE FROM candidates WHERE timestamp < ?');
@@ -186,6 +220,7 @@ export class ArbitrageRepository {
   }
 
   public getSummaryStats(): StorageStats {
+    this.flushSync();
     const counts = this.db.prepare(`
       SELECT 
         COUNT(*) as total,
@@ -212,6 +247,7 @@ export class ArbitrageRepository {
   }
 
   public getTopOpportunities(limit = 10): ArbitrageCandidate[] {
+    this.flushSync();
     const rows = this.db.prepare(`
       SELECT * FROM candidates 
       ORDER BY 
@@ -271,6 +307,7 @@ export class ArbitrageRepository {
   }
 
   public exportToCsv(filePath: string): number {
+    this.flushSync();
     const rows = this.db.prepare(`
       SELECT 
         candidate_id, route_name, input_amount_usdc,
@@ -302,6 +339,11 @@ export class ArbitrageRepository {
   }
 
   public close(): void {
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.flushSync();
     try {
       this.db.close();
     } catch {}
