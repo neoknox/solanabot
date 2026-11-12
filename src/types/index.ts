@@ -52,7 +52,7 @@ export type TradeSizingMethod = 'COARSE_GRID' | 'COARSE_TO_FINE';
 
 export type ExecutionProbability = 'UNCALIBRATED';
 
-export type ContentionLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'EXTREME';
+export type ContentionLevel = 'UNKNOWN' | 'LOW' | 'MEDIUM' | 'HIGH' | 'EXTREME';
 
 export interface FeeDistribution {
   min: number;

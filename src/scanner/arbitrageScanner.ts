@@ -517,6 +517,7 @@ export class ArbitrageScanner {
       const accounts = rpcRes.value;
       const decodedPools: PoolState[] = [];
       const vaultsToFetch: { pubkey: PublicKey; poolIndex: number; isA: boolean }[] = [];
+      const openOrdersToFetch: { pubkey: PublicKey; poolIndex: number; expectedOwner: string }[] = [];
 
       for (let i = 0; i < pools.length; i++) {
         const poolConfig = pools[i];
@@ -530,6 +531,14 @@ export class ArbitrageScanner {
             const extra = decoded.extraData as any;
             const vaultA = extra?.baseVault || extra?.tokenVaultA || extra?.reserveX;
             const vaultB = extra?.quoteVault || extra?.tokenVaultB || extra?.reserveY;
+
+            if (poolConfig.dex === 'RAYDIUM_AMM' && extra?.openOrders) {
+              openOrdersToFetch.push({
+                pubkey: new PublicKey(extra.openOrders),
+                poolIndex: decodedPools.length,
+                expectedOwner: extra.marketProgramId || 'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX'
+              });
+            }
 
             if (vaultA && vaultB) {
               if (!this.vaultToPool.has(vaultA)) {
@@ -602,7 +611,57 @@ export class ArbitrageScanner {
         } catch {}
       }
 
+      // Step 3: Single bounded attempt to fetch OpenOrders accounts for Raydium V4 pools
+      if (openOrdersToFetch.length > 0) {
+        try {
+          const ooStart = performance.now();
+          const ooRes = await this.rpc.getMultipleAccountsAndContext(openOrdersToFetch.map(o => o.pubkey));
+          this.latencyTracker.recordRpcLatency(performance.now() - ooStart);
+          const ooAccounts = ooRes.value;
+
+          for (let i = 0; i < openOrdersToFetch.length; i++) {
+            const ooInfo = openOrdersToFetch[i];
+            const acc = ooAccounts[i];
+            const pool = decodedPools[ooInfo.poolIndex];
+            if (!pool) continue;
+
+            if (acc && acc.data && acc.data.length >= 3228) {
+              const ownerStr = acc.owner ? acc.owner.toBase58() : '';
+              if (ownerStr === ooInfo.expectedOwner || ownerStr === 'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX') {
+                const baseTokenTotal = acc.data.readBigUInt64LE(85);
+                const quoteTokenTotal = acc.data.readBigUInt64LE(101);
+                if (pool.extraData) {
+                  pool.extraData.openOrdersVerified = true;
+                  pool.extraData.openOrdersBaseTokenTotal = baseTokenTotal.toString();
+                  pool.extraData.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
+                }
+              } else {
+                if (pool.extraData) {
+                  pool.extraData.openOrdersVerified = false;
+                  pool.extraData.unverifiedReason = 'OPENORDERS_OWNER_MISMATCH';
+                }
+              }
+            } else {
+              if (pool.extraData) {
+                pool.extraData.openOrdersVerified = false;
+                pool.extraData.unverifiedReason = 'OPENORDERS_LAYOUT_INVALID';
+              }
+            }
+          }
+        } catch {
+          // Bounded attempt failed or timed out: retain QUOTE_UNVERIFIED and proceed
+          for (const ooInfo of openOrdersToFetch) {
+            const pool = decodedPools[ooInfo.poolIndex];
+            if (pool && pool.extraData) {
+              pool.extraData.openOrdersVerified = false;
+              pool.extraData.unverifiedReason = 'BLOCKED_RPC_TIMEOUT';
+            }
+          }
+        }
+      }
+
       for (const pool of decodedPools) {
+        pool.receivedAt = Date.now();
         const existing = this.stateCache.getPoolState(pool.id);
         if (existing) {
           if (pool.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) pool.reserveA = existing.reserveA;

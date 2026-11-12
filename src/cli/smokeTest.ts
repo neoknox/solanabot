@@ -18,11 +18,13 @@ async function main() {
   const routeIndex = scanner.getRouteIndex();
 
   console.log(`Route Index Configured:`);
-  console.log(`  Total Directed Routes:  ${routeIndex.getRouteCount()}`);
-  console.log(`  2-Leg Cycles:           ${routeIndex.getTwoLegRouteCount()}`);
-  console.log(`  3-Leg Cycles:           ${routeIndex.getThreeLegRouteCount()}`);
-  console.log(`  Intra-DEX Routes:       ${routeIndex.getIntraDexRouteCount()}`);
-  console.log(`  Inter-DEX Routes:       ${routeIndex.getInterDexRouteCount()}\n`);
+  console.log(`  Total Directed Routes:     ${routeIndex.getRouteCount()}`);
+  console.log(`  - Verified Direct Routes:  ${routeIndex.getVerifiedDirectRouteCount()}`);
+  console.log(`  - Blocked Routes (Data):   ${routeIndex.getBlockedRouteCount()}`);
+  console.log(`  2-Leg Cycles:              ${routeIndex.getTwoLegRouteCount()}`);
+  console.log(`  3-Leg Cycles:              ${routeIndex.getThreeLegRouteCount()}`);
+  console.log(`  Intra-DEX Routes:          ${routeIndex.getIntraDexRouteCount()}`);
+  console.log(`  Inter-DEX Routes:          ${routeIndex.getInterDexRouteCount()}\n`);
 
   let indicativeCount = 0;
   let shadowQualifiedCount = 0;
@@ -106,9 +108,15 @@ async function main() {
   for (const p of monitoredPools) {
     const m = scanner.getCompetitorAnalyzer().getCachedMetrics(p.id);
     console.log(`  Pool: ${p.name}`);
-    console.log(`    Contention: ${m.contentionLevel} | Historical Competition Score: ${m.historicalCompetitionScore}/100`);
-    console.log(`    Tx Analyzed: ${m.totalObservedTx} (Failed: ${m.failedTxCount}) | Est. Arb Freq: ${m.arbitrageLoopFrequencyPerHour}/hr`);
-    console.log(`    Fee p50: ${m.feeDistributionLamports.p50} lamports | Priority Fee p50: ${m.priorityFeeStatsMicroLamports.p50} μL`);
+    if (m.totalObservedTx === 0) {
+      console.log(`    Contention: UNKNOWN (0 tx samples observed) | Historical Competition Score: UNCALIBRATED`);
+      console.log(`    Tx Analyzed: 0 | Arb Freq: UNKNOWN`);
+      console.log(`    Fee p50: UNKNOWN | Priority Fee p50: UNKNOWN`);
+    } else {
+      console.log(`    Contention: ${m.contentionLevel} | Historical Competition Score: ${m.historicalCompetitionScore}/100`);
+      console.log(`    Tx Analyzed: ${m.totalObservedTx} (Failed: ${m.failedTxCount}) | Est. Arb Freq: ${m.arbitrageLoopFrequencyPerHour}/hr`);
+      console.log(`    Fee p50: ${m.feeDistributionLamports.p50} lamports | Priority Fee p50: ${m.priorityFeeStatsMicroLamports.p50} μL`);
+    }
   }
 
   console.log('\n--- LATENCY INSTRUMENTATION BENCHMARKS ---');

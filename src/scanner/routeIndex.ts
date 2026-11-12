@@ -299,4 +299,20 @@ export class RouteIndex {
   public getInterDexRouteCount(): number {
     return this.allRoutes.filter(r => !r.isIntraDex).length;
   }
+
+  public getVerifiedDirectRoutes(): IndexedDirectedRoute[] {
+    return this.allRoutes.filter(r => r.isDirectToDirect);
+  }
+
+  public getBlockedRoutes(): IndexedDirectedRoute[] {
+    return this.allRoutes.filter(r => !r.isDirectToDirect);
+  }
+
+  public getVerifiedDirectRouteCount(): number {
+    return this.allRoutes.filter(r => r.isDirectToDirect).length;
+  }
+
+  public getBlockedRouteCount(): number {
+    return this.allRoutes.filter(r => !r.isDirectToDirect).length;
+  }
 }

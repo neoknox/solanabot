@@ -39,6 +39,14 @@ export const KNOWN_TOKENS: Record<string, TokenInfo> = {
   }
 };
 
+export function getKnownTokenDecimals(mint: string): number {
+  const token = KNOWN_TOKENS[mint];
+  if (token) return token.decimals;
+  if (mint === CANONICAL_WSOL_MINT) return 9;
+  if (mint === CANONICAL_USDC_MINT || mint === CANONICAL_USDT_MINT) return 6;
+  return 6;
+}
+
 // Verified On-Chain Mainnet Program IDs
 export const KNOWN_PROGRAM_IDS = {
   TOKEN_PROGRAM: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',

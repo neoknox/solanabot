@@ -1,7 +1,7 @@
 import { PublicKey } from '@solana/web3.js';
 import { DexAdapter } from './types.js';
 import { DexType, PoolState, SwapQuote } from '../types/index.js';
-import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT, CANONICAL_USDC_MINT } from '../config/index.js';
+import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT, CANONICAL_USDC_MINT, getKnownTokenDecimals } from '../config/index.js';
 
 export class RaydiumAmmAdapter implements DexAdapter {
   public readonly dex: DexType = 'RAYDIUM_AMM';
@@ -21,14 +21,15 @@ export class RaydiumAmmAdapter implements DexAdapter {
       const baseMint = new PublicKey(data.subarray(400, 432)).toBase58();
       const quoteMint = new PublicKey(data.subarray(432, 464)).toBase58();
       const openOrders = new PublicKey(data.subarray(496, 528)).toBase58();
+      const marketId = new PublicKey(data.subarray(528, 560)).toBase58();
+      const marketProgramId = new PublicKey(data.subarray(560, 592)).toBase58();
 
       const feeBps = swapFeeDenominator > 0n
         ? Number((swapFeeNumerator * 10000n) / swapFeeDenominator)
         : 25;
 
-      const isBaseWSOL = baseMint === CANONICAL_WSOL_MINT;
-      const tokenADecimals = isBaseWSOL ? 9 : 6;
-      const tokenBDecimals = isBaseWSOL ? 6 : 9;
+      const tokenADecimals = getKnownTokenDecimals(baseMint);
+      const tokenBDecimals = getKnownTokenDecimals(quoteMint);
 
       return {
         id: poolId,
@@ -49,6 +50,8 @@ export class RaydiumAmmAdapter implements DexAdapter {
           baseVault,
           quoteVault,
           openOrders,
+          marketId,
+          marketProgramId,
           baseNeedTakePnl: baseNeedTakePnl.toString(),
           quoteNeedTakePnl: quoteNeedTakePnl.toString(),
           swapFeeNumerator: swapFeeNumerator.toString(),
@@ -66,6 +69,7 @@ export class RaydiumAmmAdapter implements DexAdapter {
     amountIn: bigint
   ): SwapQuote | null {
     if (amountIn <= 0n) return null;
+    if (!pool.receivedAt || pool.receivedAt <= 0) return null;
 
     const rawReserveA = pool.reserveA ?? 0n;
     const rawReserveB = pool.reserveB ?? 0n;
@@ -75,15 +79,22 @@ export class RaydiumAmmAdapter implements DexAdapter {
       baseNeedTakePnl?: string;
       quoteNeedTakePnl?: string;
       openOrdersVerified?: boolean;
+      openOrdersBaseTokenTotal?: string;
+      openOrdersQuoteTokenTotal?: string;
     } | undefined;
 
     const basePnl = BigInt(extra?.baseNeedTakePnl || '0');
     const quotePnl = BigInt(extra?.quoteNeedTakePnl || '0');
+    const openOrdersBase = BigInt(extra?.openOrdersBaseTokenTotal || '0');
+    const openOrdersQuote = BigInt(extra?.openOrdersQuoteTokenTotal || '0');
     const isOpenOrdersVerified = extra?.openOrdersVerified === true;
 
-    // Effective reserves after deducting uncollected accrued protocol PnL
-    const reserveA = rawReserveA > basePnl ? rawReserveA - basePnl : 0n;
-    const reserveB = rawReserveB > quotePnl ? rawReserveB - quotePnl : 0n;
+    // Classic Raydium V4 reserve formula verified against official Raydium SDK source:
+    // Effective reserve = vault balance + OpenOrders token total - uncollected accrued protocol PnL
+    const totalRawA = rawReserveA + openOrdersBase;
+    const totalRawB = rawReserveB + openOrdersQuote;
+    const reserveA = totalRawA > basePnl ? totalRawA - basePnl : 0n;
+    const reserveB = totalRawB > quotePnl ? totalRawB - quotePnl : 0n;
     if (reserveA <= 0n || reserveB <= 0n) return null;
 
     const isInputA = inputMint === pool.tokenAMint;
@@ -120,7 +131,7 @@ export class RaydiumAmmAdapter implements DexAdapter {
       feeAmount: feeDeduction,
       priceImpactBps,
       slot: pool.slot,
-      timestamp: pool.receivedAt || Date.now(),
+      timestamp: pool.receivedAt,
       executionType: isOpenOrdersVerified ? 'POTENTIAL_ATOMIC' : 'INDICATIVE_ONLY'
     };
 

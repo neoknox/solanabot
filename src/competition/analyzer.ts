@@ -155,10 +155,11 @@ export class CompetitorAnalyzer {
     const arbitrageLoopFrequencyPerHour = Number(((arbLoops / windowSec) * 3600).toFixed(2));
 
     // Contention Level determination
-    let contentionLevel: ContentionLevel = 'LOW';
+    let contentionLevel: ContentionLevel = 'UNKNOWN';
     if (totalObservedTx >= 40) contentionLevel = 'EXTREME';
     else if (totalObservedTx >= 20) contentionLevel = 'HIGH';
     else if (totalObservedTx >= 8) contentionLevel = 'MEDIUM';
+    else if (totalObservedTx >= 1) contentionLevel = 'LOW';
 
     // Deterministic Historical Competition Score (0 to 100)
     // 1. Contention factor: 0-35 pts
@@ -223,14 +224,14 @@ export class CompetitorAnalyzer {
       successfulTxCount: 0,
       failedTxCount: 0,
       failureRate: 0,
-      feeDistributionLamports: { min: 5000, p50: 5000, p95: 10000, max: 15000, mean: 6500 },
-      priorityFeeStatsMicroLamports: { min: 0, p50: 10000, p95: 50000, max: 100000, mean: 20000 },
+      feeDistributionLamports: { min: 0, p50: 0, p95: 0, max: 0, mean: 0 },
+      priorityFeeStatsMicroLamports: { min: 0, p50: 0, p95: 0, max: 0, mean: 0 },
       jitoTipCount: 0,
       jitoTipDistributionLamports: { min: 0, p50: 0, p95: 0, max: 0 },
-      contentionLevel: 'LOW',
-      historicalCompetitionScore: 15, // Baseline default for unanalyzed pools
+      contentionLevel: 'UNKNOWN',
+      historicalCompetitionScore: 0, // Unsampled: 0 transactions observed
       arbitrageLoopFrequencyPerHour: 0,
-      sampleWindowSeconds: 60,
+      sampleWindowSeconds: 0,
       lastAnalyzedSlot: 0,
       timestamp: Date.now()
     };

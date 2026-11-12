@@ -64,12 +64,21 @@ export class ArbitrageProfitCalculator {
 
     // 2. Freshness and Slot synchronization
     const quotes = leg3Quote ? [leg1Quote, leg2Quote, leg3Quote] : [leg1Quote, leg2Quote];
+    for (const q of quotes) {
+      if (!q.timestamp || q.timestamp <= 0 || q.timestamp > now + 5000) {
+        if (!rejectionReasons.includes('STALE_QUOTE')) {
+          rejectionReasons.push('STALE_QUOTE');
+        }
+      }
+    }
     const quoteAgeMs = Math.max(...quotes.map(q => now - q.timestamp));
     const slots = quotes.map(q => q.slot);
     const slotGap = Math.max(...slots) - Math.min(...slots);
 
     if (quoteAgeMs > this.config.MAX_QUOTE_AGE_MS) {
-      rejectionReasons.push('STALE_QUOTE');
+      if (!rejectionReasons.includes('STALE_QUOTE')) {
+        rejectionReasons.push('STALE_QUOTE');
+      }
     }
     if (slotGap > this.config.MAX_SLOT_GAP) {
       rejectionReasons.push('SLOT_MISMATCH');
@@ -196,18 +205,34 @@ export class ArbitrageProfitCalculator {
       .sub(totalCostsDecimal)
       .sub(safetyBufferDecimal);
 
-    // Max execution cost check
-    if (totalCostsDecimal.gt(this.config.MAX_EXECUTION_COST_USDC)) {
-      if (!rejectionReasons.includes('LOW_CONSERVATIVE_NET')) {
-        rejectionReasons.push('LOW_CONSERVATIVE_NET');
-      }
-    }
+    // Separate rejection attribution: Do NOT claim LOW_CONSERVATIVE_NET for routes whose outputs are not independently verifiable
+    const isUnverifiableOrBlocked = rejectionReasons.some(r =>
+      r === 'QUOTE_UNVERIFIED' ||
+      r === 'UNSUPPORTED_ROUTE' ||
+      r === 'INSUFFICIENT_LIQUIDITY' ||
+      r === 'INVALID_MINT' ||
+      r === 'MISSING_TICK_DATA' ||
+      r === 'STALE_QUOTE' ||
+      r === 'PRICE_CONVERSION_STALE' ||
+      r === 'SLOT_MISMATCH' ||
+      r === 'WS_DISCONNECTED' ||
+      r === 'MISSING_COST_ESTIMATE'
+    );
 
-    // Target minimum profit check: >= MIN_NET_PROFIT_USDC ($0.50)
-    const minProfitHurdle = new Decimal(this.config.MIN_NET_PROFIT_USDC);
-    if (minConservativeNetUSDC.lt(minProfitHurdle)) {
-      if (!rejectionReasons.includes('LOW_CONSERVATIVE_NET')) {
-        rejectionReasons.push('LOW_CONSERVATIVE_NET');
+    if (!isUnverifiableOrBlocked) {
+      // Max execution cost check
+      if (totalCostsDecimal.gt(this.config.MAX_EXECUTION_COST_USDC)) {
+        if (!rejectionReasons.includes('LOW_CONSERVATIVE_NET')) {
+          rejectionReasons.push('LOW_CONSERVATIVE_NET');
+        }
+      }
+
+      // Target minimum profit check: >= MIN_NET_PROFIT_USDC ($0.50)
+      const minProfitHurdle = new Decimal(this.config.MIN_NET_PROFIT_USDC);
+      if (minConservativeNetUSDC.lt(minProfitHurdle)) {
+        if (!rejectionReasons.includes('LOW_CONSERVATIVE_NET')) {
+          rejectionReasons.push('LOW_CONSERVATIVE_NET');
+        }
       }
     }
 

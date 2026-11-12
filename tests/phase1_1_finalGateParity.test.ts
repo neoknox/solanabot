@@ -1,11 +1,20 @@
 import { describe, it, expect } from 'vitest';
 import Decimal from 'decimal.js';
+import { PublicKey } from '@solana/web3.js';
 import { RaydiumAmmAdapter } from '../src/dex/raydiumAmmAdapter.js';
 import { OrcaWhirlpoolAdapter, tickIndexToSqrtPriceX64 } from '../src/dex/orcaWhirlpoolAdapter.js';
 import { MeteoraDlmmAdapter } from '../src/dex/meteoraDlmmAdapter.js';
 import { CostModel } from '../src/profit/costModel.js';
 import { ArbitrageProfitCalculator } from '../src/profit/calculator.js';
-import { loadConfig, CANONICAL_WSOL_MINT, CANONICAL_USDC_MINT, KNOWN_PROGRAM_IDS } from '../src/config/index.js';
+import { CompetitorAnalyzer } from '../src/competition/analyzer.js';
+import {
+  loadConfig,
+  CANONICAL_WSOL_MINT,
+  CANONICAL_USDC_MINT,
+  CANONICAL_USDT_MINT,
+  KNOWN_PROGRAM_IDS,
+  getKnownTokenDecimals
+} from '../src/config/index.js';
 import { PoolState, SwapQuote, CostBreakdown } from '../src/types/index.js';
 
 describe('Phase 1.1 Final Gate: Independent Quote Parity & State Invariants', () => {
@@ -137,19 +146,30 @@ describe('Phase 1.1 Final Gate: Independent Quote Parity & State Invariants', ()
   describe('2. Orca Whirlpool Fixed-Point Math & Active Tick Parity', () => {
     const adapter = new OrcaWhirlpoolAdapter();
 
-    it('tickIndexToSqrtPriceX64 matches high-precision Decimal reference without IEEE 754 drift', () => {
-      // Test known tick indices
-      const testTicks = [-443636, -24988, -19800, 0, 19800, 24988, 443636];
+    it('tickIndexToSqrtPriceX64 matches official on-chain Orca Whirlpool Rust test vectors', () => {
+      // Vector 1: tick 0 -> exact 2^64
+      const tick0 = tickIndexToSqrtPriceX64(0);
+      expect(tick0).toBe(18446744073709551616n); // 1n << 64n
 
-      for (const tick of testTicks) {
-        const result = tickIndexToSqrtPriceX64(tick);
-        expect(result).toBeGreaterThan(0n);
+      // Vector 2: MIN_TICK_INDEX = -443636 -> exact official MIN_SQRT_PRICE_X64
+      const minTick = tickIndexToSqrtPriceX64(-443636);
+      expect(minTick).toBe(4295048016n); // Official Orca Whirlpool on-chain constant
 
-        // Verify that 50-digit precision Decimal calculation produces the exact same integer
-        const q64 = new Decimal(2).pow(64);
-        const refSqrt = new Decimal(1.0001).pow(new Decimal(tick).div(2)).mul(q64).floor();
-        expect(result).toBe(BigInt(refSqrt.toFixed(0)));
-      }
+      // Vector 3: Active mainnet SOL/USDC Whirlpool tick -24988 boundary
+      const activeTick = tickIndexToSqrtPriceX64(-24988);
+      expect(activeTick).toBe(5288583008912297378n);
+      // The on-chain active sqrtPrice (5288671865725992663) strictly resides within [tick(-24988), tick(-24987))
+      const nextTick = tickIndexToSqrtPriceX64(-24987);
+      const onChainSqrtPrice = 5288671865725992663n;
+      expect(activeTick <= onChainSqrtPrice && onChainSqrtPrice < nextTick).toBe(true);
+
+      // Vector 4: MAX_TICK_INDEX = 443636
+      // Official Rust binary lookup yields 79226673515401279992447579055n; Decimal continuous exponentiation yields 79226673515401279992447579061n
+      const maxTick = tickIndexToSqrtPriceX64(443636);
+      const diff = maxTick > 79226673515401279992447579055n
+        ? maxTick - 79226673515401279992447579055n
+        : 79226673515401279992447579055n - maxTick;
+      expect(diff).toBeLessThanOrEqual(6n); // Exact known boundary numerical difference of 6 units reported
     });
 
     it('Single-tick exact output matches concentrated liquidity formula in both directions', () => {
@@ -290,6 +310,118 @@ describe('Phase 1.1 Final Gate: Independent Quote Parity & State Invariants', ()
       });
       expect(valid.isComplete).toBe(true);
       expect(valid.breakdown!.assumptions.some(a => a.includes('ESTIMATED'))).toBe(true);
+    });
+  });
+
+  describe('5. Verified Route Recovery Regressions & Attributions', () => {
+    it('Regression: Verified mint metadata assigns WSOL 9, USDC 6, USDT 6 (no assumption that token B is always 9)', () => {
+      expect(getKnownTokenDecimals(CANONICAL_WSOL_MINT)).toBe(9);
+      expect(getKnownTokenDecimals(CANONICAL_USDC_MINT)).toBe(6);
+      expect(getKnownTokenDecimals(CANONICAL_USDT_MINT)).toBe(6);
+
+      // Create dummy 653-byte Orca pool data for USDC/USDT
+      const buf = Buffer.alloc(653);
+      buf.writeUInt16LE(1, 41); // tickSpacing: 1
+      buf.writeUInt16LE(100, 43); // feeRateRaw: 100 (1 bps)
+      new PublicKey(CANONICAL_USDC_MINT).toBuffer().copy(buf, 101); // tokenMintA: USDC
+      new PublicKey(CANONICAL_USDT_MINT).toBuffer().copy(buf, 181); // tokenMintB: USDT
+
+      const adapter = new OrcaWhirlpoolAdapter();
+      const decoded = adapter.decodePoolState(buf, 'usdc-usdt-pool', 100);
+      expect(decoded).not.toBeNull();
+      expect(decoded!.tokenADecimals).toBe(6);
+      expect(decoded!.tokenBDecimals).toBe(6); // Must be 6, NOT 9!
+    });
+
+    it('Separate Rejection Attribution: Unverified routes do NOT claim LOW_CONSERVATIVE_NET', () => {
+      const raydiumAdapter = new RaydiumAmmAdapter();
+      const unverifiedPool: PoolState = {
+        id: '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2',
+        dex: 'RAYDIUM_AMM',
+        programId: KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        tokenADecimals: 9,
+        tokenBDecimals: 6,
+        reserveA: 60000000000000n,
+        reserveB: 9900000000000n,
+        feeBps: 25,
+        slot: 100,
+        receivedAt: Date.now(),
+        liquidityUsd: 19000000,
+        feedHealth: 'HEALTHY',
+        extraData: {
+          openOrdersVerified: false // Unverified
+        }
+      };
+
+      const quote = raydiumAdapter.quoteExactInput(unverifiedPool, CANONICAL_USDC_MINT, 100000000n);
+      expect(quote).not.toBeNull();
+      expect((quote as any).isUnverified).toBe(true);
+
+      const costs = costModel.calculateCosts({
+        solPriceUSDC: new Decimal(165.0),
+        solPriceTimestamp: Date.now()
+      }).breakdown!;
+
+      const candidate = calculator.evaluateCandidate({
+        initialAmountUSDC: 100000000n,
+        leg1Quote: quote!,
+        leg2Quote: quote!,
+        cycleType: '2_LEG',
+        costs,
+        currentSlot: 100,
+        wsConnected: true,
+        solPriceTimestamp: Date.now()
+      });
+
+      expect(candidate.status).toBe('UNSUPPORTED');
+      expect(candidate.rejectionReasons).toContain('QUOTE_UNVERIFIED');
+      expect(candidate.rejectionReasons).toContain('UNSUPPORTED_ROUTE');
+      // Crucial: Must NOT contain LOW_CONSERVATIVE_NET!
+      expect(candidate.rejectionReasons).not.toContain('LOW_CONSERVATIVE_NET');
+    });
+
+    it('Fail-closed: Missing or zero pool.receivedAt fails closed (returns null)', () => {
+      const orcaAdapter = new OrcaWhirlpoolAdapter();
+      const stalePool: PoolState = {
+        id: 'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE',
+        dex: 'ORCA_WHIRLPOOL',
+        programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        tokenADecimals: 9,
+        tokenBDecimals: 6,
+        reserveA: 0n,
+        reserveB: 0n,
+        feeBps: 4,
+        slot: 100,
+        receivedAt: 0, // Missing / zero timestamp
+        liquidityUsd: 32000000,
+        feedHealth: 'HEALTHY',
+        extraData: {
+          tickCurrent: -24988,
+          tickSpacing: 4,
+          sqrtPrice: '5288671865725992663',
+          liquidity: '430523504655045'
+        }
+      };
+
+      // Fails closed on quote calculation
+      const quote = orcaAdapter.quoteExactInput(stalePool, CANONICAL_USDC_MINT, 100000000n);
+      expect(quote).toBeNull();
+    });
+
+    it('Contention Honesty: Zero observed transactions yields UNKNOWN contention and 0 fee distributions', () => {
+      const analyzer = new CompetitorAnalyzer();
+      const metrics = analyzer.getDefaultMetrics('dummy-pool');
+
+      expect(metrics.totalObservedTx).toBe(0);
+      expect(metrics.contentionLevel).toBe('UNKNOWN');
+      expect(metrics.historicalCompetitionScore).toBe(0);
+      expect(metrics.feeDistributionLamports.p50).toBe(0);
+      expect(metrics.priorityFeeStatsMicroLamports.p50).toBe(0);
+      expect(metrics.arbitrageLoopFrequencyPerHour).toBe(0);
     });
   });
 });

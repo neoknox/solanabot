@@ -2,7 +2,7 @@ import { PublicKey } from '@solana/web3.js';
 import Decimal from 'decimal.js';
 import { DexAdapter } from './types.js';
 import { DexType, PoolState, SwapQuote } from '../types/index.js';
-import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT } from '../config/index.js';
+import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT, getKnownTokenDecimals } from '../config/index.js';
 
 Decimal.set({ precision: 50, rounding: Decimal.ROUND_DOWN });
 
@@ -47,9 +47,8 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
       const tokenMintB = new PublicKey(data.subarray(181, 213)).toBase58();
       const tokenVaultB = new PublicKey(data.subarray(213, 245)).toBase58();
 
-      const isBaseWSOL = tokenMintA === CANONICAL_WSOL_MINT;
-      const tokenADecimals = isBaseWSOL ? 9 : 6;
-      const tokenBDecimals = isBaseWSOL ? 6 : 9;
+      const tokenADecimals = getKnownTokenDecimals(tokenMintA);
+      const tokenBDecimals = getKnownTokenDecimals(tokenMintB);
 
       return {
         id: poolId,
@@ -87,6 +86,7 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
     amountIn: bigint
   ): SwapQuote | null {
     if (amountIn <= 0n) return null;
+    if (!pool.receivedAt || pool.receivedAt <= 0) return null;
 
     const extra = pool.extraData as {
       liquidity?: string;
@@ -198,7 +198,7 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
       feeAmount,
       priceImpactBps: Math.max(0, priceImpactBps),
       slot: pool.slot,
-      timestamp: pool.receivedAt || Date.now(),
+      timestamp: pool.receivedAt,
       executionType: 'POTENTIAL_ATOMIC'
     };
   }

@@ -2,7 +2,7 @@ import { PublicKey } from '@solana/web3.js';
 import Decimal from 'decimal.js';
 import { DexAdapter } from './types.js';
 import { DexType, PoolState, SwapQuote } from '../types/index.js';
-import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT } from '../config/index.js';
+import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT, getKnownTokenDecimals } from '../config/index.js';
 
 Decimal.set({ precision: 50, rounding: Decimal.ROUND_DOWN });
 
@@ -22,9 +22,8 @@ export class MeteoraDlmmAdapter implements DexAdapter {
       const reserveX = new PublicKey(data.subarray(152, 184)).toBase58();
       const reserveY = new PublicKey(data.subarray(184, 216)).toBase58();
 
-      const isBaseWSOL = tokenXMint === CANONICAL_WSOL_MINT;
-      const tokenADecimals = isBaseWSOL ? 9 : 6;
-      const tokenBDecimals = isBaseWSOL ? 6 : 9;
+      const tokenADecimals = getKnownTokenDecimals(tokenXMint);
+      const tokenBDecimals = getKnownTokenDecimals(tokenYMint);
 
       // Meteora DLMM base fee parameter
       const feeBps = Math.max(1, Math.min(100, Math.round(binStep / 10)));
@@ -63,6 +62,7 @@ export class MeteoraDlmmAdapter implements DexAdapter {
     amountIn: bigint
   ): SwapQuote | null {
     if (amountIn <= 0n) return null;
+    if (!pool.receivedAt || pool.receivedAt <= 0) return null;
 
     const extra = pool.extraData as {
       binStep?: number;
@@ -143,7 +143,7 @@ export class MeteoraDlmmAdapter implements DexAdapter {
         feeAmount,
         priceImpactBps: Math.min(pool.feeBps, 50),
         slot: pool.slot,
-        timestamp: pool.receivedAt || Date.now(),
+        timestamp: pool.receivedAt,
         executionType: 'POTENTIAL_ATOMIC'
       };
     } catch {
