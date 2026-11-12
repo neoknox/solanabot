@@ -168,4 +168,16 @@ export class PoolRegistry {
     const pool = this.pools.get(id);
     return pool?.verificationStatus === 'VERIFIED_DIRECT';
   }
+
+  public isVenueSupported(dex: DexType): boolean {
+    return dex === 'ORCA_WHIRLPOOL' || dex === 'RAYDIUM_AMM';
+  }
+
+  public getSupportedPools(): PoolConfig[] {
+    return Array.from(this.pools.values()).filter(p => this.isVenueSupported(p.dex));
+  }
+
+  public getUnsupportedCatalog(): PoolConfig[] {
+    return Array.from(this.pools.values()).filter(p => !this.isVenueSupported(p.dex));
+  }
 }

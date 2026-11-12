@@ -84,8 +84,11 @@ export class ArbitrageScanner {
     survivalCheckedCount: 0,
     survivalSurvivedCount: 0,
     survivalDecayedCount: 0,
-    competitorTxsAnalyzed: 0,
-    averageCompetitionScore: 0
+    configuredRouteCount: 0,
+    stateReadyRouteCount: 0,
+    quoteValidRouteCount: 0,
+    profitQualifiedRouteCount: 0,
+    executionUnverifiedRouteCount: 0
   };
 
   // Live timestamped SOL/USDC price (null initially: zero fictitious default price permitted)
@@ -414,11 +417,22 @@ export class ArbitrageScanner {
   }
 
   private evaluateIndexedRoute(route: IndexedDirectedRoute, monotonicReceiptTime?: number): void {
+    this.auditMetrics.configuredRouteCount = this.routeIndex.getAllRoutes().length;
     const quoterLegs: QuoterLeg[] = [];
     let oldestSlot = Infinity;
 
     for (let idx = 0; idx < route.legs.length; idx++) {
       const legDef = route.legs[idx];
+
+      // Exclude unsupported venues
+      if (!this.poolRegistry.isVenueSupported(legDef.dex)) {
+        this.rejectedCount++;
+        this.auditMetrics.rejectedRoutes++;
+        this.auditMetrics.unsupportedRoutes = (this.auditMetrics.unsupportedRoutes || 0) + 1;
+        this.rejectionBreakdown['UNSUPPORTED_ROUTE'] = (this.rejectionBreakdown['UNSUPPORTED_ROUTE'] || 0) + 1;
+        return;
+      }
+
       const pool = this.stateCache.getPoolState(legDef.poolId);
       if (!pool) return;
 
@@ -443,6 +457,11 @@ export class ArbitrageScanner {
       if (pool.slot < oldestSlot) oldestSlot = pool.slot;
     }
 
+    if (quoterLegs.length < route.legs.length) return;
+
+    // All pool dependencies are verified, hydrated, and compatible
+    this.auditMetrics.stateReadyRouteCount = (this.auditMetrics.stateReadyRouteCount || 0) + 1;
+
     const currentSlot = this.ws.getCurrentSlot();
     const wsConnected = this.ws.getHealth() !== 'DISCONNECTED';
 
@@ -459,6 +478,9 @@ export class ArbitrageScanner {
     });
 
     if (!costResult.isComplete || !costResult.breakdown) return;
+
+    // Deterministic state version uniquely identifies this exact multi-pool snapshot
+    const stateVersion = quoterLegs.map(l => `${l.pool.id}@${l.pool.slot}`).join(':');
 
     // Fast optimal trade sizing
     const quoteStart = performance.now();
@@ -481,7 +503,7 @@ export class ArbitrageScanner {
       this.auditMetrics.interDexEvaluated = (this.auditMetrics.interDexEvaluated || 0) + 1;
     }
 
-    if (sizerResult.optimalQuotes.length < 2) {
+    if (sizerResult.optimalQuotes.length < route.legs.length) {
       this.rejectedCount++;
       this.auditMetrics.rejectedRoutes++;
       const reason = (sizerResult.allEvaluations[0]?.rejectionReason || 'INSUFFICIENT_LIQUIDITY') as RejectionReasonCode;
@@ -490,10 +512,13 @@ export class ArbitrageScanner {
         this.auditMetrics.quoteValidationFailures++;
       }
       if (reason === 'UNSUPPORTED_ROUTE') {
-        this.auditMetrics.unsupportedRoutes++;
+        this.auditMetrics.unsupportedRoutes = (this.auditMetrics.unsupportedRoutes || 0) + 1;
       }
       return;
     }
+
+    // Exact quotes successfully produced for all legs
+    this.auditMetrics.quoteValidRouteCount = (this.auditMetrics.quoteValidRouteCount || 0) + 1;
 
     const validationStart = performance.now();
     const candidate = this.calculator.evaluateCandidate({
@@ -501,14 +526,32 @@ export class ArbitrageScanner {
       leg1Quote: sizerResult.optimalQuotes[0],
       leg2Quote: sizerResult.optimalQuotes[1],
       leg3Quote: sizerResult.optimalQuotes[2],
+      leg1ConservativeQuote: sizerResult.conservativeQuotes[0],
+      leg2ConservativeQuote: sizerResult.conservativeQuotes[1],
+      leg3ConservativeQuote: sizerResult.conservativeQuotes[2],
       cycleType: route.cycleType,
       optimalSizeUSDC: sizerResult.optimalSizeUSDC,
       sizingMethod: sizerResult.sizingMethod,
       costs: costResult.breakdown,
       currentSlot,
       wsConnected,
-      solPriceTimestamp: this.lastSolPriceTime
+      solPriceTimestamp: this.lastSolPriceTime,
+      topAlternatives: sizerResult.topAlternatives,
+      stateVersion
     });
+
+    // Simulated Capital Management: Bound total simultaneous active reservations against VIRTUAL_CAPITAL_USDC
+    if (candidate.status === 'QUALIFIED_SHADOW') {
+      this.opportunityTracker.purgeStaleOpportunities(10000);
+      const activeAllocated = this.opportunityTracker.getActiveAllocatedCapital();
+      const oppSizeUSDC = candidate.optimalSizeUSDC || Number(candidate.inputAmountUSDC) / 1e6;
+      const oppKey = `${quoterLegs.map(l => l.pool.id).join('->')}:${oppSizeUSDC.toFixed(0)}`;
+      const existingOpp = this.opportunityTracker.getActiveOpportunity(oppKey);
+      if (!existingOpp && (activeAllocated + oppSizeUSDC > this.config.VIRTUAL_CAPITAL_USDC)) {
+        candidate.status = 'REJECTED';
+        candidate.rejectionReasons.push('SIMULATED_CAPITAL_EXHAUSTED');
+      }
+    }
 
     // Competition-Aware Opportunity Scoring (Section 4)
     const poolMetrics = route.legs.map(l => this.competitorAnalyzer.getCachedMetrics(l.poolId));
@@ -538,11 +581,12 @@ export class ArbitrageScanner {
       this.auditMetrics.candidatesGrossPositive++;
     }
 
-    // Deduplicate identical repeated opportunities
+    // Deduplicate identical repeated opportunities using route + stateVersion + size
     const isDupe = this.stateCache.isDuplicate({
       route: route.routeId,
       amountUSDC: candidate.inputAmountUSDC,
-      netProfitUSDC: candidate.minConservativeNetUSDC
+      netProfitUSDC: candidate.minConservativeNetUSDC,
+      stateVersion
     });
 
     if (!isDupe) {
@@ -553,6 +597,9 @@ export class ArbitrageScanner {
       this.qualifiedCount++;
       this.auditMetrics.candidatesConservativeQualified++;
       this.auditMetrics.shadowQualifiedCount = (this.auditMetrics.shadowQualifiedCount || 0) + 1;
+      this.auditMetrics.profitQualifiedRouteCount = (this.auditMetrics.profitQualifiedRouteCount || 0) + 1;
+      candidate.executionStatus = 'EXECUTION_UNVERIFIED';
+      this.auditMetrics.executionUnverifiedRouteCount = (this.auditMetrics.executionUnverifiedRouteCount || 0) + 1;
 
       // Survival re-check against current state
       const survival = this.recheckSurvivalSync(candidate, quoterLegs, costResult.breakdown, currentSlot);
@@ -572,7 +619,7 @@ export class ArbitrageScanner {
           this.auditMetrics.quoteValidationFailures++;
         }
         if (reason === 'UNSUPPORTED_ROUTE') {
-          this.auditMetrics.unsupportedRoutes++;
+          this.auditMetrics.unsupportedRoutes = (this.auditMetrics.unsupportedRoutes || 0) + 1;
         }
         if (reason === 'STALE_QUOTE' || reason === 'SLOT_MISMATCH' || reason === 'PRICE_CONVERSION_STALE') {
           this.auditMetrics.staleDataRejections++;
@@ -912,6 +959,7 @@ export class ArbitrageScanner {
     const lifecycleStats = this.opportunityTracker.getLifecycleStats();
     return {
       ...this.auditMetrics,
+      configuredRouteCount: this.routeIndex.getAllRoutes().length,
       maxOpportunityVisibilityMs: lifecycleStats.maxVisibilityDurationMs,
       meanOpportunityVisibilityMs: lifecycleStats.meanVisibilityDurationMs
     };

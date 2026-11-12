@@ -88,3 +88,62 @@ export interface AlternativeRpcSender {
   isFallback: boolean;
   health: 'HEALTHY' | 'DEGRADED' | 'UNAVAILABLE';
 }
+
+/**
+ * PROFIT-FIRST FUTURE EXECUTION CONTRACT SPECIFICATION
+ * 
+ * Strict specifications for eventual atomic multi-hop transaction composition.
+ * No signing, no transaction broadcast, and no keypairs in Phase 1.1 / Phase 1.2.
+ */
+
+export interface ExecutionInstructionLayout {
+  stepIndex: number;
+  type:
+    | 'COMPUTE_BUDGET_LIMIT'
+    | 'COMPUTE_BUDGET_PRICE'
+    | 'JITO_TIP'
+    | 'SWAP_LEG_1'
+    | 'SWAP_LEG_2'
+    | 'SWAP_LEG_3'
+    | 'ON_CHAIN_PROFIT_GUARD';
+  programId: PublicKey;
+  description: string;
+  isAtomicGuard: boolean;
+}
+
+export interface ExecutionContractSpec {
+  routeId: string;
+  cycleType: '2_LEG' | '3_LEG';
+  initialAmountUSDC: bigint;
+  minimumOutputAmountUSDC: bigint;
+  minNetProfitUSDC: string;
+  instructionLayout: ExecutionInstructionLayout[];
+  maxComputeUnits: number;
+  targetPriorityFeeMicroLamports: number;
+  jitoTipLamports: number;
+  requiresLookupTable: boolean;
+  lookupTableAddresses?: PublicKey[];
+  /** Status remains EXECUTION_UNVERIFIED until composition and simulation demonstrate feasibility */
+  executionStatus: 'EXECUTION_UNVERIFIED' | 'SIMULATION_PASSED' | 'ATOMIC_READY';
+}
+
+export interface PreflightSimulationRequirements {
+  simulatedComputeUnits: number;
+  computeUnitMarginBps: number;
+  writableAccountContention: 'LOW' | 'MEDIUM' | 'HIGH' | 'UNKNOWN';
+  duplicateInflightPreventionKey: string;
+  cooldownPeriodMs: number;
+  failedAttemptCostLamports: number;
+  simulationSuccess: boolean;
+  simulationLogs: string[];
+}
+
+export interface OperatorRiskBudget {
+  maxDailyLossUSDC: number;
+  currentDailyConsumedLossUSDC: number;
+  maxConsecutiveFailures: number;
+  currentConsecutiveFailures: number;
+  circuitBreakerTripped: boolean;
+  virtualCapitalLimitUSDC: number;
+  activeAllocatedCapitalUSDC: number;
+}

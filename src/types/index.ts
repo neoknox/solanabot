@@ -100,6 +100,14 @@ export type OpportunityStatus =
   | 'STALE'                       // Slot gap or quote age exceeded configured threshold
   | 'DEGRADED';                   // Feed disconnected or unreliable
 
+export interface SizeAlternative {
+  sizeUSDC: number;
+  expectedNetUSDC: string;
+  conservativeNetUSDC: string;
+  isViable: boolean;
+  rejectionReason?: string;
+}
+
 export type RejectionReasonCode =
   | 'STALE_QUOTE'
   | 'SLOT_MISMATCH'
@@ -115,6 +123,8 @@ export type RejectionReasonCode =
   | 'EXCESSIVE_PRICE_IMPACT'
   | 'MISSING_TICK_DATA'
   | 'TICK_BOUNDARY_EXCEEDED'
+  | 'SPREAD_PREFILTER_REJECTED'
+  | 'SIMULATED_CAPITAL_EXHAUSTED'
   | 'QUOTE_UNVERIFIED'
   | 'UNSUPPORTED_ROUTE'
   | 'REUSED_IDENTICAL_POOL'
@@ -235,6 +245,11 @@ export interface ArbitrageCandidate {
   visibilityDurationMs?: number;      // Continuous observation duration across snapshots
   observedSnapshotsCount?: number;    // Number of sequential snapshots where opportunity was visible
   scoringBreakdown?: ScoringBreakdown;// Itemized deterministic score explanation
+
+  // Profit-First Algorithm Additions
+  topAlternatives?: SizeAlternative[]; // Evaluated alternative sizes and their net profit
+  stateVersion?: string;               // Snapshot version signature (pool slots)
+  executionStatus?: 'EXECUTION_UNVERIFIED' | 'SIMULATION_PASSED' | 'ATOMIC_READY';
 }
 
 export interface ScanHealthStatus {
@@ -268,6 +283,13 @@ export interface AuditMetrics {
   survivalCheckedCount?: number;
   survivalSurvivedCount?: number;
   survivalDecayedCount?: number;
+
+  // Profit-First Stage Funnel Counts
+  configuredRouteCount?: number;
+  stateReadyRouteCount?: number;
+  quoteValidRouteCount?: number;
+  profitQualifiedRouteCount?: number;
+  executionUnverifiedRouteCount?: number;
 
   // Competition intelligence metrics
   competitorTxsAnalyzed?: number;

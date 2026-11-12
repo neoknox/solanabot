@@ -85,6 +85,16 @@ async function main() {
   console.log(`Unique Opportunities:           ${audit.uniqueOpportunities}`);
   console.log(`Gross-Positive Candidates:      ${audit.candidatesGrossPositive}`);
   console.log(`Conservative Net Qualified:     ${audit.candidatesConservativeQualified}`);
+
+  console.log('\n--- PROFIT-FIRST OPPORTUNITY FUNNEL METRICS ---');
+  console.log(`  1. Configured Routes (Catalog):     ${audit.configuredRouteCount || routeIndex.getRouteCount()}`);
+  console.log(`  2. State-Ready Routes (Hydrated):   ${audit.stateReadyRouteCount || 0}`);
+  console.log(`  3. Quote-Valid Routes (Math Exec):  ${audit.quoteValidRouteCount || 0}`);
+  console.log(`  4. Profit-Qualified Routes (>= $0.50): ${audit.profitQualifiedRouteCount || 0}`);
+  console.log(`  5. Execution-Unverified (Phase 1.2): ${audit.executionUnverifiedRouteCount || 0}`);
+  console.log(`  Simulated Capital Limit:            $${config.VIRTUAL_CAPITAL_USDC} USDC`);
+  console.log(`  Active Allocated Simulated Capital: $${scanner.getOpportunityTracker().getActiveAllocatedCapital()} USDC`);
+
   console.log(`Opportunity Quality Labels:`);
   console.log(`  - SHADOW_QUALIFIED:           ${audit.candidatesConservativeQualified}`);
   console.log(`  - INDICATIVE_ONLY:            ${audit.unsupportedRoutes + audit.quoteValidationFailures}`);

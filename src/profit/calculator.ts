@@ -8,7 +8,8 @@ import {
   CycleType,
   TradeSizingMethod,
   RejectionReasonCode,
-  CostBreakdown
+  CostBreakdown,
+  SizeAlternative
 } from '../types/index.js';
 
 Decimal.set({ precision: 30, rounding: Decimal.ROUND_DOWN });
@@ -18,6 +19,9 @@ export interface CandidateEvaluationParams {
   leg1Quote: SwapQuote;
   leg2Quote: SwapQuote;
   leg3Quote?: SwapQuote;
+  leg1ConservativeQuote?: SwapQuote;
+  leg2ConservativeQuote?: SwapQuote;
+  leg3ConservativeQuote?: SwapQuote;
   cycleType?: CycleType;
   optimalSizeUSDC?: number;
   sizingMethod?: TradeSizingMethod;
@@ -25,6 +29,8 @@ export interface CandidateEvaluationParams {
   currentSlot: number;
   wsConnected: boolean;
   solPriceTimestamp?: number;
+  topAlternatives?: SizeAlternative[];
+  stateVersion?: string;
 }
 
 export class ArbitrageProfitCalculator {
@@ -107,6 +113,12 @@ export class ArbitrageProfitCalculator {
         if (!rejectionReasons.includes('QUOTE_UNVERIFIED')) {
           rejectionReasons.push('QUOTE_UNVERIFIED');
         }
+        if ((q as any).unverifiedReason) {
+          const customReason = (q as any).unverifiedReason as RejectionReasonCode;
+          if (!rejectionReasons.includes(customReason)) {
+            rejectionReasons.push(customReason);
+          }
+        }
       }
       if (q.priceImpactBps > this.config.MAX_PRICE_IMPACT_BPS) {
         if (!rejectionReasons.includes('EXCESSIVE_PRICE_IMPACT')) {
@@ -138,12 +150,16 @@ export class ArbitrageProfitCalculator {
     const leg1ExpectedOutWSOL = leg1Quote.outAmount;
     const slippageBps1 = BigInt(this.config.SLIPPAGE_BPS_LEG1);
     const slippage1 = (leg1ExpectedOutWSOL * slippageBps1) / 10000n;
-    const leg1ConservativeOutWSOL = leg1ExpectedOutWSOL - slippage1;
+    const leg1ConservativeOutWSOL = params.leg1ConservativeQuote
+      ? params.leg1ConservativeQuote.outAmount - slippage1
+      : leg1ExpectedOutWSOL - slippage1;
 
     const leg2ExpectedOutUSDC = leg2Quote.outAmount;
     const slippageBps2 = BigInt(this.config.SLIPPAGE_BPS_LEG2);
     const slippage2 = (leg2ExpectedOutUSDC * slippageBps2) / 10000n;
-    const leg2ConservativeOutUSDC = leg2ExpectedOutUSDC - slippage2;
+    const leg2ConservativeOutUSDC = params.leg2ConservativeQuote
+      ? params.leg2ConservativeQuote.outAmount - slippage2
+      : leg2ExpectedOutUSDC - slippage2;
 
     let leg3ExpectedOutUSDC: bigint | undefined;
     let leg3ConservativeOutUSDC: bigint | undefined;
@@ -155,7 +171,9 @@ export class ArbitrageProfitCalculator {
       leg3ExpectedOutUSDC = leg3Quote.outAmount;
       const slippageBps3 = BigInt(this.config.SLIPPAGE_BPS_LEG3 || 10);
       const slippage3 = (leg3ExpectedOutUSDC * slippageBps3) / 10000n;
-      leg3ConservativeOutUSDC = leg3ExpectedOutUSDC - slippage3;
+      leg3ConservativeOutUSDC = params.leg3ConservativeQuote
+        ? params.leg3ConservativeQuote.outAmount - slippage3
+        : leg3ExpectedOutUSDC - slippage3;
 
       finalExpectedUnits = leg3ExpectedOutUSDC;
       finalConservativeUnits = leg3ConservativeOutUSDC;
@@ -191,8 +209,8 @@ export class ArbitrageProfitCalculator {
     const initialDecimal = new Decimal(initialAmountUSDC.toString()).div(1e6);
     const finalExpectedDecimal = new Decimal(finalExpectedUnits.toString()).div(1e6);
     const finalConservativeDecimal = new Decimal(finalConservativeUnits.toString()).div(1e6);
-    const totalCostsDecimal = new Decimal(defaultCosts.totalCostsUSDC);
-    const safetyBufferDecimal = new Decimal(defaultCosts.safetyBufferUSDC);
+    const totalCostsDecimal = new Decimal(defaultCosts.totalCostsUSDC || defaultCosts.consumedCostUSDC || '0');
+    const safetyBufferDecimal = new Decimal(defaultCosts.safetyBufferUSDC || '0');
 
     // Expected Quote Net: finalExpected - initial - totalCosts
     const expectedNetUSDC = finalExpectedDecimal
@@ -212,6 +230,9 @@ export class ArbitrageProfitCalculator {
       r === 'INSUFFICIENT_LIQUIDITY' ||
       r === 'INVALID_MINT' ||
       r === 'MISSING_TICK_DATA' ||
+      r === 'TICK_BOUNDARY_EXCEEDED' ||
+      r === 'SPREAD_PREFILTER_REJECTED' ||
+      r === 'SIMULATED_CAPITAL_EXHAUSTED' ||
       r === 'STALE_QUOTE' ||
       r === 'PRICE_CONVERSION_STALE' ||
       r === 'SLOT_MISMATCH' ||
@@ -249,7 +270,12 @@ export class ArbitrageProfitCalculator {
     } else if (rejectionReasons.includes('WS_DISCONNECTED')) {
       status = 'DEGRADED';
       qualityLabel = 'INVALID';
-    } else if (rejectionReasons.includes('QUOTE_UNVERIFIED') || rejectionReasons.includes('MISSING_TICK_DATA') || rejectionReasons.includes('UNSUPPORTED_ROUTE')) {
+    } else if (
+      rejectionReasons.includes('QUOTE_UNVERIFIED') ||
+      rejectionReasons.includes('MISSING_TICK_DATA') ||
+      rejectionReasons.includes('TICK_BOUNDARY_EXCEEDED') ||
+      rejectionReasons.includes('UNSUPPORTED_ROUTE')
+    ) {
       status = 'UNSUPPORTED';
       qualityLabel = 'INDICATIVE_ONLY';
     } else if (expectedNetUSDC.gt(0) && rejectionReasons.length === 1 && rejectionReasons[0] === 'LOW_CONSERVATIVE_NET') {
@@ -302,7 +328,10 @@ export class ArbitrageProfitCalculator {
       timestamp: now,
       slotGap,
       quoteAgeMs,
-      survivalStatus: 'UNCHECKED'
+      survivalStatus: 'UNCHECKED',
+      topAlternatives: params.topAlternatives,
+      stateVersion: params.stateVersion,
+      executionStatus: 'EXECUTION_UNVERIFIED'
     };
   }
 }

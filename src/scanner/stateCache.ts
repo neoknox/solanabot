@@ -4,6 +4,7 @@ export interface DedupeKey {
   route: string;
   amountUSDC: bigint;
   netProfitUSDC: string;
+  stateVersion?: string;
 }
 
 export class StateCache {
@@ -23,6 +24,14 @@ export class StateCache {
     return Array.from(this.poolStates.values());
   }
 
+  public invalidatePool(poolId: string, reason: FeedHealth = 'DEGRADED'): void {
+    const state = this.poolStates.get(poolId);
+    if (state) {
+      state.feedHealth = reason;
+      state.receivedAt = 0;
+    }
+  }
+
   public invalidateAll(reason: FeedHealth = 'DISCONNECTED'): void {
     for (const [id, state] of this.poolStates.entries()) {
       this.poolStates.set(id, {
@@ -35,7 +44,8 @@ export class StateCache {
   }
 
   public isDuplicate(key: DedupeKey): boolean {
-    const serialized = `${key.route}:${key.amountUSDC.toString()}:${key.netProfitUSDC}`;
+    const versionPart = key.stateVersion ? `v:${key.stateVersion}` : `net:${key.netProfitUSDC}`;
+    const serialized = `${key.route}:${versionPart}:${key.amountUSDC.toString()}`;
     const now = Date.now();
     const lastSeen = this.dedupeCache.get(serialized);
 

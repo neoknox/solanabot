@@ -51,13 +51,17 @@ export class CompetitionScorer {
 
     // 4. Competition & Pool Contention Factor (0 to 20 pts awarded)
     // Lower pool competition score gives higher awarded score
-    let avgPoolCompetition = 25; // default moderate
+    // With no observed competitor transactions, contention is UNKNOWN and no artificial penalty is applied.
+    let avgPoolCompetition = 0;
     if (poolMetricsList.length > 0) {
-      const sumComp = poolMetricsList.reduce((acc, m) => acc + m.historicalCompetitionScore, 0);
-      avgPoolCompetition = Math.round(sumComp / poolMetricsList.length);
+      const observedMetrics = poolMetricsList.filter(m => m.totalObservedTx > 0);
+      if (observedMetrics.length > 0) {
+        const sumComp = observedMetrics.reduce((acc, m) => acc + m.historicalCompetitionScore, 0);
+        avgPoolCompetition = Math.round(sumComp / observedMetrics.length);
+      }
     }
     const competitionPenalty = Math.max(0, Math.min(20, Math.round(20 - (avgPoolCompetition * 0.20))));
-    rationale.push(`Competition: average pool competition score ${avgPoolCompetition}/100 = ${competitionPenalty}/20 pts awarded`);
+    rationale.push(`Competition: observed pool competition score ${avgPoolCompetition}/100 = ${competitionPenalty}/20 pts awarded`);
 
     // 5. Route Complexity Score (0 to 10 pts)
     let complexityScore = 8;

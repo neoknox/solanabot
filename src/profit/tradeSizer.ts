@@ -4,7 +4,8 @@ import {
   SwapQuote,
   TradeSizingMethod,
   CostBreakdown,
-  PoolState
+  PoolState,
+  SizeAlternative
 } from '../types/index.js';
 import { DexAdapter } from '../dex/types.js';
 
@@ -25,7 +26,9 @@ export interface SizeEvaluation {
   finalConservativeUnits: bigint;
   expectedNetUSDC: Decimal;
   conservativeNetUSDC: Decimal;
-  quotes: SwapQuote[];
+  expectedQuotes: SwapQuote[];
+  conservativeQuotes: SwapQuote[];
+  quotes: SwapQuote[]; // backwards compatible alias to expectedQuotes
   isViable: boolean;
   rejectionReason?: string;
 }
@@ -37,6 +40,8 @@ export interface TradeSizerResult {
   sizingMethod: TradeSizingMethod;
   evaluatedSizesCount: number;
   optimalQuotes: SwapQuote[];
+  conservativeQuotes: SwapQuote[];
+  topAlternatives: SizeAlternative[];
   allEvaluations: SizeEvaluation[];
 }
 
@@ -48,7 +53,10 @@ export class TradeSizer {
   }
 
   /**
-   * Evaluates sequential swaps for a given USDC size along a route
+   * Evaluates sequential swaps for a given USDC size along a route.
+   * Calculates Expected Output and Conservative Output as strictly SEPARATE paths:
+   * - Expected Path: Exact chained swaps, swap fees included, ZERO slippage deducted.
+   * - Conservative Path: Exact chained swaps, swap fees included, conservative slippage allowance deducted per leg.
    */
   public evaluateSize(
     sizeUSDC: number,
@@ -57,77 +65,101 @@ export class TradeSizer {
     currentSlot: number
   ): SizeEvaluation {
     const inputUnits = BigInt(Math.floor(sizeUSDC * 1e6));
-    const quotes: SwapQuote[] = [];
-    let currentInputUnits = inputUnits;
-
-    const totalCostsDecimal = new Decimal(costs.totalCostsUSDC);
-    const safetyBufferDecimal = new Decimal(costs.safetyBufferUSDC);
+    const consumedCostsDecimal = new Decimal(costs.consumedCostUSDC || costs.totalCostsUSDC || '0');
+    const safetyBufferDecimal = new Decimal(costs.safetyBufferUSDC || '0');
     const initialDecimal = new Decimal(sizeUSDC);
+
+    // 1. EXPECTED OUTPUT PATH (Exact chained quotes without slippage deduction)
+    const expectedQuotes: SwapQuote[] = [];
+    let currentExpectedUnits = inputUnits;
+    let expectedFailedReason: string | undefined;
 
     for (let i = 0; i < legs.length; i++) {
       const leg = legs[i];
-      if (currentInputUnits <= 0n) {
-        return {
-          sizeUSDC,
-          inputUnits,
-          finalExpectedUnits: 0n,
-          finalConservativeUnits: 0n,
-          expectedNetUSDC: new Decimal(-999),
-          conservativeNetUSDC: new Decimal(-999),
-          quotes: [],
-          isViable: false,
-          rejectionReason: 'INSUFFICIENT_LIQUIDITY'
-        };
+      if (currentExpectedUnits <= 0n) {
+        expectedFailedReason = 'INSUFFICIENT_LIQUIDITY';
+        break;
       }
 
-      const quote = leg.adapter.quoteExactInput(leg.pool, leg.inputMint, currentInputUnits);
-      if (!quote || quote.outAmount <= 0n) {
-        let rejectionReason: string = 'QUOTE_UNVERIFIED';
+      const q = leg.adapter.quoteExactInput(leg.pool, leg.inputMint, currentExpectedUnits);
+      if (!q || q.outAmount <= 0n) {
         if (leg.pool.dex === 'ORCA_WHIRLPOOL') {
-          rejectionReason = 'TICK_BOUNDARY_EXCEEDED';
+          expectedFailedReason = 'TICK_BOUNDARY_EXCEEDED';
         } else if (leg.pool.dex === 'METEORA_DLMM') {
-          rejectionReason = 'UNSUPPORTED_ROUTE';
+          expectedFailedReason = 'UNSUPPORTED_ROUTE';
         } else if (leg.pool.dex === 'RAYDIUM_AMM') {
-          rejectionReason = (leg.pool.extraData as any)?.unverifiedReason || 'QUOTE_UNVERIFIED';
+          expectedFailedReason = (leg.pool.extraData as any)?.unverifiedReason || 'QUOTE_UNVERIFIED';
+        } else {
+          expectedFailedReason = 'QUOTE_UNVERIFIED';
         }
-
-        return {
-          sizeUSDC,
-          inputUnits,
-          finalExpectedUnits: 0n,
-          finalConservativeUnits: 0n,
-          expectedNetUSDC: new Decimal(-999),
-          conservativeNetUSDC: new Decimal(-999),
-          quotes: [],
-          isViable: false,
-          rejectionReason
-        };
+        break;
       }
 
-      quotes.push(quote);
-
-      // Deduct conservative slippage allowance for input to next leg
-      const slippage = (quote.outAmount * BigInt(leg.slippageBps)) / 10000n;
-      currentInputUnits = quote.outAmount - slippage;
+      expectedQuotes.push(q);
+      currentExpectedUnits = q.outAmount;
     }
 
-    const lastQuote = quotes[quotes.length - 1];
-    const finalExpectedUnits = lastQuote.outAmount;
-    const lastLegSlippageBps = BigInt(legs[legs.length - 1].slippageBps);
-    const lastSlippage = (finalExpectedUnits * lastLegSlippageBps) / 10000n;
-    const finalConservativeUnits = finalExpectedUnits - lastSlippage;
+    // 2. CONSERVATIVE MINIMUM OUTPUT PATH (Exact chained quotes with per-leg slippage deduction)
+    const conservativeQuotes: SwapQuote[] = [];
+    let currentConservativeUnits = inputUnits;
+    let conservativeFailedReason: string | undefined;
 
-    // Output is in USDC (6 decimals)
+    for (let i = 0; i < legs.length; i++) {
+      const leg = legs[i];
+      if (currentConservativeUnits <= 0n) {
+        conservativeFailedReason = 'INSUFFICIENT_LIQUIDITY';
+        break;
+      }
+
+      const q = leg.adapter.quoteExactInput(leg.pool, leg.inputMint, currentConservativeUnits);
+      if (!q || q.outAmount <= 0n) {
+        if (leg.pool.dex === 'ORCA_WHIRLPOOL') {
+          conservativeFailedReason = 'TICK_BOUNDARY_EXCEEDED';
+        } else if (leg.pool.dex === 'METEORA_DLMM') {
+          conservativeFailedReason = 'UNSUPPORTED_ROUTE';
+        } else if (leg.pool.dex === 'RAYDIUM_AMM') {
+          conservativeFailedReason = (leg.pool.extraData as any)?.unverifiedReason || 'QUOTE_UNVERIFIED';
+        } else {
+          conservativeFailedReason = 'QUOTE_UNVERIFIED';
+        }
+        break;
+      }
+
+      conservativeQuotes.push(q);
+      const slippage = (q.outAmount * BigInt(leg.slippageBps)) / 10000n;
+      currentConservativeUnits = q.outAmount - slippage;
+    }
+
+    if (expectedFailedReason || expectedQuotes.length < legs.length) {
+      const reason = expectedFailedReason || 'QUOTE_UNVERIFIED';
+      return {
+        sizeUSDC,
+        inputUnits,
+        finalExpectedUnits: 0n,
+        finalConservativeUnits: 0n,
+        expectedNetUSDC: new Decimal(-999),
+        conservativeNetUSDC: new Decimal(-999),
+        expectedQuotes: [],
+        conservativeQuotes: [],
+        quotes: [],
+        isViable: false,
+        rejectionReason: reason
+      };
+    }
+
+    const finalExpectedUnits = currentExpectedUnits;
+    const finalConservativeUnits = currentConservativeUnits;
+
     const finalExpectedDecimal = new Decimal(finalExpectedUnits.toString()).div(1e6);
     const finalConservativeDecimal = new Decimal(finalConservativeUnits.toString()).div(1e6);
 
     const expectedNetUSDC = finalExpectedDecimal
       .sub(initialDecimal)
-      .sub(totalCostsDecimal);
+      .sub(consumedCostsDecimal);
 
     const conservativeNetUSDC = finalConservativeDecimal
       .sub(initialDecimal)
-      .sub(totalCostsDecimal)
+      .sub(consumedCostsDecimal)
       .sub(safetyBufferDecimal);
 
     return {
@@ -137,7 +169,9 @@ export class TradeSizer {
       finalConservativeUnits,
       expectedNetUSDC,
       conservativeNetUSDC,
-      quotes,
+      expectedQuotes,
+      conservativeQuotes,
+      quotes: conservativeQuotes,
       isViable: true
     };
   }
@@ -156,15 +190,58 @@ export class TradeSizer {
     const coarseGrid = this.config.parsedTradeSizesUSDC;
     const evaluations: SizeEvaluation[] = [];
 
-    // 1. Coarse evaluation
-    let bestCoarseEval: SizeEvaluation | null = null;
+    // 1. Cheap Spread Pre-Filter at Minimal Trade Size ($25 USDC)
+    // In constant-product AMMs and CLMMs, price impact increases monotonically with trade size.
+    // If at the minimum size ($25), gross expected return is already < 98% of input (>200 bps gross negative spread),
+    // larger sizes will suffer strictly worse price impact and cannot overcome fixed fees to reach +$0.50 net profit.
+    const minSize = coarseGrid[0] || 25;
+    const firstEval = this.evaluateSize(minSize, legs, costs, currentSlot);
 
-    for (const size of coarseGrid) {
+    if (!firstEval.isViable) {
+      evaluations.push(firstEval);
+      return {
+        optimalSizeUSDC: minSize,
+        maxConservativeNetUSDC: new Decimal(-999),
+        expectedNetUSDC: new Decimal(-999),
+        sizingMethod: 'COARSE_GRID',
+        evaluatedSizesCount: 1,
+        optimalQuotes: [],
+        conservativeQuotes: [],
+        topAlternatives: [],
+        allEvaluations: evaluations
+      };
+    }
+
+    // Check gross output spread pre-filter
+    const minViableExpectedUnits = (firstEval.inputUnits * 98n) / 100n;
+    if (firstEval.finalExpectedUnits < minViableExpectedUnits) {
+      firstEval.isViable = false;
+      firstEval.rejectionReason = 'SPREAD_PREFILTER_REJECTED';
+      evaluations.push(firstEval);
+      return {
+        optimalSizeUSDC: minSize,
+        maxConservativeNetUSDC: firstEval.conservativeNetUSDC,
+        expectedNetUSDC: firstEval.expectedNetUSDC,
+        sizingMethod: 'COARSE_GRID',
+        evaluatedSizesCount: 1,
+        optimalQuotes: [],
+        conservativeQuotes: [],
+        topAlternatives: [],
+        allEvaluations: evaluations
+      };
+    }
+
+    evaluations.push(firstEval);
+    let bestCoarseEval: SizeEvaluation = firstEval;
+
+    // 2. Coarse evaluation of remaining grid sizes
+    for (let i = 1; i < coarseGrid.length; i++) {
+      const size = coarseGrid[i];
       const evalRes = this.evaluateSize(size, legs, costs, currentSlot);
       evaluations.push(evalRes);
 
       if (evalRes.isViable) {
-        if (!bestCoarseEval || evalRes.conservativeNetUSDC.gt(bestCoarseEval.conservativeNetUSDC)) {
+        if (evalRes.conservativeNetUSDC.gt(bestCoarseEval.conservativeNetUSDC)) {
           bestCoarseEval = evalRes;
         }
       }
@@ -179,22 +256,22 @@ export class TradeSizer {
         sizingMethod: 'COARSE_GRID',
         evaluatedSizesCount: evaluations.length,
         optimalQuotes: [],
+        conservativeQuotes: [],
+        topAlternatives: [],
         allEvaluations: evaluations
       };
     }
 
     // 2. Determine if fine search is warranted
-    // If best coarse net is near zero or positive (e.g. > -$0.25), run bounded fine search
     let bestOverallEval = bestCoarseEval;
     let sizingMethod: TradeSizingMethod = 'COARSE_GRID';
 
     if (this.config.ENABLE_OPTIMAL_SIZING && bestCoarseEval.conservativeNetUSDC.gt(-0.25)) {
-      sizingMethod = 'COARSE_TO_FINE';
       const bestSize = bestCoarseEval.sizeUSDC;
       const minBound = Math.max(25, Math.floor(bestSize * 0.6));
       const maxBound = Math.min(this.config.VIRTUAL_CAPITAL_USDC, Math.ceil(bestSize * 1.4));
 
-      // Generate 5 probe points in [minBound, maxBound]
+      // Generate probe points in [minBound, maxBound]
       const step = Math.max(5, Math.floor((maxBound - minBound) / 5));
       const probeSizes: number[] = [];
       for (let s = minBound; s <= maxBound; s += step) {
@@ -210,10 +287,23 @@ export class TradeSizer {
         if (fineEval.isViable) {
           if (fineEval.conservativeNetUSDC.gt(bestOverallEval.conservativeNetUSDC)) {
             bestOverallEval = fineEval;
+            sizingMethod = 'COARSE_TO_FINE';
           }
         }
       }
     }
+
+    const topAlternatives: SizeAlternative[] = evaluations
+      .filter(e => e.sizeUSDC !== bestOverallEval.sizeUSDC)
+      .sort((a, b) => b.conservativeNetUSDC.comparedTo(a.conservativeNetUSDC))
+      .slice(0, 3)
+      .map(e => ({
+        sizeUSDC: e.sizeUSDC,
+        expectedNetUSDC: e.expectedNetUSDC.toFixed(4),
+        conservativeNetUSDC: e.conservativeNetUSDC.toFixed(4),
+        isViable: e.isViable,
+        rejectionReason: e.rejectionReason
+      }));
 
     return {
       optimalSizeUSDC: bestOverallEval.sizeUSDC,
@@ -221,7 +311,9 @@ export class TradeSizer {
       expectedNetUSDC: bestOverallEval.expectedNetUSDC,
       sizingMethod,
       evaluatedSizesCount: evaluations.length,
-      optimalQuotes: bestOverallEval.quotes,
+      optimalQuotes: bestOverallEval.expectedQuotes,
+      conservativeQuotes: bestOverallEval.conservativeQuotes,
+      topAlternatives,
       allEvaluations: evaluations
     };
   }

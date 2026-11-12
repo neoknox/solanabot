@@ -7,6 +7,8 @@ export interface ActiveOpportunityRecord {
   firstSeenSlot: number;
   lastSeenTimestamp: number;
   lastSeenSlot: number;
+  lastStateVersion?: string;
+  sizeUSDC: number;
   visibilityDurationMs: number;
   observedSnapshotsCount: number;
   lastConservativeNetUSDC: string;
@@ -44,10 +46,21 @@ export class OpportunityTracker {
     let record = this.opportunities.get(routeKey);
 
     if (record) {
+      const slotChanged = currentSlot !== record.lastSeenSlot;
       record.lastSeenTimestamp = now;
       record.lastSeenSlot = currentSlot;
       record.visibilityDurationMs = Math.max(0, record.lastSeenTimestamp - record.firstSeenTimestamp);
-      record.observedSnapshotsCount += 1;
+      // Track persistence strictly across NEW independently observed pool states;
+      // repeated recalculation of the same snapshot does not count as survival.
+      if (candidate.stateVersion) {
+        if (candidate.stateVersion !== record.lastStateVersion) {
+          record.observedSnapshotsCount += 1;
+          record.lastStateVersion = candidate.stateVersion;
+        }
+      } else if (slotChanged) {
+        record.observedSnapshotsCount += 1;
+      }
+      record.sizeUSDC = inputSize;
       record.lastConservativeNetUSDC = candidate.minConservativeNetUSDC;
       record.status = candidate.status;
     } else {
@@ -58,6 +71,8 @@ export class OpportunityTracker {
         firstSeenSlot: currentSlot,
         lastSeenTimestamp: now,
         lastSeenSlot: currentSlot,
+        lastStateVersion: candidate.stateVersion,
+        sizeUSDC: inputSize,
         visibilityDurationMs: 0,
         observedSnapshotsCount: 1,
         lastConservativeNetUSDC: candidate.minConservativeNetUSDC,
@@ -124,5 +139,19 @@ export class OpportunityTracker {
 
   public getAllActiveOpportunities(): ActiveOpportunityRecord[] {
     return Array.from(this.opportunities.values());
+  }
+
+  public getActiveOpportunity(routeKey: string): ActiveOpportunityRecord | undefined {
+    return this.opportunities.get(routeKey);
+  }
+
+  public getActiveAllocatedCapital(): number {
+    let total = 0;
+    for (const record of this.opportunities.values()) {
+      if (record.status === 'QUALIFIED_SHADOW') {
+        total += record.sizeUSDC || 0;
+      }
+    }
+    return total;
   }
 }
