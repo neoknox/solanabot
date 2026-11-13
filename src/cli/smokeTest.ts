@@ -91,7 +91,7 @@ async function main() {
   console.log(`  1. Total Pipeline Evaluation Attempts: ${audit.totalEvaluated}`);
   console.log(`  2. State-Ready Attempts (Hydrated):    ${audit.stateReadyRouteCount || 0}`);
   console.log(`  3. Quote-Valid Attempts (Math Exec):   ${audit.quoteValidRouteCount || 0}`);
-  console.log(`  4. Profit-Qualified Attempts (>= $0.50): ${audit.profitQualifiedRouteCount || 0}`);
+  console.log(`  4. Profit-Qualified Attempts (>= $${scanner.getProfitThresholdManager().getThresholdUSDC().toFixed(2)}): ${audit.profitQualifiedRouteCount || 0}`);
   console.log(`  5. Execution-Unverified (Phase 1.2):   ${audit.executionUnverifiedRouteCount || 0}`);
   console.log(`  Survival Checks Conducted:             ${audit.survivalCheckedCount || 0}`);
   console.log(`  Real Opportunities Survived:           ${audit.survivalSurvivedCount || 0}`);

@@ -104,6 +104,8 @@ const rawConfigSchema = z.object({
   ENABLE_OPTIMAL_SIZING: z.coerce.boolean().default(true),
   ENABLE_THREE_LEG_CYCLES: z.coerce.boolean().default(true),
   ENABLE_INTRA_DEX_CYCLES: z.coerce.boolean().default(true),
+  HUD_PORT: z.coerce.number().min(1024).max(65535).default(3030),
+  PROFIT_THRESHOLD_FILE: z.string().default('./data/profit_threshold.json'),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info')
 });
 

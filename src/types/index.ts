@@ -263,6 +263,9 @@ export interface ArbitrageCandidate {
   topAlternatives?: SizeAlternative[]; // Evaluated alternative sizes and their net profit
   stateVersion?: string;               // Snapshot version signature (pool slots)
   executionStatus?: 'EXECUTION_UNVERIFIED' | 'SIMULATION_PASSED' | 'ATOMIC_READY';
+
+  // Phase 1.3 Profit Threshold Control Additions
+  evaluatedMinNetProfitUSDC?: number;  // Authoritative minimum hurdle applied during candidate evaluation
 }
 
 export interface ScanHealthStatus {

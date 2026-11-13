@@ -1,3 +1,4 @@
+import Decimal from 'decimal.js';
 import { ArbitrageCandidate } from '../types/index.js';
 
 export interface ActiveOpportunityRecord {
@@ -113,6 +114,24 @@ export class OpportunityTracker {
         this.opportunities.delete(key);
       }
     }
+  }
+
+  /**
+   * Reclassifies or clears active shadow opportunities that no longer satisfy an increased threshold.
+   * Prevents stale qualified signals from lingering after runtime threshold elevation.
+   */
+  public reclassifyActiveOpportunities(minThresholdDecimal: Decimal): number {
+    let reclassifiedCount = 0;
+    for (const record of this.opportunities.values()) {
+      if (record.status === 'QUALIFIED_SHADOW') {
+        const conservativeNet = new Decimal(record.lastConservativeNetUSDC);
+        if (conservativeNet.lt(minThresholdDecimal)) {
+          record.status = 'REJECTED';
+          reclassifiedCount++;
+        }
+      }
+    }
+    return reclassifiedCount;
   }
 
   public getLifecycleStats(): OpportunityLifecycleStats {

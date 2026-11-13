@@ -19,6 +19,7 @@ import { PoolRegistry } from './poolRegistry.js';
 import { StateCache } from './stateCache.js';
 import { CostModel } from '../profit/costModel.js';
 import { ArbitrageProfitCalculator } from '../profit/calculator.js';
+import { ProfitThresholdManager } from '../profit/profitThresholdManager.js';
 import { ArbitrageRepository } from '../storage/repository.js';
 import { CANONICAL_WSOL_MINT, CANONICAL_USDC_MINT } from '../config/index.js';
 import { RouteIndex, IndexedDirectedRoute } from './routeIndex.js';
@@ -47,6 +48,7 @@ export class ArbitrageScanner {
   private poolRegistry: PoolRegistry;
   private stateCache: StateCache;
   private costModel: CostModel;
+  private profitThresholdManager: ProfitThresholdManager;
   private calculator: ArbitrageProfitCalculator;
   private repository: ArbitrageRepository;
   private tradeSizer: TradeSizer;
@@ -109,7 +111,8 @@ export class ArbitrageScanner {
     customRpc?: SolanaRpcProvider,
     customWs?: SolanaWsProvider,
     customJupiter?: JupiterClient,
-    customRepo?: ArbitrageRepository
+    customRepo?: ArbitrageRepository,
+    customThresholdManager?: ProfitThresholdManager
   ) {
     this.config = config;
     this.rpc = customRpc || new SolanaRpcProvider(config);
@@ -118,7 +121,11 @@ export class ArbitrageScanner {
     this.poolRegistry = new PoolRegistry();
     this.stateCache = new StateCache();
     this.costModel = new CostModel(config);
-    this.calculator = new ArbitrageProfitCalculator(config);
+    this.profitThresholdManager = customThresholdManager || new ProfitThresholdManager({
+      filePath: config.PROFIT_THRESHOLD_FILE,
+      initialThresholdUSDC: config.MIN_NET_PROFIT_USDC
+    });
+    this.calculator = new ArbitrageProfitCalculator(config, this.profitThresholdManager);
     this.repository = customRepo || new ArbitrageRepository(config);
     this.tradeSizer = new TradeSizer(config);
 
@@ -126,6 +133,12 @@ export class ArbitrageScanner {
     this.competitorAnalyzer = new CompetitorAnalyzer(this.rpc);
     this.competitionScorer = new CompetitionScorer();
     this.opportunityTracker = new OpportunityTracker();
+
+    // Hook threshold changes to immediately reclassify active shadow opportunities
+    this.profitThresholdManager.onThresholdChange((_newUSDC) => {
+      const minHurdle = this.profitThresholdManager.getThresholdDecimal();
+      this.opportunityTracker.reclassifyActiveOpportunities(minHurdle);
+    });
 
     // Initialize Route Index & Performance Pipelines
     this.routeIndex = new RouteIndex(this.poolRegistry.getAllPools());
@@ -1179,7 +1192,8 @@ export class ArbitrageScanner {
     try {
       const sizeUSDC = candidate.optimalSizeUSDC || Number(candidate.inputAmountUSDC) / 1e6;
       const evalRes = this.tradeSizer.evaluateSize(sizeUSDC, legs, costs, currentSlot);
-      if (evalRes.isViable && evalRes.conservativeNetUSDC.gte(this.config.MIN_NET_PROFIT_USDC)) {
+      const minHurdle = this.profitThresholdManager.getThresholdDecimal();
+      if (evalRes.isViable && evalRes.conservativeNetUSDC.gte(minHurdle)) {
         return 'SURVIVED';
       }
       return 'DECAYED';
@@ -1627,6 +1641,10 @@ export class ArbitrageScanner {
 
   public getOpportunityTracker(): OpportunityTracker {
     return this.opportunityTracker;
+  }
+
+  public getProfitThresholdManager(): ProfitThresholdManager {
+    return this.profitThresholdManager;
   }
 
   public stop(): void {

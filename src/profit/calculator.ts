@@ -1,5 +1,6 @@
 import Decimal from 'decimal.js';
 import { AppConfig, CANONICAL_USDC_MINT } from '../config/index.js';
+import { ProfitThresholdManager } from './profitThresholdManager.js';
 import {
   SwapQuote,
   ArbitrageCandidate,
@@ -35,9 +36,21 @@ export interface CandidateEvaluationParams {
 
 export class ArbitrageProfitCalculator {
   private config: AppConfig;
+  private thresholdManager: ProfitThresholdManager;
 
-  constructor(config: AppConfig) {
+  constructor(config: AppConfig, thresholdManager?: ProfitThresholdManager) {
     this.config = config;
+    this.thresholdManager = thresholdManager || new ProfitThresholdManager({
+      initialThresholdUSDC: config.MIN_NET_PROFIT_USDC
+    });
+  }
+
+  public getThresholdManager(): ProfitThresholdManager {
+    return this.thresholdManager;
+  }
+
+  public setThresholdManager(manager: ProfitThresholdManager): void {
+    this.thresholdManager = manager;
   }
 
   public evaluateCandidate(params: CandidateEvaluationParams): ArbitrageCandidate {
@@ -248,8 +261,8 @@ export class ArbitrageProfitCalculator {
         }
       }
 
-      // Target minimum profit check: >= MIN_NET_PROFIT_USDC ($0.50)
-      const minProfitHurdle = new Decimal(this.config.MIN_NET_PROFIT_USDC);
+      // Target minimum profit check: >= authoritative runtime threshold ($0.20 - $0.70)
+      const minProfitHurdle = this.thresholdManager.getThresholdDecimal();
       if (minConservativeNetUSDC.lt(minProfitHurdle)) {
         if (!rejectionReasons.includes('LOW_CONSERVATIVE_NET')) {
           rejectionReasons.push('LOW_CONSERVATIVE_NET');
@@ -331,7 +344,8 @@ export class ArbitrageProfitCalculator {
       survivalStatus: 'UNCHECKED',
       topAlternatives: params.topAlternatives,
       stateVersion: params.stateVersion,
-      executionStatus: 'EXECUTION_UNVERIFIED'
+      executionStatus: 'EXECUTION_UNVERIFIED',
+      evaluatedMinNetProfitUSDC: this.thresholdManager.getThresholdUSDC()
     };
   }
 }
