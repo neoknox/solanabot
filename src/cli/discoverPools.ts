@@ -26,7 +26,11 @@ async function main() {
   });
 
   console.log('\nRunning bounded discovery against Orca public API (max 3 pages, limit 10)...');
-  const report = await discovery.runDiscoveryAndVerification(poolRegistry, rpcProvider);
+  const report = await discovery.runDiscoveryAndVerification(
+    poolRegistry,
+    rpcProvider,
+    config.DISCOVERED_POOLS_FILE
+  );
 
   console.log('\n================================================================');
   console.log('  ORCA POOL DISCOVERY & ON-CHAIN VERIFICATION REPORT             ');
@@ -62,6 +66,9 @@ async function main() {
 
   const finalPools = poolRegistry.getAllPools();
   console.log(`\nFinal Pools in Registry:    ${finalPools.length}`);
+  if (report.candidatesVerified > 0) {
+    console.log(`Persisted Discovered Pools: ${config.DISCOVERED_POOLS_FILE} (${report.candidatesVerified} verified candidates)`);
+  }
   console.log('Registry Status Summary:');
   console.log(`  - Verified Direct:         ${finalPools.filter(p => p.verificationStatus === 'VERIFIED_DIRECT').length}`);
   console.log(`  - Quote Unverified:        ${finalPools.filter(p => p.verificationStatus === 'QUOTE_UNVERIFIED').length}`);

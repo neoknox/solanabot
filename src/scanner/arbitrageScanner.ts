@@ -16,6 +16,7 @@ import { SolanaWsProvider } from '../providers/solanaWs.js';
 import { JupiterClient } from '../providers/jupiterClient.js';
 import { dexRegistry } from '../dex/index.js';
 import { PoolRegistry } from './poolRegistry.js';
+import { loadDiscoveredCandidates } from './poolDiscovery.js';
 import { StateCache } from './stateCache.js';
 import { CostModel } from '../profit/costModel.js';
 import { ArbitrageProfitCalculator } from '../profit/calculator.js';
@@ -119,6 +120,13 @@ export class ArbitrageScanner {
     this.ws = customWs || new SolanaWsProvider(config);
     this.jupiter = customJupiter || new JupiterClient(config);
     this.poolRegistry = new PoolRegistry();
+
+    // Load persisted discovered candidate pools into registry before building route index
+    const discoveredFile = config.DISCOVERED_POOLS_FILE || './data/discovered_pools.json';
+    const discovered = loadDiscoveredCandidates(discoveredFile);
+    if (discovered.length > 0) {
+      this.poolRegistry.loadDiscoveredCandidates(discovered);
+    }
     this.stateCache = new StateCache();
     this.costModel = new CostModel(config);
     this.profitThresholdManager = customThresholdManager || new ProfitThresholdManager({
@@ -643,6 +651,30 @@ export class ArbitrageScanner {
 
     // Independent Freshness: Do NOT overwrite pool.slot or pool.receivedAt with tick array update!
     // The Whirlpool's observation timestamp and slot represent the pool state itself.
+
+    // Safe Promotion: Check if Orca Whirlpool now has all required surrounding tick arrays hydrated and fresh
+    const tickSpacing = extra.tickSpacing || 1;
+    const tickCurrent = extra.tickCurrent;
+    const liquidity = BigInt(extra?.liquidity || '0');
+    if (tickCurrent !== undefined && extra.tickArrays && liquidity > 0n) {
+      const surroundingStarts = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+      const arrayTimestamps = extra.tickArrayReceivedAt || {};
+      const arraySlots = extra.tickArraySlots || {};
+      const ttl = 30000;
+
+      const allSurroundingPresent = surroundingStarts.every(idx => {
+        const arr = extra.tickArrays[idx];
+        const t = arrayTimestamps[idx];
+        const s = arraySlots[idx];
+        return arr && t && (now - t <= ttl) && s && Math.abs(pool.slot - s) <= 100;
+      });
+
+      if (allSurroundingPresent) {
+        delete extra.unverifiedReason;
+        this.poolRegistry.updatePoolVerification(mapping.poolId, 'VERIFIED_DIRECT');
+        this.routeIndex.updatePoolStatus(mapping.poolId, 'VERIFIED_DIRECT');
+      }
+    }
 
     const { hasChanged } = this.stateCache.setPoolState(pool);
     if (hasChanged) {
@@ -1237,12 +1269,52 @@ export class ArbitrageScanner {
       for (let i = 0; i < pools.length; i++) {
         const poolConfig = pools[i];
         const accountInfo = accounts[i];
-        if (!accountInfo) continue;
+        if (!accountInfo) {
+          if (poolConfig.dex === 'ORCA_WHIRLPOOL' && poolConfig.verificationStatus === 'QUOTE_UNVERIFIED') {
+            this.poolRegistry.updatePoolVerification(poolConfig.id, 'QUOTE_UNVERIFIED', 'ACCOUNT_NOT_FOUND');
+            this.routeIndex.updatePoolStatus(poolConfig.id, 'QUOTE_UNVERIFIED');
+          }
+          continue;
+        }
 
         const adapter = dexRegistry.getAdapter(poolConfig.dex);
         if (adapter) {
+          // On-chain program owner & minimum layout revalidation for Orca pools
+          if (poolConfig.dex === 'ORCA_WHIRLPOOL') {
+            const onChainOwner = accountInfo.owner ? accountInfo.owner.toBase58() : '';
+            if (onChainOwner !== KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL) {
+              this.poolRegistry.updatePoolVerification(poolConfig.id, 'QUOTE_UNVERIFIED', 'INVALID_PROGRAM_OWNER');
+              this.routeIndex.updatePoolStatus(poolConfig.id, 'QUOTE_UNVERIFIED');
+              continue;
+            }
+            if (accountInfo.data.length < 653) {
+              this.poolRegistry.updatePoolVerification(poolConfig.id, 'QUOTE_UNVERIFIED', 'INVALID_ACCOUNT_LAYOUT');
+              this.routeIndex.updatePoolStatus(poolConfig.id, 'QUOTE_UNVERIFIED');
+              continue;
+            }
+          }
+
           const decoded = adapter.decodePoolState(accountInfo.data, poolConfig.id, snapshotSlot);
           if (decoded) {
+            // Strict mint pair match and positive on-chain liquidity for Orca Whirlpool candidates
+            if (poolConfig.dex === 'ORCA_WHIRLPOOL') {
+              const matchesMints =
+                (decoded.tokenAMint === poolConfig.tokenAMint && decoded.tokenBMint === poolConfig.tokenBMint) ||
+                (decoded.tokenAMint === poolConfig.tokenBMint && decoded.tokenBMint === poolConfig.tokenAMint);
+              if (!matchesMints) {
+                this.poolRegistry.updatePoolVerification(poolConfig.id, 'QUOTE_UNVERIFIED', 'MINT_PAIR_MISMATCH');
+                this.routeIndex.updatePoolStatus(poolConfig.id, 'QUOTE_UNVERIFIED');
+                continue;
+              }
+
+              const extra = decoded.extraData as any;
+              const liquidity = BigInt(extra?.liquidity || '0');
+              if (liquidity <= 0n) {
+                this.poolRegistry.updatePoolVerification(poolConfig.id, 'QUOTE_UNVERIFIED', 'ZERO_LIQUIDITY');
+                this.routeIndex.updatePoolStatus(poolConfig.id, 'QUOTE_UNVERIFIED');
+                continue;
+              }
+            }
             const extra = decoded.extraData as any;
             const vaultA = extra?.baseVault || extra?.tokenVaultA || extra?.reserveX;
             const vaultB = extra?.quoteVault || extra?.tokenVaultB || extra?.reserveY;
@@ -1520,6 +1592,39 @@ export class ArbitrageScanner {
             if (pool.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) pool.reserveB = existing.reserveB;
           }
         }
+
+        // Safe Promotion: Promote Orca Whirlpools to VERIFIED_DIRECT only when all surrounding tick arrays are hydrated and fresh
+        if (pool.dex === 'ORCA_WHIRLPOOL') {
+          const extra = (pool.extraData || {}) as any;
+          const tickSpacing = extra.tickSpacing || 1;
+          const tickCurrent = extra.tickCurrent;
+          const liquidity = BigInt(extra?.liquidity || '0');
+
+          if (tickCurrent !== undefined && extra.tickArrays && liquidity > 0n) {
+            const surroundingStarts = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+            const arrayTimestamps = extra.tickArrayReceivedAt || {};
+            const arraySlots = extra.tickArraySlots || {};
+            const now = Date.now();
+            const ttl = 30000;
+
+            const allSurroundingPresent = surroundingStarts.every(idx => {
+              const arr = extra.tickArrays[idx];
+              const t = arrayTimestamps[idx];
+              const s = arraySlots[idx];
+              return arr && t && (now - t <= ttl) && s && Math.abs(snapshotSlot - s) <= 100;
+            });
+
+            if (allSurroundingPresent) {
+              delete extra.unverifiedReason;
+              this.poolRegistry.updatePoolVerification(pool.id, 'VERIFIED_DIRECT');
+              this.routeIndex.updatePoolStatus(pool.id, 'VERIFIED_DIRECT');
+            } else if (!this.poolRegistry.isPoolVerified(pool.id)) {
+              this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'MISSING_TICK_DATA');
+              this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+            }
+          }
+        }
+
         this.stateCache.setPoolState(pool);
       }
     } catch {}

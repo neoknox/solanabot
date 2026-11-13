@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import { PublicKey } from '@solana/web3.js';
 import {
   CANONICAL_WSOL_MINT,
@@ -192,8 +194,51 @@ export class OrcaPoolDiscovery {
     candidate: DiscoveredCandidate,
     rpcProvider: SolanaRpcProvider
   ): Promise<VerificationResult> {
+    // 0. Validate candidate record format
+    if (!candidate || typeof candidate !== 'object') {
+      return {
+        address: 'unknown',
+        verified: false,
+        blockerReason: 'MALFORMED_CANDIDATE'
+      };
+    }
+
+    if (!candidate.address || typeof candidate.address !== 'string' ||
+        !candidate.tokenMintA || typeof candidate.tokenMintA !== 'string' ||
+        !candidate.tokenMintB || typeof candidate.tokenMintB !== 'string') {
+      return {
+        address: candidate.address || 'unknown',
+        verified: false,
+        blockerReason: 'MALFORMED_CANDIDATE'
+      };
+    }
+
+    let pubkey: PublicKey;
     try {
-      const pubkey = new PublicKey(candidate.address);
+      pubkey = new PublicKey(candidate.address);
+      new PublicKey(candidate.tokenMintA);
+      new PublicKey(candidate.tokenMintB);
+    } catch {
+      return {
+        address: candidate.address,
+        verified: false,
+        blockerReason: 'MALFORMED_CANDIDATE'
+      };
+    }
+
+    if (
+      !ALLOWLISTED_MINTS.has(candidate.tokenMintA) ||
+      !ALLOWLISTED_MINTS.has(candidate.tokenMintB) ||
+      candidate.tokenMintA === candidate.tokenMintB
+    ) {
+      return {
+        address: candidate.address,
+        verified: false,
+        blockerReason: 'UNSUPPORTED_TOKEN_MINTS'
+      };
+    }
+
+    try {
       const accountInfo = await rpcProvider.getAccountInfo(pubkey);
 
       if (!accountInfo) {
@@ -241,7 +286,7 @@ export class OrcaPoolDiscovery {
         };
       }
 
-      // 4. Exact Token Mint Validation (must be in allowlist and match candidate)
+      // 4. Exact Token Mint Validation (must be in allowlist and match candidate's token pair)
       if (
         !ALLOWLISTED_MINTS.has(decoded.tokenAMint) ||
         !ALLOWLISTED_MINTS.has(decoded.tokenBMint) ||
@@ -253,6 +298,20 @@ export class OrcaPoolDiscovery {
           onChainOwner,
           dataLength,
           blockerReason: 'UNSUPPORTED_TOKEN_MINTS'
+        };
+      }
+
+      const mintsMatch =
+        (decoded.tokenAMint === candidate.tokenMintA && decoded.tokenBMint === candidate.tokenMintB) ||
+        (decoded.tokenAMint === candidate.tokenMintB && decoded.tokenBMint === candidate.tokenMintA);
+
+      if (!mintsMatch) {
+        return {
+          address: candidate.address,
+          verified: false,
+          onChainOwner,
+          dataLength,
+          blockerReason: 'MINT_PAIR_MISMATCH'
         };
       }
 
@@ -270,22 +329,22 @@ export class OrcaPoolDiscovery {
         };
       }
 
-      // 6. Active Liquidity Validation (pool must have non-zero liquidity or positive TVL)
+      // 6. Active Liquidity Validation (Require positive ON-CHAIN liquidity. Never accept API TVL as proof)
       const liquidity = BigInt(extra?.liquidity || '0');
-      const tvlUsdc = parseFloat(candidate.tvlUsdc || '0');
-      if (liquidity <= 0n && tvlUsdc <= 0) {
+      if (liquidity <= 0n) {
         return {
           address: candidate.address,
           verified: false,
           onChainOwner,
           dataLength,
-          activeLiquidity: liquidity.toString(),
+          activeLiquidity: '0',
           blockerReason: 'ZERO_LIQUIDITY'
         };
       }
 
       // 7. Success: Pool qualifies as a valid on-chain Orca Whirlpool candidate.
       // NOTE: Strictly marked QUOTE_UNVERIFIED until required tick arrays are streamed and hydrated.
+      const candidateTvl = parseFloat(candidate.tvlUsdc || '0');
       const poolConfig: PoolConfig = {
         id: candidate.address,
         dex: 'ORCA_WHIRLPOOL',
@@ -293,7 +352,7 @@ export class OrcaPoolDiscovery {
         tokenAMint: decoded.tokenAMint,
         tokenBMint: decoded.tokenBMint,
         feeBps: decoded.feeBps,
-        initialLiquidityUsd: tvlUsdc > 0 ? tvlUsdc : undefined,
+        initialLiquidityUsd: candidateTvl > 0 ? candidateTvl : undefined,
         description: `Orca Whirlpool (Discovered) ${decoded.feeBps} bps`,
         verificationStatus: 'QUOTE_UNVERIFIED',
         blockerReason: 'PENDING_TICK_ARRAY_HYDRATION'
@@ -323,7 +382,8 @@ export class OrcaPoolDiscovery {
    */
   public async runDiscoveryAndVerification(
     poolRegistry: PoolRegistry,
-    rpcProvider: SolanaRpcProvider
+    rpcProvider: SolanaRpcProvider,
+    persistenceFilePath?: string
   ): Promise<DiscoveryReport> {
     const startTime = Date.now();
     const results: VerificationResult[] = [];
@@ -346,6 +406,8 @@ export class OrcaPoolDiscovery {
       report.candidatesFound = discovery.candidates.length;
       report.errors = discovery.errors;
 
+      const verifiedCandidatesForPersistence: DiscoveredCandidate[] = [];
+
       // 2. Perform targeted on-chain verification for each candidate
       for (const candidate of discovery.candidates) {
         // Skip pools already present in the registry
@@ -360,9 +422,15 @@ export class OrcaPoolDiscovery {
           report.candidatesVerified++;
           // Register as QUOTE_UNVERIFIED (Requirement 3 & 4)
           poolRegistry.register(verification.poolConfig);
+          verifiedCandidatesForPersistence.push(candidate);
         } else {
           report.candidatesRejected++;
         }
+      }
+
+      // 3. Atomically persist successfully verified candidates if path is specified
+      if (persistenceFilePath && verifiedCandidatesForPersistence.length > 0) {
+        saveDiscoveredCandidates(verifiedCandidatesForPersistence, persistenceFilePath);
       }
     } catch (err: any) {
       report.apiStatus = 'FAILED';
@@ -372,5 +440,111 @@ export class OrcaPoolDiscovery {
     }
 
     return report;
+  }
+}
+
+export interface DiscoveredPoolsPayload {
+  pools: DiscoveredCandidate[];
+  updatedAt: string;
+  version: number;
+}
+
+/**
+ * Persists successfully verified candidate pool records in a local JSON file.
+ * - Deduplicates by pool address.
+ * - Merges with existing records in the file.
+ * - Uses atomic write/replace (.tmp file + renameSync, with Windows locking fallback).
+ */
+export function saveDiscoveredCandidates(
+  candidates: DiscoveredCandidate[],
+  filePath = './data/discovered_pools.json'
+): void {
+  try {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    // Load existing and merge with deduplication by pool address
+    const existing = loadDiscoveredCandidates(filePath);
+    const poolMap = new Map<string, DiscoveredCandidate>();
+    for (const p of existing) {
+      if (p.address) poolMap.set(p.address, p);
+    }
+    for (const c of candidates) {
+      if (c.address) poolMap.set(c.address, c);
+    }
+
+    const payload: DiscoveredPoolsPayload = {
+      pools: Array.from(poolMap.values()),
+      updatedAt: new Date().toISOString(),
+      version: 1
+    };
+
+    const serialized = JSON.stringify(payload, null, 2);
+    const tmpPath = `${filePath}.tmp.${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    fs.writeFileSync(tmpPath, serialized, 'utf-8');
+
+    try {
+      fs.renameSync(tmpPath, filePath);
+    } catch {
+      // Fallback for Windows filesystem locks: copy then remove temporary file
+      fs.copyFileSync(tmpPath, filePath);
+      try { fs.unlinkSync(tmpPath); } catch {}
+    }
+  } catch (err) {
+    console.warn(`[OrcaPoolDiscovery] Failed to persist discovered pools to "${filePath}":`, err);
+  }
+}
+
+/**
+ * Loads persisted discovered candidate pools from local JSON file.
+ * - Fails safely (returns empty array) on missing, malformed, or corrupt file without crashing.
+ * - Deduplicates by pool address.
+ * - Filters out malformed candidate records.
+ */
+export function loadDiscoveredCandidates(
+  filePath = './data/discovered_pools.json'
+): DiscoveredCandidate[] {
+  if (!fs.existsSync(filePath)) {
+    return [];
+  }
+
+  try {
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    const rawList: any[] = Array.isArray(parsed) ? parsed : (parsed.pools || []);
+
+    const validCandidates: DiscoveredCandidate[] = [];
+    const seen = new Set<string>();
+
+    for (const item of rawList) {
+      if (
+        item &&
+        typeof item === 'object' &&
+        typeof item.address === 'string' &&
+        typeof item.tokenMintA === 'string' &&
+        typeof item.tokenMintB === 'string' &&
+        !seen.has(item.address)
+      ) {
+        seen.add(item.address);
+        validCandidates.push({
+          address: item.address,
+          tokenMintA: item.tokenMintA,
+          tokenMintB: item.tokenMintB,
+          tickSpacing: Number(item.tickSpacing) || 0,
+          feeRate: Number(item.feeRate) || 0,
+          tvlUsdc: item.tvlUsdc?.toString(),
+          liquidity: item.liquidity?.toString(),
+          source: 'ORCA_API',
+          discoveredAt: Number(item.discoveredAt) || Date.now()
+        });
+      }
+    }
+
+    return validCandidates;
+  } catch (err) {
+    console.warn(`[OrcaPoolDiscovery] Warning: Failed to parse discovered pools file "${filePath}":`, err);
+    return [];
   }
 }

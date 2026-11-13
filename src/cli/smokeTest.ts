@@ -16,6 +16,8 @@ async function main() {
 
   const scanner = new ArbitrageScanner(config);
   const routeIndex = scanner.getRouteIndex();
+  const verifiedRoutesBefore = routeIndex.getVerifiedDirectRouteCount();
+  const catalogPoolsBefore = scanner.getPoolRegistry().getAllPools().length;
 
   console.log(`Route Index Configured:`);
   console.log(`  Total Directed Routes:     ${routeIndex.getRouteCount()}`);
@@ -105,6 +107,12 @@ async function main() {
   console.log(`  - INDICATIVE_ONLY:            ${audit.unsupportedRoutes + audit.quoteValidationFailures}`);
   console.log(`  - INVALID / REJECTED:         ${audit.rejectedRoutes}`);
   console.log(`Rejection Reasons Breakdown:    ${JSON.stringify(health.rejectionBreakdown, null, 2)}`);
+
+  console.log('\n--- PHASE 1.3 DISCOVERED POOL ACTIVATION BENCHMARK ---');
+  console.log(`  Catalog Pools (Before / After):        ${catalogPoolsBefore} / ${scanner.getPoolRegistry().getAllPools().length}`);
+  console.log(`  Verified Routes (Before / After):      ${verifiedRoutesBefore} / ${routeIndex.getVerifiedDirectRouteCount()}`);
+  console.log(`  Quote-Valid Attempts (Math Executed):  ${audit.quoteValidRouteCount || 0}`);
+  console.log(`  Conservative Net Profit Signals:       ${audit.candidatesConservativeQualified || 0}`);
 
   console.log('\n--- RUNTIME POOL VERIFICATION STATUS ---');
   const poolReg = scanner.getPoolRegistry();

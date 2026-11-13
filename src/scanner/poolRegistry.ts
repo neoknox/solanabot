@@ -1,4 +1,5 @@
 import { DexType, PoolState } from '../types/index.js';
+import type { DiscoveredCandidate } from './poolDiscovery.js';
 import {
   CANONICAL_WSOL_MINT,
   CANONICAL_USDC_MINT,
@@ -142,6 +143,35 @@ export class PoolRegistry {
 
   public register(pool: PoolConfig): void {
     this.pools.set(pool.id, pool);
+  }
+
+  /**
+   * Loads discovered pool candidates into the registry.
+   * - Retains all existing default pools.
+   * - Deduplicates by pool ID.
+   * - New pools start strictly as QUOTE_UNVERIFIED with blockerReason PENDING_ONCHAIN_REVALIDATION.
+   */
+  public loadDiscoveredCandidates(candidates: DiscoveredCandidate[]): number {
+    let addedCount = 0;
+    for (const candidate of candidates) {
+      if (!candidate || !candidate.address || this.pools.has(candidate.address)) {
+        continue;
+      }
+
+      this.register({
+        id: candidate.address,
+        dex: 'ORCA_WHIRLPOOL',
+        programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
+        tokenAMint: candidate.tokenMintA,
+        tokenBMint: candidate.tokenMintB,
+        feeBps: candidate.feeRate ? Math.max(1, Math.round(candidate.feeRate / 100)) : 1,
+        description: `Orca Whirlpool (Discovered) ${candidate.feeRate ? Math.round(candidate.feeRate / 100) : 1} bps`,
+        verificationStatus: 'QUOTE_UNVERIFIED',
+        blockerReason: 'PENDING_ONCHAIN_REVALIDATION'
+      });
+      addedCount++;
+    }
+    return addedCount;
   }
 
   public getPool(id: string): PoolConfig | undefined {
