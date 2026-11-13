@@ -4,11 +4,12 @@ This document establishes the binding architectural, developmental, and operatio
 
 ---
 
-## 1. Authoritative Specification & Inclusion
+## 1. Authoritative Specification & Inclusions
 
-The approved SolanaBot 90-Day Master Roadmap is the authoritative, binding project specification.
+The approved SolanaBot 90-Day Master Roadmap and AI Supervisor Policy are the authoritative, binding project specifications.
 
 @[SolanaBot Master Roadmap](docs/SOLANABOT_MASTER_ROADMAP.md)
+@[SolanaBot AI Supervisor Policy](docs/AI_SUPERVISOR_POLICY.md)
 
 ---
 
@@ -24,3 +25,15 @@ The approved SolanaBot 90-Day Master Roadmap is the authoritative, binding proje
 8. **Empirical Reporting Integrity:** Report real, measured results and verified benchmarks only. Never present estimates, theoretical throughputs, or synthetic simulations as verified live performance.
 9. **Strict Read-Only Enforcement:** Do not implement wallets, private key handling, signing, or transaction broadcasts during this read-only roadmap.
 10. **Documentation Isolation:** Never treat roadmap installation or documentation updates as permission to start coding. All implementation requires explicit user authorization.
+
+---
+
+## 3. AI Supervisor Governance Policy
+
+1. **Out-of-Band Analysis Only:** AI is strictly a supervisory observer (monitoring route database health, identifying coverage gaps, reviewing performance, detecting operational failures, summarizing opportunities, and compiling daily intelligence reports).
+2. **Deterministic Fast Path:** Real-time quoting, pricing, sizing, and trading decisions are strictly 100% deterministic code. AI must NEVER sit inside the critical runtime path.
+3. **No Synthetic Evidence:** AI must NEVER invent, fabricate, or approve blockchain verification evidence.
+4. **No Autonomous Rule Mutation:** AI must NEVER alter profit thresholds, safety buffers, or validation gates without authorization.
+5. **Zero Fund Control:** AI must NEVER hold private keys, sign transactions, or move funds.
+6. **Cost Discipline:** Reuse SQLite and local telemetry. Aggregate data before analysis; avoid per-route/per-quote AI API calls. Start with one daily report.
+7. **No Separate Platform:** Do NOT build a separate AI platform or microservice. Implement only after reliable route telemetry and persistence exist.
