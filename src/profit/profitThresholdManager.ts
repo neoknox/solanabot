@@ -93,45 +93,58 @@ export class ProfitThresholdManager {
     }
 
     // Persist active default to file safely
-    this.saveToDisk();
+    try {
+      this.saveToDisk();
+    } catch (err) {
+      if (!this.silent) {
+        console.warn(
+          `[ProfitThresholdManager] WARNING: Initial persistence to "${this.filePath}" failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+  }
+
+  /**
+   * Persists threshold to disk using atomic temporary file replacement (.tmp + renameSync).
+   * Throws if write or rename fails. Does NOT use non-atomic copy fallback.
+   */
+  public saveToDiskSync(cents: number): void {
+    const dir = path.dirname(this.filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    const payload = {
+      thresholdUSDC: cents / 100,
+      cents: cents,
+      updatedAt: new Date().toISOString(),
+      mode: 'READ-ONLY / SHADOW MODE',
+      version: 1
+    };
+
+    const serialized = JSON.stringify(payload, null, 2);
+    const tmpPath = `${this.filePath}.tmp.${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+
+    fs.writeFileSync(tmpPath, serialized, 'utf-8');
+
+    try {
+      fs.renameSync(tmpPath, this.filePath);
+    } catch (renameErr) {
+      try {
+        if (fs.existsSync(tmpPath)) {
+          fs.unlinkSync(tmpPath);
+        }
+      } catch {}
+      throw renameErr;
+    }
   }
 
   /**
    * Safely persists current threshold to disk using atomic write/replace.
+   * Throws on failure.
    */
   private saveToDisk(): void {
-    try {
-      const dir = path.dirname(this.filePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-
-      const payload = {
-        thresholdUSDC: this.getThresholdUSDC(),
-        cents: this.currentCents,
-        updatedAt: new Date().toISOString(),
-        mode: 'READ-ONLY / SHADOW MODE',
-        version: 1
-      };
-
-      const serialized = JSON.stringify(payload, null, 2);
-      const tmpPath = `${this.filePath}.tmp.${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
-      fs.writeFileSync(tmpPath, serialized, 'utf-8');
-
-      try {
-        fs.renameSync(tmpPath, this.filePath);
-      } catch {
-        // Fallback for Windows filesystem locks: copy then remove temporary file
-        fs.copyFileSync(tmpPath, this.filePath);
-        try { fs.unlinkSync(tmpPath); } catch {}
-      }
-    } catch (err) {
-      if (!this.silent) {
-        console.warn(
-          `[ProfitThresholdManager] WARNING: Could not persist threshold to "${this.filePath}": ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-    }
+    this.saveToDiskSync(this.currentCents);
   }
 
   /**
@@ -216,10 +229,32 @@ export class ProfitThresholdManager {
     }
 
     const previousCents = this.currentCents;
-    this.currentCents = validated.cents;
+    const targetCents = validated.cents;
 
-    // Persist to local JSON file
-    this.saveToDisk();
+    // Persist to local JSON file atomically BEFORE committing state change
+    try {
+      this.saveToDiskSync(targetCents);
+    } catch (persistErr) {
+      // On persistence failure:
+      // - Keep previous confirmed threshold
+      // - Return an actionable error
+      // - Leave scanner qualification unchanged (no listeners notified)
+      // - Keep HUD showing confirmed value
+      const errorMsg = `Persistence failure: Failed to atomically save threshold to "${this.filePath}": ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`;
+      if (!this.silent) {
+        console.error(`[ProfitThresholdManager] ${errorMsg}`);
+      }
+      return {
+        success: false,
+        error: errorMsg,
+        thresholdUSDC: this.getThresholdUSDC(),
+        thresholdCents: this.currentCents,
+        formatted: this.getFormattedThreshold()
+      };
+    }
+
+    // Persistence succeeded! Now commit memory state
+    this.currentCents = targetCents;
 
     // Trigger listeners if value changed
     if (previousCents !== this.currentCents) {

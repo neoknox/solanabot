@@ -32,6 +32,7 @@ export class ProfitHudServer {
 
   /**
    * Starts the localhost HTTP HUD server.
+   * If the target port is occupied (EADDRINUSE), rejects immediately with a clear actionable error.
    */
   public async start(): Promise<{ port: number; host: string; url: string }> {
     if (this.server) {
@@ -47,10 +48,26 @@ export class ProfitHudServer {
         this.handleRequest(req, res);
       });
 
-      this.server.on('error', (err) => {
+      this.server.on('error', (err: any) => {
+        if (err.code === 'EADDRINUSE') {
+          const occupiedErr = new Error(
+            `HUD port ${this.port} is already occupied by another process. Ensure no other instance is running or configure a different HUD_PORT.`
+          );
+          (occupiedErr as any).code = 'EADDRINUSE';
+          if (!this.silent) {
+            console.error(`[ProfitHudServer] FATAL: ${occupiedErr.message}`);
+          }
+          this.server = null;
+          this.boundPort = null;
+          reject(occupiedErr);
+          return;
+        }
+
         if (!this.silent) {
           console.error('[ProfitHudServer] Server error:', err);
         }
+        this.server = null;
+        this.boundPort = null;
         reject(err);
       });
 
@@ -95,25 +112,38 @@ export class ProfitHudServer {
   }
 
   /**
-   * Validates that state-changing requests originate strictly from localhost / 127.0.0.1.
+   * Returns authoritative allowed origins for localhost security.
    */
-  private isOriginAllowed(req: http.IncomingMessage): boolean {
-    const origin = req.headers['origin'];
-    if (origin) {
-      try {
-        const parsed = new URL(origin);
-        if (parsed.hostname !== '127.0.0.1' && parsed.hostname !== 'localhost') {
-          return false;
-        }
-      } catch {
-        return false;
-      }
-    }
+  public getAllowedOrigins(): Set<string> {
+    const port = this.boundPort || this.port;
+    return new Set([
+      `http://127.0.0.1:${port}`,
+      `http://localhost:${port}`
+    ]);
+  }
+
+  /**
+   * Validates that state-changing requests originate strictly from the local HUD (127.0.0.1 / localhost).
+   * Verifies both Host header and Origin/Referer headers without reflecting arbitrary origins.
+   */
+  public isValidOriginAndHost(req: http.IncomingMessage): boolean {
+    const port = this.boundPort || this.port;
+    const allowedOrigins = this.getAllowedOrigins();
+    const allowedHosts = new Set([
+      `127.0.0.1:${port}`,
+      `localhost:${port}`,
+      `127.0.0.1`,
+      `localhost`
+    ]);
 
     const host = req.headers['host'];
-    if (host) {
-      const hostname = host.split(':')[0];
-      if (hostname !== '127.0.0.1' && hostname !== 'localhost') {
+    if (!host || !allowedHosts.has(host.toLowerCase())) {
+      return false;
+    }
+
+    const origin = req.headers['origin'];
+    if (origin) {
+      if (!allowedOrigins.has(origin.toLowerCase())) {
         return false;
       }
     }
@@ -126,13 +156,28 @@ export class ProfitHudServer {
     const pathname = parsedUrl.pathname;
     const method = req.method?.toUpperCase();
 
+    const allowedOrigins = this.getAllowedOrigins();
+    const originHeader = req.headers['origin'];
+    const defaultOrigin = `http://${this.host}:${this.boundPort || this.port}`;
+
+    // Never reflect arbitrary foreign origins in CORS responses
+    const corsOrigin = originHeader && allowedOrigins.has(originHeader.toLowerCase())
+      ? originHeader
+      : defaultOrigin;
+
     // CORS & Security Headers (Restricted to localhost)
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
 
     if (method === 'OPTIONS') {
+      if (originHeader && !allowedOrigins.has(originHeader.toLowerCase())) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Forbidden: CORS origin not allowed' }));
+        return;
+      }
+
       res.writeHead(204, {
-        'Access-Control-Allow-Origin': req.headers['origin'] || `http://${this.host}:${this.boundPort || this.port}`,
+        'Access-Control-Allow-Origin': corsOrigin,
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type'
       });
@@ -154,19 +199,25 @@ export class ProfitHudServer {
         allowedStepsUSDC: VALID_PROFIT_THRESHOLDS_CENTS.map(c => c / 100)
       };
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': corsOrigin
+      });
       res.end(JSON.stringify(payload));
       return;
     }
 
     // 2. POST /api/threshold (Live runtime adjustment)
     if (pathname === '/api/threshold' && method === 'POST') {
-      // Security: Origin validation
-      if (!this.isOriginAllowed(req)) {
-        res.writeHead(403, { 'Content-Type': 'application/json' });
+      // Security: Origin and Host validation
+      if (!this.isValidOriginAndHost(req)) {
+        res.writeHead(403, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': defaultOrigin
+        });
         res.end(JSON.stringify({
           success: false,
-          error: 'Forbidden: State-changing requests restricted strictly to 127.0.0.1 / localhost Origin'
+          error: 'Forbidden: State-changing requests restricted strictly to 127.0.0.1 / localhost Origin and Host'
         }));
         return;
       }
@@ -189,7 +240,14 @@ export class ProfitHudServer {
           const result = this.thresholdManager.setThreshold(candidateVal);
 
           if (!result.success) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
+            // Check if failure was caused by persistence failure vs invalid user input
+            const isPersistenceFailure = result.error?.includes('Persistence failure');
+            const statusCode = isPersistenceFailure ? 500 : 400;
+
+            res.writeHead(statusCode, {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': corsOrigin
+            });
             res.end(JSON.stringify({
               success: false,
               error: result.error,
@@ -200,7 +258,10 @@ export class ProfitHudServer {
             return;
           }
 
-          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': corsOrigin
+          });
           res.end(JSON.stringify({
             success: true,
             thresholdUSDC: result.thresholdUSDC,
@@ -209,7 +270,10 @@ export class ProfitHudServer {
             mode: 'READ-ONLY / SHADOW MODE'
           }));
         } catch (err) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.writeHead(400, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': corsOrigin
+          });
           res.end(JSON.stringify({
             success: false,
             error: `Malformed JSON request payload: ${err instanceof Error ? err.message : String(err)}`,
@@ -224,6 +288,7 @@ export class ProfitHudServer {
 
     // 3. GET /api/status (Live telemetry & active signal counts)
     if (pathname === '/api/status' && method === 'GET') {
+      const isScannerPresent = !!this.scanner;
       const health = this.scanner ? this.scanner.getHealthStatus() : null;
       const tracker = this.scanner ? this.scanner.getOpportunityTracker() : null;
       const activeOpportunities = tracker ? tracker.getAllActiveOpportunities() : [];
@@ -232,19 +297,25 @@ export class ProfitHudServer {
       const payload = {
         success: true,
         mode: 'READ-ONLY / SHADOW MODE',
+        scannerStatus: isScannerPresent ? 'ONLINE' : 'STANDBY',
+        scannerOnline: isScannerPresent,
         thresholdUSDC: this.thresholdManager.getThresholdUSDC(),
         thresholdCents: this.thresholdManager.getThresholdCents(),
         formatted: this.thresholdManager.getFormattedThreshold(),
         solanaSlot: health ? health.currentSlot : null,
         wsConnected: health ? health.connectedWs : false,
-        rpcStatus: health ? (health.connectedRpc ? 'ACTIVE' : 'DEGRADED') : 'STANDBY',
+        wsStatus: isScannerPresent ? (health && health.connectedWs ? 'CONNECTED' : 'DISCONNECTED') : 'STANDBY',
+        rpcStatus: isScannerPresent ? (health && health.connectedRpc ? 'ACTIVE' : 'DEGRADED') : 'STANDBY',
         qualifiedCount: health ? health.qualifiedCount : 0,
         rejectedCount: health ? health.rejectedCount : 0,
         activeAllocatedCapitalUSDC: tracker ? tracker.getActiveAllocatedCapital() : 0,
         activeShadowSignalsCount: qualifiedActiveShadow.length
       };
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': corsOrigin
+      });
       res.end(JSON.stringify(payload));
       return;
     }
@@ -273,7 +344,7 @@ export class ProfitHudServer {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SolanaBot - Profit Threshold HUD</title>
+  <title>SolanaBot - Profit Threshold & Telemetry HUD</title>
   <style>
     :root {
       --bg: #0d1117;
@@ -295,7 +366,7 @@ export class ProfitHudServer {
       line-height: 1.5;
     }
     .container {
-      max-width: 680px;
+      max-width: 720px;
       margin: 0 auto;
     }
     .header {
@@ -326,7 +397,7 @@ export class ProfitHudServer {
       background-color: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 24px;
+      padding: 22px;
       margin-bottom: 20px;
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
     }
@@ -334,12 +405,59 @@ export class ProfitHudServer {
       font-size: 15px;
       font-weight: 600;
       color: var(--text-bright);
-      margin-bottom: 8px;
+      margin-bottom: 6px;
     }
     .card-desc {
       font-size: 13px;
       color: #8b949e;
-      margin-bottom: 20px;
+      margin-bottom: 18px;
+    }
+    .telemetry-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 14px;
+      margin-top: 10px;
+    }
+    .telemetry-item {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 14px;
+    }
+    .telemetry-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #8b949e;
+      margin-bottom: 4px;
+    }
+    .telemetry-value {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text-bright);
+      font-variant-numeric: tabular-nums;
+    }
+    .status-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .status-online {
+      background: rgba(35, 134, 54, 0.25);
+      color: #3fb950;
+      border: 1px solid rgba(35, 134, 54, 0.4);
+    }
+    .status-standby {
+      background: rgba(245, 158, 11, 0.2);
+      color: #f59e0b;
+      border: 1px solid rgba(245, 158, 11, 0.4);
+    }
+    .status-offline {
+      background: rgba(218, 54, 51, 0.2);
+      color: #f85149;
+      border: 1px solid rgba(218, 54, 51, 0.4);
     }
     .display-readout {
       text-align: center;
@@ -431,6 +549,43 @@ export class ProfitHudServer {
       <span class="badge-shadow">READ-ONLY / SHADOW MODE</span>
     </div>
 
+    <!-- Telemetry Card -->
+    <div class="card" id="telemetryCard">
+      <div class="card-title">Live Scanner & Network Telemetry</div>
+      <div class="card-desc">
+        Polled in real-time every 3s via GET /api/status. Zero external dependencies.
+      </div>
+      <div class="telemetry-grid">
+        <div class="telemetry-item">
+          <div class="telemetry-label">Scanner Engine</div>
+          <div class="telemetry-value">
+            <span id="telemetryScannerStatus" class="status-badge status-standby">STANDBY</span>
+          </div>
+        </div>
+        <div class="telemetry-item">
+          <div class="telemetry-label">Solana Slot</div>
+          <div class="telemetry-value" id="telemetrySlot">STANDBY</div>
+        </div>
+        <div class="telemetry-item">
+          <div class="telemetry-label">RPC / WebSocket</div>
+          <div class="telemetry-value" id="telemetryNetwork">STANDBY / STANDBY</div>
+        </div>
+        <div class="telemetry-item">
+          <div class="telemetry-label">Active Shadow Signals</div>
+          <div class="telemetry-value" id="telemetrySignals">0</div>
+        </div>
+        <div class="telemetry-item">
+          <div class="telemetry-label">Active Virtual Capital</div>
+          <div class="telemetry-value" id="telemetryCapital">$0.00 USDC</div>
+        </div>
+        <div class="telemetry-item">
+          <div class="telemetry-label">Active Threshold</div>
+          <div class="telemetry-value" id="telemetryThreshold">$${currentUSDC} USDC</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Threshold Setting Card -->
     <div class="card">
       <div class="card-title">Minimum Conservative Net Profit Floor</div>
       <div class="card-desc">
@@ -477,8 +632,16 @@ export class ProfitHudServer {
       const confirmedBadge = document.getElementById('confirmedBadge');
       const alertBox = document.getElementById('alertBox');
 
+      const telemetryScanner = document.getElementById('telemetryScannerStatus');
+      const telemetrySlot = document.getElementById('telemetrySlot');
+      const telemetryNetwork = document.getElementById('telemetryNetwork');
+      const telemetrySignals = document.getElementById('telemetrySignals');
+      const telemetryCapital = document.getElementById('telemetryCapital');
+      const telemetryThreshold = document.getElementById('telemetryThreshold');
+
       let activeConfirmed = parseFloat(slider.value);
       let isUpdating = false;
+      let isDragging = false;
 
       function showAlert(msg, isError) {
         alertBox.textContent = msg;
@@ -490,12 +653,67 @@ export class ProfitHudServer {
         alertBox.style.display = 'none';
       }
 
+      async function fetchTelemetry() {
+        try {
+          const res = await fetch('/api/status');
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const data = await res.json();
+
+          // Scanner status
+          if (data.scannerStatus === 'ONLINE') {
+            telemetryScanner.textContent = 'ONLINE';
+            telemetryScanner.className = 'status-badge status-online';
+          } else {
+            telemetryScanner.textContent = 'STANDBY';
+            telemetryScanner.className = 'status-badge status-standby';
+          }
+
+          // Slot
+          telemetrySlot.textContent = data.solanaSlot !== null && data.solanaSlot !== undefined
+            ? String(data.solanaSlot)
+            : 'STANDBY';
+
+          // Network RPC / WS
+          telemetryNetwork.textContent = (data.rpcStatus || 'STANDBY') + ' / ' + (data.wsStatus || 'STANDBY');
+
+          // Signals
+          telemetrySignals.textContent = String(data.activeShadowSignalsCount || 0);
+
+          // Capital
+          const capital = Number(data.activeAllocatedCapitalUSDC) || 0;
+          telemetryCapital.textContent = '$' + capital.toFixed(2) + ' USDC';
+
+          // Confirmed Threshold
+          telemetryThreshold.textContent = data.formatted || ('$' + Number(data.thresholdUSDC).toFixed(2) + ' USDC');
+
+          // Sync slider if not actively being adjusted by user
+          if (!isUpdating && !isDragging && typeof data.thresholdUSDC === 'number') {
+            activeConfirmed = data.thresholdUSDC;
+            slider.value = activeConfirmed.toFixed(2);
+            display.textContent = '$' + activeConfirmed.toFixed(2) + ' USDC';
+            confirmedBadge.textContent = 'Confirmed Active: $' + activeConfirmed.toFixed(2) + ' USDC';
+          }
+        } catch (err) {
+          telemetryScanner.textContent = 'OFFLINE';
+          telemetryScanner.className = 'status-badge status-offline';
+          telemetryNetwork.textContent = 'UNREACHABLE';
+        }
+      }
+
+      // Initial telemetry fetch and poll every 3 seconds
+      fetchTelemetry();
+      setInterval(fetchTelemetry, 3000);
+
+      slider.addEventListener('mousedown', function() { isDragging = true; });
+      slider.addEventListener('touchstart', function() { isDragging = true; });
+
       slider.addEventListener('input', function(e) {
         const val = parseFloat(e.target.value).toFixed(2);
         display.textContent = '$' + val + ' USDC';
       });
 
       slider.addEventListener('change', async function(e) {
+        isDragging = false;
         if (isUpdating) return;
         const targetValue = parseFloat(e.target.value);
         isUpdating = true;
@@ -518,6 +736,7 @@ export class ProfitHudServer {
             display.textContent = formatted;
             slider.value = activeConfirmed.toFixed(2);
             confirmedBadge.textContent = 'Confirmed Active: ' + formatted;
+            telemetryThreshold.textContent = formatted;
             showAlert('Active threshold updated to ' + formatted + ' (no restart required).', false);
           } else {
             // Revert slider to last backend-confirmed value

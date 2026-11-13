@@ -1760,5 +1760,6 @@ export class ArbitrageScanner {
     }
     this.ws.disconnect();
     this.repository.flushSync();
+    this.repository.close();
   }
 }

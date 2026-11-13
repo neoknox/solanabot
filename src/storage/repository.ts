@@ -102,7 +102,10 @@ export class ArbitrageRepository {
         candidate.executionProbability || 'UNCALIBRATED',
         candidate.visibilityDurationMs || 0,
         candidate.observedSnapshotsCount || 1,
-        JSON.stringify(candidate.scoringBreakdown || {}),
+        JSON.stringify({
+          ...(candidate.scoringBreakdown || {}),
+          evaluatedMinNetProfitUSDC: candidate.evaluatedMinNetProfitUSDC
+        }),
         JSON.stringify(candidate.costs),
         candidate.quoteAgeMs,
         candidate.slotGap,
@@ -354,7 +357,26 @@ export class ArbitrageRepository {
       LIMIT ?
     `).all(limit) as Array<Record<string, unknown>>;
 
-    return rows.map(r => ({
+    return rows.map(r => this.mapRowToCandidate(r));
+  }
+
+  public getCandidate(candidateId: string): ArbitrageCandidate | null {
+    this.flushSync();
+    const row = this.db.prepare(`
+      SELECT * FROM candidates WHERE candidate_id = ?
+    `).get(candidateId) as Record<string, unknown> | undefined;
+
+    if (!row) return null;
+    return this.mapRowToCandidate(row);
+  }
+
+  private mapRowToCandidate(r: Record<string, unknown>): ArbitrageCandidate {
+    const rawScoring = JSON.parse(String(r.scoring_breakdown_json || '{}'));
+    const evaluatedMinNetProfitUSDC = typeof rawScoring.evaluatedMinNetProfitUSDC === 'number'
+      ? rawScoring.evaluatedMinNetProfitUSDC
+      : undefined;
+
+    return {
       candidateId: String(r.candidate_id),
       routeName: String(r.route_name),
       direction: String(r.direction || 'USDC_TO_WSOL_TO_USDC'),
@@ -369,7 +391,8 @@ export class ArbitrageRepository {
       executionProbability: (r.execution_probability as any) || 'UNCALIBRATED',
       visibilityDurationMs: Number(r.visibility_duration_ms || 0),
       observedSnapshotsCount: Number(r.observed_snapshots_count || 1),
-      scoringBreakdown: JSON.parse(String(r.scoring_breakdown_json || '{}')),
+      scoringBreakdown: rawScoring,
+      evaluatedMinNetProfitUSDC,
       inputAmountUSDC: BigInt(String(r.input_amount_usdc)),
       leg1ExpectedOutWSOL: BigInt(String(r.leg1_expected_out_wsol)),
       leg1ConservativeOutWSOL: BigInt(String(r.leg1_conservative_out_wsol)),
@@ -413,7 +436,7 @@ export class ArbitrageRepository {
       timestamp: Number(r.timestamp),
       slotGap: Number(r.slot_gap),
       quoteAgeMs: Number(r.quote_age_ms)
-    }));
+    };
   }
 
   public exportToCsv(filePath: string): number {
