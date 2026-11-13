@@ -113,8 +113,9 @@ export class RaydiumAmmAdapter implements DexAdapter {
     const openOrdersBase = BigInt(extra?.openOrdersBaseTokenTotal || '0');
     const openOrdersQuote = BigInt(extra?.openOrdersQuoteTokenTotal || '0');
 
-    // OpenOrders verification check: pool must be verified by OpenOrders audit
-    const isOpenOrdersVerified = extra?.openOrdersVerified === true;
+    // OpenOrders and pool dependency verification check:
+    // Pool is verified only when openOrdersVerified is true AND no unverifiedReason is set.
+    const isOpenOrdersVerified = extra?.openOrdersVerified === true && !extra?.unverifiedReason;
 
     // Classic Raydium V4 reserve formula verified against official Raydium SDK source:
     // Effective reserve = vault balance + OpenOrders token total - uncollected accrued protocol PnL

@@ -109,7 +109,7 @@ export class ArbitrageProfitCalculator {
           rejectionReasons.push('UNSUPPORTED_ROUTE');
         }
       }
-      if ((q as any).isUnverified) {
+      if (q.quoteSource === 'UNVERIFIED' || (q as any).isUnverified) {
         if (!rejectionReasons.includes('QUOTE_UNVERIFIED')) {
           rejectionReasons.push('QUOTE_UNVERIFIED');
         }

@@ -70,7 +70,11 @@ describe('Runtime Route Verification & Dynamic Classification Gate', () => {
           lastConfirmedAt: Date.now(),
           observationFreshnessTtlMs: 30000,
           verifiedSlot: initialSlot,
-          verifiedAt: Date.now()
+          verifiedAt: Date.now(),
+          vaultASlot: initialSlot,
+          vaultBSlot: initialSlot,
+          vaultAReceivedAt: Date.now(),
+          vaultBReceivedAt: Date.now()
         }
       };
 
@@ -140,7 +144,11 @@ describe('Runtime Route Verification & Dynamic Classification Gate', () => {
           lastAccountChangeSlot: initialSlot,
           lastRpcConfirmationContextSlot: initialSlot,
           lastConfirmedAt: Date.now() - 35000, // Expired TTL
-          observationFreshnessTtlMs: 30000
+          observationFreshnessTtlMs: 30000,
+          vaultASlot: initialSlot,
+          vaultBSlot: initialSlot,
+          vaultAReceivedAt: Date.now(),
+          vaultBReceivedAt: Date.now()
         }
       };
 
@@ -201,7 +209,11 @@ describe('Runtime Route Verification & Dynamic Classification Gate', () => {
           openOrdersBaseTokenTotal: '0',
           openOrdersQuoteTokenTotal: '0',
           lastConfirmedAt: Date.now(),
-          observationFreshnessTtlMs: 30000
+          observationFreshnessTtlMs: 30000,
+          vaultASlot: initialSlot,
+          vaultBSlot: initialSlot,
+          vaultAReceivedAt: Date.now(),
+          vaultBReceivedAt: Date.now()
         }
       };
 

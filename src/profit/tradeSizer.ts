@@ -84,13 +84,22 @@ export class TradeSizer {
       }
 
       const q = leg.adapter.quoteExactInput(leg.pool, leg.inputMint, currentExpectedUnits);
-      if (!q || q.outAmount <= 0n) {
-        if (leg.adapter.getLastFailureReason) {
+      const isUnverifiedRaydium = leg.pool.dex === 'RAYDIUM_AMM' && (
+        (leg.pool.extraData as any)?.openOrdersVerified === false ||
+        !!(leg.pool.extraData as any)?.unverifiedReason
+      );
+
+      if (!q || q.outAmount <= 0n || isUnverifiedRaydium) {
+        if ((q as any)?.unverifiedReason) {
+          expectedFailedReason = (q as any).unverifiedReason;
+        } else if ((leg.pool.extraData as any)?.unverifiedReason) {
+          expectedFailedReason = (leg.pool.extraData as any).unverifiedReason;
+        } else if (leg.adapter.getLastFailureReason) {
           expectedFailedReason = leg.adapter.getLastFailureReason() || 'QUOTE_UNVERIFIED';
         } else if (leg.pool.dex === 'METEORA_DLMM') {
           expectedFailedReason = 'UNSUPPORTED_ROUTE';
         } else if (leg.pool.dex === 'RAYDIUM_AMM') {
-          expectedFailedReason = (leg.pool.extraData as any)?.unverifiedReason || 'QUOTE_UNVERIFIED';
+          expectedFailedReason = 'QUOTE_UNVERIFIED';
         } else {
           expectedFailedReason = 'QUOTE_UNVERIFIED';
         }
@@ -140,13 +149,22 @@ export class TradeSizer {
       }
 
       const q = leg.adapter.quoteExactInput(leg.pool, leg.inputMint, currentConservativeUnits);
-      if (!q || q.outAmount <= 0n) {
-        if (leg.adapter.getLastFailureReason) {
+      const isUnverifiedRaydium = leg.pool.dex === 'RAYDIUM_AMM' && (
+        (leg.pool.extraData as any)?.openOrdersVerified === false ||
+        !!(leg.pool.extraData as any)?.unverifiedReason
+      );
+
+      if (!q || q.outAmount <= 0n || isUnverifiedRaydium) {
+        if ((q as any)?.unverifiedReason) {
+          conservativeFailedReason = (q as any).unverifiedReason;
+        } else if ((leg.pool.extraData as any)?.unverifiedReason) {
+          conservativeFailedReason = (leg.pool.extraData as any).unverifiedReason;
+        } else if (leg.adapter.getLastFailureReason) {
           conservativeFailedReason = leg.adapter.getLastFailureReason() || 'QUOTE_UNVERIFIED';
         } else if (leg.pool.dex === 'METEORA_DLMM') {
           conservativeFailedReason = 'UNSUPPORTED_ROUTE';
         } else if (leg.pool.dex === 'RAYDIUM_AMM') {
-          conservativeFailedReason = (leg.pool.extraData as any)?.unverifiedReason || 'QUOTE_UNVERIFIED';
+          conservativeFailedReason = 'QUOTE_UNVERIFIED';
         } else {
           conservativeFailedReason = 'QUOTE_UNVERIFIED';
         }

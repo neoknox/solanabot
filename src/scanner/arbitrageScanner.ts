@@ -266,13 +266,12 @@ export class ArbitrageScanner {
         } catch {}
       }
 
-      // Preserve existing hydrated vault reserves and verify OpenOrders state freshness
+      // Preserve existing hydrated state and verify dependency freshness
       const existing = this.stateCache.getPoolState(update.key);
       if (existing) {
-        if (decoded.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) decoded.reserveA = existing.reserveA;
-        if (decoded.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) decoded.reserveB = existing.reserveB;
-
         if (decoded.dex === 'ORCA_WHIRLPOOL' && existing.extraData && decoded.extraData) {
+          if (decoded.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) decoded.reserveA = existing.reserveA;
+          if (decoded.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) decoded.reserveB = existing.reserveB;
           const oldExtra = existing.extraData as any;
           const newExtra = decoded.extraData as any;
           if (oldExtra.tickArrays) {
@@ -286,6 +285,7 @@ export class ArbitrageScanner {
 
           // Check if critical account pointers changed (vaults, openOrders, market)
           const pointersChanged =
+            !oldExtra.baseVault ||
             oldExtra.baseVault !== newExtra.baseVault ||
             oldExtra.quoteVault !== newExtra.quoteVault ||
             oldExtra.openOrders !== newExtra.openOrders ||
@@ -293,50 +293,104 @@ export class ArbitrageScanner {
             oldExtra.marketProgramId !== newExtra.marketProgramId;
 
           if (pointersChanged) {
-            // Invalidate verification immediately if pool pointers changed
+            // Invalidate verification immediately if pool pointers changed.
+            // Do NOT recycle old reserves or vault metadata!
+            decoded.reserveA = 0n;
+            decoded.reserveB = 0n;
             newExtra.openOrdersVerified = false;
             newExtra.unverifiedReason = 'ACCOUNT_POINTERS_CHANGED';
             this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'ACCOUNT_POINTERS_CHANGED');
             this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
-          } else if (oldExtra.openOrdersVerified === true) {
-            // Raydium OpenOrders Observation Model:
-            // A quiet, unchanged OpenOrders account does NOT receive updates every slot.
-            // Check observation freshness: within TTL and WebSocket connection healthy.
-            const now = update.receivedAtMs || Date.now();
-            const lastConfirmedAt = oldExtra.lastConfirmedAt || oldExtra.verifiedAt || existing.receivedAt || 0;
-            const ttl = oldExtra.observationFreshnessTtlMs || this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
-            const isFresh = (now - lastConfirmedAt) <= ttl;
-            const wsHealthy = this.ws.getHealth() !== 'DISCONNECTED';
-
-            if (!wsHealthy) {
-              newExtra.openOrdersVerified = false;
-              newExtra.unverifiedReason = 'SUBSCRIPTION_LOSS';
-              this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'SUBSCRIPTION_LOSS');
-              this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
-            } else if (!isFresh) {
-              // Observation expired: fail closed and trigger bounded reconfirmation
-              newExtra.openOrdersVerified = false;
-              newExtra.unverifiedReason = 'OBSERVATION_EXPIRED';
-              this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'OBSERVATION_EXPIRED');
-              this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
-              this.triggerRateLimitedReconfirmation(update.key);
-            } else {
-              // Observation is fresh and dependencies are verified: preserve verified state without false SLOT_MISMATCH
-              newExtra.openOrdersVerified = true;
-              newExtra.openOrdersBaseTokenTotal = oldExtra.openOrdersBaseTokenTotal;
-              newExtra.openOrdersQuoteTokenTotal = oldExtra.openOrdersQuoteTokenTotal;
-              newExtra.lastAccountChangeSlot = oldExtra.lastAccountChangeSlot || oldExtra.openOrdersSlot || existing.slot;
-              newExtra.lastRpcConfirmationContextSlot = oldExtra.lastRpcConfirmationContextSlot || oldExtra.verifiedSlot || existing.slot;
-              newExtra.lastConfirmedAt = lastConfirmedAt;
-              newExtra.observationFreshnessTtlMs = ttl;
-              newExtra.openOrdersSlot = oldExtra.openOrdersSlot;
-              newExtra.verifiedSlot = update.slot;
-              newExtra.verifiedAt = oldExtra.verifiedAt;
-              delete newExtra.unverifiedReason;
-            }
           } else {
-            newExtra.openOrdersVerified = false;
-            newExtra.unverifiedReason = oldExtra.unverifiedReason || 'UNVERIFIED';
+            // Account pointers are UNCHANGED.
+            // Check vault observation metadata: Never substitute pool.receivedAt or pool.slot!
+            const vASlot = oldExtra.vaultASlot;
+            const vBSlot = oldExtra.vaultBSlot;
+            const vAReceivedAt = oldExtra.vaultAReceivedAt;
+            const vBReceivedAt = oldExtra.vaultBReceivedAt;
+
+            const now = update.receivedAtMs || Date.now();
+            const ttl = oldExtra.observationFreshnessTtlMs || this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
+            const hasReserves = (existing.reserveA ?? 0n) > 0n && (existing.reserveB ?? 0n) > 0n;
+            const hasVaultMeta = !!(vASlot && vBSlot && vAReceivedAt && vBReceivedAt);
+            const vAFresh = hasVaultMeta && (now - vAReceivedAt <= ttl);
+            const vBFresh = hasVaultMeta && (now - vBReceivedAt <= ttl);
+            const vaultSlotGap = hasVaultMeta ? Math.abs(vASlot - vBSlot) : Infinity;
+
+            if (!hasReserves) {
+              // Unhydrated reserves: fail closed, do not mark verified
+              newExtra.openOrdersVerified = false;
+              newExtra.unverifiedReason = 'VAULT_RESERVES_UNHYDRATED';
+              this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'VAULT_RESERVES_UNHYDRATED');
+              this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
+            } else if (!hasVaultMeta) {
+              // Missing vault timestamps or slots: fail closed, do not silently recycle old reserves
+              newExtra.openOrdersVerified = false;
+              newExtra.unverifiedReason = 'MISSING_VAULT_METADATA';
+              this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'MISSING_VAULT_METADATA');
+              this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
+            } else if (!vAFresh || !vBFresh) {
+              // Stale vault observation: fail closed
+              newExtra.openOrdersVerified = false;
+              newExtra.unverifiedReason = 'STALE_VAULT_SNAPSHOT';
+              this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'STALE_VAULT_SNAPSHOT');
+              this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
+            } else if (vaultSlotGap > 100) {
+              // Mismatched vault slots: fail closed
+              newExtra.openOrdersVerified = false;
+              newExtra.unverifiedReason = 'INCONSISTENT_VAULT_SNAPSHOT';
+              this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'INCONSISTENT_VAULT_SNAPSHOT');
+              this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
+            } else {
+              // Vault data is fresh and validated! Preserve reserves and metadata
+              if (decoded.reserveA === 0n) decoded.reserveA = existing.reserveA;
+              if (decoded.reserveB === 0n) decoded.reserveB = existing.reserveB;
+              newExtra.vaultASlot = vASlot;
+              newExtra.vaultBSlot = vBSlot;
+              newExtra.vaultAReceivedAt = vAReceivedAt;
+              newExtra.vaultBReceivedAt = vBReceivedAt;
+
+              // Now verify OpenOrders status
+              if (oldExtra.openOrdersVerified === true && !oldExtra.unverifiedReason) {
+                const lastConfirmedAt = oldExtra.lastConfirmedAt || oldExtra.verifiedAt || 0;
+                const isOoFresh = (now - lastConfirmedAt) <= ttl;
+                const wsHealthy = this.ws.getHealth() !== 'DISCONNECTED';
+
+                if (!wsHealthy) {
+                  newExtra.openOrdersVerified = false;
+                  newExtra.unverifiedReason = 'SUBSCRIPTION_LOSS';
+                  this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'SUBSCRIPTION_LOSS');
+                  this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
+                } else if (!isOoFresh) {
+                  newExtra.openOrdersVerified = false;
+                  newExtra.unverifiedReason = 'OBSERVATION_EXPIRED';
+                  this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'OBSERVATION_EXPIRED');
+                  this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
+                  this.triggerRateLimitedReconfirmation(update.key);
+                } else {
+                  // Both vaults and OpenOrders are verified and fresh!
+                  newExtra.openOrdersVerified = true;
+                  newExtra.openOrdersBaseTokenTotal = oldExtra.openOrdersBaseTokenTotal;
+                  newExtra.openOrdersQuoteTokenTotal = oldExtra.openOrdersQuoteTokenTotal;
+                  newExtra.lastAccountChangeSlot = oldExtra.lastAccountChangeSlot || oldExtra.openOrdersSlot || existing.slot;
+                  newExtra.lastRpcConfirmationContextSlot = oldExtra.lastRpcConfirmationContextSlot || oldExtra.verifiedSlot || existing.slot;
+                  newExtra.lastConfirmedAt = lastConfirmedAt;
+                  newExtra.observationFreshnessTtlMs = ttl;
+                  newExtra.openOrdersSlot = oldExtra.openOrdersSlot;
+                  newExtra.verifiedSlot = update.slot;
+                  newExtra.verifiedAt = oldExtra.verifiedAt;
+                  delete newExtra.unverifiedReason;
+
+                  this.poolRegistry.updatePoolVerification(update.key, 'VERIFIED_DIRECT');
+                  this.routeIndex.updatePoolStatus(update.key, 'VERIFIED_DIRECT');
+                }
+              } else {
+                newExtra.openOrdersVerified = false;
+                newExtra.unverifiedReason = oldExtra.unverifiedReason || 'UNVERIFIED';
+                this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', newExtra.unverifiedReason);
+                this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
+              }
+            }
           }
         }
       }
@@ -394,16 +448,58 @@ export class ArbitrageScanner {
     const baseTokenTotal = update.data.readBigUInt64LE(85);
     const quoteTokenTotal = update.data.readBigUInt64LE(101);
 
+    // Validate ALL required vault dependencies before promoting to VERIFIED_DIRECT
+    const now = update.receivedAtMs || Date.now();
+    const ttl = extra.observationFreshnessTtlMs || this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
+    const hasReserves = (pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n;
+    const vASlot = extra.vaultASlot;
+    const vBSlot = extra.vaultBSlot;
+    const vAReceivedAt = extra.vaultAReceivedAt;
+    const vBReceivedAt = extra.vaultBReceivedAt;
+    const hasVaultMeta = !!(vASlot && vBSlot && vAReceivedAt && vBReceivedAt);
+    const vAFresh = hasVaultMeta && (now - vAReceivedAt <= ttl);
+    const vBFresh = hasVaultMeta && (now - vBReceivedAt <= ttl);
+    const vaultSlotGap = hasVaultMeta ? Math.abs(vASlot - vBSlot) : Infinity;
+
+    if (!hasReserves) {
+      extra.openOrdersVerified = false;
+      extra.unverifiedReason = 'VAULT_RESERVES_UNHYDRATED';
+      this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'VAULT_RESERVES_UNHYDRATED');
+      this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+      return;
+    }
+    if (!hasVaultMeta) {
+      extra.openOrdersVerified = false;
+      extra.unverifiedReason = 'MISSING_VAULT_METADATA';
+      this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'MISSING_VAULT_METADATA');
+      this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+      return;
+    }
+    if (!vAFresh || !vBFresh) {
+      extra.openOrdersVerified = false;
+      extra.unverifiedReason = 'STALE_VAULT_SNAPSHOT';
+      this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'STALE_VAULT_SNAPSHOT');
+      this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+      return;
+    }
+    if (vaultSlotGap > 100) {
+      extra.openOrdersVerified = false;
+      extra.unverifiedReason = 'INCONSISTENT_VAULT_SNAPSHOT';
+      this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'INCONSISTENT_VAULT_SNAPSHOT');
+      this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+      return;
+    }
+
     extra.openOrdersVerified = true;
     extra.openOrdersBaseTokenTotal = baseTokenTotal.toString();
     extra.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
     extra.lastAccountChangeSlot = update.slot;
     extra.lastRpcConfirmationContextSlot = update.slot;
-    extra.lastConfirmedAt = update.receivedAtMs || Date.now();
-    extra.observationFreshnessTtlMs = this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
+    extra.lastConfirmedAt = now;
+    extra.observationFreshnessTtlMs = ttl;
     extra.openOrdersSlot = update.slot;
     extra.verifiedSlot = update.slot;
-    extra.verifiedAt = update.receivedAtMs || Date.now();
+    extra.verifiedAt = now;
     delete extra.unverifiedReason;
 
     this.poolRegistry.updatePoolVerification(poolId, 'VERIFIED_DIRECT');
@@ -432,6 +528,32 @@ export class ArbitrageScanner {
             }
             pool.slot = update.slot;
             pool.receivedAt = update.receivedAtMs;
+
+            // Runtime recovery: If valid fresh vault data arrives, check if pool can be promoted back to VERIFIED_DIRECT
+            if (pool.dex === 'RAYDIUM_AMM') {
+              const now = update.receivedAtMs || Date.now();
+              const ttl = extra.observationFreshnessTtlMs || this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
+              const hasReserves = (pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n;
+              const vASlot = extra.vaultASlot;
+              const vBSlot = extra.vaultBSlot;
+              const vAReceivedAt = extra.vaultAReceivedAt;
+              const vBReceivedAt = extra.vaultBReceivedAt;
+              const hasVaultMeta = !!(vASlot && vBSlot && vAReceivedAt && vBReceivedAt);
+              const vAFresh = hasVaultMeta && (now - vAReceivedAt <= ttl);
+              const vBFresh = hasVaultMeta && (now - vBReceivedAt <= ttl);
+              const vaultSlotGap = hasVaultMeta ? Math.abs(vASlot - vBSlot) : Infinity;
+
+              if (hasReserves && vAFresh && vBFresh && vaultSlotGap <= 100 && extra.openOrdersVerified === true) {
+                const lastConfirmedAt = extra.lastConfirmedAt || extra.verifiedAt || 0;
+                const isOoFresh = (now - lastConfirmedAt) <= ttl;
+                if (isOoFresh) {
+                  delete extra.unverifiedReason;
+                  this.poolRegistry.updatePoolVerification(mapping.poolId, 'VERIFIED_DIRECT');
+                  this.routeIndex.updatePoolStatus(mapping.poolId, 'VERIFIED_DIRECT');
+                }
+              }
+            }
+
             this.stateCache.setPoolState(pool);
 
             // Reevaluate only routes affected by this vault update
@@ -530,22 +652,12 @@ export class ArbitrageScanner {
       const baseTokenTotal = acc.data.readBigUInt64LE(85);
       const quoteTokenTotal = acc.data.readBigUInt64LE(101);
 
-      extra.openOrdersVerified = true;
-      extra.openOrdersBaseTokenTotal = baseTokenTotal.toString();
-      extra.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
-      extra.lastAccountChangeSlot = ooSlot;
-      extra.lastRpcConfirmationContextSlot = ooSlot;
-      extra.lastConfirmedAt = Date.now();
-      extra.observationFreshnessTtlMs = this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
-      extra.openOrdersSlot = ooSlot;
-      extra.verifiedSlot = ooSlot;
-      extra.verifiedAt = Date.now();
-      delete extra.unverifiedReason;
-
       // CRITICAL DEPENDENCY INTEGRITY CHECK:
-      // OpenOrders reconfirmation must NOT automatically validate stale or unhydrated vaults.
+      // Validate ALL required vault dependencies FIRST before promoting openOrdersVerified to true.
+      // 1. Check vault hydration:
       const reservesHydrated = (pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n;
       if (!reservesHydrated) {
+        extra.openOrdersVerified = false;
         extra.unverifiedReason = 'VAULT_RESERVES_UNHYDRATED';
         this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'VAULT_RESERVES_UNHYDRATED');
         this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
@@ -553,22 +665,58 @@ export class ArbitrageScanner {
         return false;
       }
 
+      // 2. Check vault observation timestamps and slots:
+      // Never substitute pool.receivedAt or pool.slot for missing vault freshness evidence.
+      const vASlot = extra.vaultASlot;
+      const vBSlot = extra.vaultBSlot;
+      const vAConfirmedAt = extra.vaultAReceivedAt;
+      const vBConfirmedAt = extra.vaultBReceivedAt;
+
+      if (!vAConfirmedAt || !vBConfirmedAt || !vASlot || !vBSlot) {
+        extra.openOrdersVerified = false;
+        extra.unverifiedReason = 'MISSING_VAULT_METADATA';
+        this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'MISSING_VAULT_METADATA');
+        this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        this.stateCache.setPoolState(pool);
+        return false;
+      }
+
+      // 3. Check vault freshness and slot gap:
       const nowAfter = Date.now();
-      const vASlot = extra.vaultASlot || pool.slot;
-      const vBSlot = extra.vaultBSlot || pool.slot;
-      const vAConfirmedAt = extra.vaultAReceivedAt || pool.receivedAt || 0;
-      const vBConfirmedAt = extra.vaultBReceivedAt || pool.receivedAt || 0;
       const vaultTtl = this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
       const vaultsFresh = (nowAfter - vAConfirmedAt <= vaultTtl) && (nowAfter - vBConfirmedAt <= vaultTtl);
       const vaultSlotGap = Math.abs(vASlot - vBSlot);
 
-      if (!vaultsFresh || vaultSlotGap > 100) {
+      if (!vaultsFresh) {
+        extra.openOrdersVerified = false;
         extra.unverifiedReason = 'STALE_VAULT_SNAPSHOT';
         this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'STALE_VAULT_SNAPSHOT');
         this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
         this.stateCache.setPoolState(pool);
         return false;
       }
+
+      if (vaultSlotGap > 100) {
+        extra.openOrdersVerified = false;
+        extra.unverifiedReason = 'STALE_VAULT_SNAPSHOT';
+        this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'STALE_VAULT_SNAPSHOT');
+        this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+        this.stateCache.setPoolState(pool);
+        return false;
+      }
+
+      // ONLY AFTER EVERY SINGLE DEPENDENCY PASSES: promote VERIFIED_DIRECT
+      extra.openOrdersVerified = true;
+      extra.openOrdersBaseTokenTotal = baseTokenTotal.toString();
+      extra.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
+      extra.lastAccountChangeSlot = ooSlot;
+      extra.lastRpcConfirmationContextSlot = ooSlot;
+      extra.lastConfirmedAt = nowAfter;
+      extra.observationFreshnessTtlMs = vaultTtl;
+      extra.openOrdersSlot = ooSlot;
+      extra.verifiedSlot = ooSlot;
+      extra.verifiedAt = nowAfter;
+      delete extra.unverifiedReason;
 
       this.poolRegistry.updatePoolVerification(poolId, 'VERIFIED_DIRECT');
       this.routeIndex.updatePoolStatus(poolId, 'VERIFIED_DIRECT');
@@ -648,6 +796,17 @@ export class ArbitrageScanner {
         return;
       }
 
+      // Require runtime pool verification before accepting a route as state-ready and quote-valid
+      const poolConfig = this.poolRegistry.getPool(legDef.poolId);
+      if (!poolConfig || poolConfig.verificationStatus !== 'VERIFIED_DIRECT') {
+        this.rejectedCount++;
+        this.auditMetrics.rejectedRoutes++;
+        const reason = (poolConfig?.blockerReason || 'QUOTE_UNVERIFIED') as RejectionReasonCode;
+        this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
+        this.auditMetrics.quoteValidationFailures++;
+        return;
+      }
+
       const pool = this.stateCache.getPoolState(legDef.poolId);
       if (!pool) {
         this.rejectedCount++;
@@ -655,11 +814,23 @@ export class ArbitrageScanner {
         return;
       }
 
-      // Fail closed if AMM reserves are not yet hydrated
-      if (pool.dex === 'RAYDIUM_AMM' && ((pool.reserveA ?? 0n) <= 0n || (pool.reserveB ?? 0n) <= 0n)) {
-        this.rejectedCount++;
-        this.auditMetrics.rejectedRoutes++;
-        return;
+      // Fail closed if Raydium AMM dependencies are unverified, stale or unhydrated
+      if (pool.dex === 'RAYDIUM_AMM') {
+        const extra = pool.extraData as any;
+        if (extra?.openOrdersVerified !== true || extra?.unverifiedReason) {
+          this.rejectedCount++;
+          this.auditMetrics.rejectedRoutes++;
+          const reason = (extra?.unverifiedReason || 'QUOTE_UNVERIFIED') as RejectionReasonCode;
+          this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
+          this.auditMetrics.quoteValidationFailures++;
+          return;
+        }
+        if ((pool.reserveA ?? 0n) <= 0n || (pool.reserveB ?? 0n) <= 0n) {
+          this.rejectedCount++;
+          this.auditMetrics.rejectedRoutes++;
+          this.rejectionBreakdown['INSUFFICIENT_LIQUIDITY'] = (this.rejectionBreakdown['INSUFFICIENT_LIQUIDITY'] || 0) + 1;
+          return;
+        }
       }
 
       const adapter = dexRegistry.getAdapter(legDef.dex);
@@ -1056,13 +1227,16 @@ export class ArbitrageScanner {
                 // Check snapshot slot consistency between pool and OpenOrders, and verify vault hydration
                 const slotGap = Math.abs(snapshotSlot - ooSlot);
                 const reservesHydrated = (pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n;
-                const vASlot = extra.vaultASlot || snapshotSlot;
-                const vBSlot = extra.vaultBSlot || snapshotSlot;
-                const vaultSlotGap = Math.abs(vASlot - vBSlot);
+                const vASlot = extra.vaultASlot;
+                const vBSlot = extra.vaultBSlot;
+                const vAReceivedAt = extra.vaultAReceivedAt;
+                const vBReceivedAt = extra.vaultBReceivedAt;
 
                 if (!reservesHydrated) {
                   blockerReason = 'VAULT_RESERVES_UNHYDRATED';
-                } else if (vaultSlotGap > 100) {
+                } else if (!vASlot || !vBSlot || !vAReceivedAt || !vBReceivedAt) {
+                  blockerReason = 'MISSING_VAULT_METADATA';
+                } else if (Math.abs(vASlot - vBSlot) > 100) {
                   blockerReason = 'INCONSISTENT_VAULT_SNAPSHOT';
                 } else if (slotGap > 100) {
                   blockerReason = 'SLOT_MISMATCH';
@@ -1194,8 +1368,10 @@ export class ArbitrageScanner {
         pool.receivedAt = Date.now();
         const existing = this.stateCache.getPoolState(pool.id);
         if (existing) {
-          if (pool.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) pool.reserveA = existing.reserveA;
-          if (pool.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) pool.reserveB = existing.reserveB;
+          if (pool.dex !== 'RAYDIUM_AMM') {
+            if (pool.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) pool.reserveA = existing.reserveA;
+            if (pool.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) pool.reserveB = existing.reserveB;
+          }
         }
         this.stateCache.setPoolState(pool);
       }
