@@ -1,4 +1,4 @@
-export type QueuedEventType = 'POOL_ACCOUNT' | 'VAULT_ACCOUNT' | 'OPENORDERS_ACCOUNT';
+export type QueuedEventType = 'POOL_ACCOUNT' | 'VAULT_ACCOUNT' | 'OPENORDERS_ACCOUNT' | 'TICK_ARRAY_ACCOUNT';
 
 export interface QueuedAccountUpdate {
   type: QueuedEventType;

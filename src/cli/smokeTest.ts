@@ -122,6 +122,15 @@ async function main() {
   console.log(`p95 Visibility Duration:        ${lifecycle.p95DurationMs} ms`);
 
   console.log('\n--- ORCA & RAYDIUM STATE INTEGRITY DIAGNOSTICS ---');
+  const stateCache = scanner.getStateCache();
+  for (const pool of poolReg.getAllPools()) {
+    if (pool.dex === 'ORCA_WHIRLPOOL') {
+      const state = stateCache.getPoolState(pool.id);
+      const tickArrays = (state?.extraData as any)?.tickArrays;
+      const count = tickArrays ? (tickArrays instanceof Map ? tickArrays.size : Object.keys(tickArrays).length) : 0;
+      console.log(`  Orca Pool ${pool.id.slice(0, 8)}... (${pool.dex}) Hydrated Tick Arrays: ${count}`);
+    }
+  }
   console.log(`  Orca Proven Tick Boundary Exceeded Attempts: ${audit.orcaTickBoundaryAttempts || 0}`);
   console.log(`  Orca Other Quote Failures (Data/Liquidity):   ${audit.orcaOtherFailureAttempts || 0}`);
   console.log(`  Raydium Reconfirmation Attempts:             ${audit.raydiumReconfirmationAttempts || 0}`);

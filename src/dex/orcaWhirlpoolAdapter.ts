@@ -1,21 +1,23 @@
 import { PublicKey } from '@solana/web3.js';
-import Decimal from 'decimal.js';
+import {
+  tickIndexToSqrtPrice,
+  swapQuoteByInputToken,
+  WhirlpoolFacade,
+  TickArrayFacade
+} from '@orca-so/whirlpools-core';
 import { DexAdapter } from './types.js';
 import { DexType, PoolState, SwapQuote, RejectionReasonCode } from '../types/index.js';
 import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT, getKnownTokenDecimals } from '../config/index.js';
-
-Decimal.set({ precision: 50, rounding: Decimal.ROUND_DOWN });
+import { getRequiredTickArrayStartIndices } from './orcaTickArray.js';
 
 const Q64 = 1n << 64n;
 
 /**
- * Converts tick index to sqrtPriceX64 using 50-digit precision Decimal arithmetic,
- * eliminating IEEE 754 floating-point drift from Math.pow(1.0001, tick/2).
+ * Converts tick index to sqrtPriceX64 using official Orca Whirlpool core integer math,
+ * providing zero-drift exact parity with on-chain smart contract math.
  */
 export function tickIndexToSqrtPriceX64(tickIndex: number): bigint {
-  const q64 = new Decimal(2).pow(64);
-  const sqrtPrice = new Decimal(1.0001).pow(new Decimal(tickIndex).div(2)).mul(q64).floor();
-  return BigInt(sqrtPrice.toFixed(0));
+  return tickIndexToSqrtPrice(tickIndex);
 }
 
 export class OrcaWhirlpoolAdapter implements DexAdapter {
@@ -33,8 +35,10 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
 
     try {
       const tickSpacing = data.readUInt16LE(41);
-      const feeRateRaw = data.readUInt16LE(43); // hundredths of a basis point (e.g. 400 = 4 bps)
-      const feeBps = Math.max(1, Math.round(feeRateRaw / 100));
+      const feeTierIndexSeed = [data.readUInt8(43), data.readUInt8(44)];
+      const feeRate = data.readUInt16LE(45); // hundredths of a basis point (e.g. 400 = 4 bps)
+      const protocolFeeRate = data.readUInt16LE(47);
+      const feeBps = Math.max(1, Math.round(feeRate / 100));
 
       // Read liquidity (u128 at offset 49..65)
       const liquidityLow = data.readBigUInt64LE(49);
@@ -73,7 +77,10 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
         feedHealth: 'HEALTHY',
         extraData: {
           tickSpacing,
-          feeRateRaw,
+          feeTierIndexSeed,
+          feeRate,
+          protocolFeeRate,
+          feeRateRaw: feeRate,
           liquidity: liquidity.toString(),
           sqrtPrice: sqrtPrice.toString(),
           tickCurrent,
@@ -108,9 +115,13 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
     const extra = pool.extraData as {
       liquidity?: string;
       sqrtPrice?: string;
+      feeRate?: number;
       feeRateRaw?: number;
+      protocolFeeRate?: number;
+      feeTierIndexSeed?: number[];
       tickCurrent?: number;
       tickSpacing?: number;
+      tickArrays?: Record<number, TickArrayFacade>;
     } | undefined;
 
     const liquidity = BigInt(extra?.liquidity || '0');
@@ -135,8 +146,96 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
     const isInputA = inputMint === pool.tokenAMint;
     const outputMint = isInputA ? pool.tokenBMint : pool.tokenAMint;
 
-    // Adaptive fee deduction (feeRateRaw is in hundredths of bps: 100 = 1 bps, 1,000,000 = 100%)
-    const feeRateRaw = BigInt(extra?.feeRateRaw ?? pool.feeBps * 100);
+    // Multi-Tick Quoting: Check if verified tick arrays are loaded for this pool
+    const loadedTickArrays = extra?.tickArrays;
+    const direction = isInputA ? 'A_TO_B' : 'B_TO_A';
+    const requiredStartIndices = getRequiredTickArrayStartIndices(tickCurrent, tickSpacing, direction);
+
+    const getTickArray = (idx: number): TickArrayFacade | undefined => {
+      if (!loadedTickArrays) return undefined;
+      if (loadedTickArrays instanceof Map) return loadedTickArrays.get(idx);
+      return loadedTickArrays[idx];
+    };
+
+    let hasAllRequiredArrays = false;
+    const sequenceArrays: TickArrayFacade[] = [];
+
+    if (loadedTickArrays) {
+      hasAllRequiredArrays = requiredStartIndices.every(idx => !!getTickArray(idx));
+      if (hasAllRequiredArrays) {
+        for (const idx of requiredStartIndices) {
+          const arr = getTickArray(idx);
+          if (arr) sequenceArrays.push(arr);
+        }
+      }
+    }
+
+    if (hasAllRequiredArrays && sequenceArrays.length === 3) {
+      try {
+        const seed = extra?.feeTierIndexSeed ? new Uint8Array(extra.feeTierIndexSeed) : new Uint8Array([tickSpacing, 0]);
+        const whirlpoolFacade: WhirlpoolFacade = {
+          feeTierIndexSeed: seed,
+          tickSpacing,
+          feeRate: extra?.feeRate ?? extra?.feeRateRaw ?? pool.feeBps * 100,
+          protocolFeeRate: extra?.protocolFeeRate ?? 0,
+          liquidity,
+          sqrtPrice,
+          tickCurrentIndex: tickCurrent,
+          feeGrowthGlobalA: 0n,
+          feeGrowthGlobalB: 0n,
+          rewardLastUpdatedTimestamp: 0n,
+          rewardInfos: [
+            { emissionsPerSecondX64: 0n, growthGlobalX64: 0n },
+            { emissionsPerSecondX64: 0n, growthGlobalX64: 0n },
+            { emissionsPerSecondX64: 0n, growthGlobalX64: 0n }
+          ]
+        };
+
+        const quoteRes = swapQuoteByInputToken(
+          amountIn,
+          isInputA,
+          0,
+          whirlpoolFacade,
+          null,
+          sequenceArrays,
+          BigInt(Math.floor(Date.now() / 1000))
+        );
+
+        if (quoteRes.tokenEstOut <= 0n) {
+          this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+          return null;
+        }
+
+        this.lastFailureReason = null;
+        return {
+          quoteSource: 'DIRECT_POOL',
+          poolId: pool.id,
+          dex: this.dex,
+          inputMint,
+          outputMint,
+          inAmount: amountIn,
+          outAmount: quoteRes.tokenEstOut,
+          feeIncluded: true,
+          feeAmount: quoteRes.tradeFee,
+          priceImpactBps: 0,
+          slot: pool.slot,
+          timestamp: pool.receivedAt,
+          executionType: 'POTENTIAL_ATOMIC'
+        };
+      } catch (err: any) {
+        const msg = String(err?.message || err);
+        if (msg.includes('TickArraySequence') || msg.includes('tick index not in array') || msg.includes('exceeded')) {
+          this.lastFailureReason = 'TICK_BOUNDARY_EXCEEDED';
+        } else {
+          this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+        }
+        return null;
+      }
+    }
+
+    // Single-tick fallback: When multi-tick arrays are not yet prehydrated,
+    // evaluate whether the probe fits safely inside the current active tick range.
+    const feeRateRaw = BigInt(extra?.feeRate ?? extra?.feeRateRaw ?? pool.feeBps * 100);
     const feeDenominator = 1000000n;
     const feeAmount = (amountIn * feeRateRaw) / feeDenominator;
     const amountInAfterFee = amountIn - feeAmount;
@@ -146,8 +245,6 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
       return null;
     }
 
-    // Boundary check: Verify whether trade exceeds the current initialized tick range
-    // If trade crosses the boundary, tick arrays are required. If tick arrays are incomplete, fail closed.
     let amountOut = 0n;
     let priceImpactBps = 0;
 
@@ -155,14 +252,12 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
       if (isInputA) {
         // Swapping Token A -> Token B (WSOL -> USDC): price moves down towards lower tick boundary
         const nextLowerTick = Math.floor(tickCurrent / tickSpacing) * tickSpacing;
-        const sqrtPriceTarget = tickIndexToSqrtPriceX64(nextLowerTick);
+        const sqrtPriceTarget = tickIndexToSqrtPrice(nextLowerTick);
 
         if (sqrtPriceTarget < sqrtPrice) {
           const deltaSqrt = sqrtPrice - sqrtPriceTarget;
           const maxInA = (liquidity * deltaSqrt * Q64) / (sqrtPrice * sqrtPriceTarget);
-          // If input exceeds active tick capacity and full tick-array traversal is not loaded, reject unverified quote
           if (amountInAfterFee > maxInA && maxInA > 0n) {
-            // Proven tick array boundary exceeded without verified tick array state
             this.lastFailureReason = 'TICK_BOUNDARY_EXCEEDED';
             return null;
           }
@@ -187,14 +282,12 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
       } else {
         // Swapping Token B -> Token A (USDC -> WSOL): price moves up towards upper tick boundary
         const nextUpperTick = (Math.floor(tickCurrent / tickSpacing) + 1) * tickSpacing;
-        const sqrtPriceTarget = tickIndexToSqrtPriceX64(nextUpperTick);
+        const sqrtPriceTarget = tickIndexToSqrtPrice(nextUpperTick);
 
         if (sqrtPriceTarget > sqrtPrice) {
           const deltaSqrt = sqrtPriceTarget - sqrtPrice;
           const maxInB = (liquidity * deltaSqrt) / Q64;
-          // If input exceeds active tick capacity, reject unverified quote without tick arrays
           if (amountInAfterFee > maxInB && maxInB > 0n) {
-            // Proven tick array boundary exceeded without verified tick array state
             this.lastFailureReason = 'TICK_BOUNDARY_EXCEEDED';
             return null;
           }

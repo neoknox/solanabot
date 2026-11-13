@@ -98,6 +98,30 @@ describe('Phase 1.1 Final Gate: Independent Quote Parity & State Invariants', ()
       expect(adapter.quoteExactInput(emptyPool, CANONICAL_USDC_MINT, 100000000n)).toBeNull();
     });
 
+    it('Rejects input mints other than pool tokenAMint or tokenBMint with INVALID_MINT', () => {
+      const invalidMint = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+      const quote = adapter.quoteExactInput(pool, invalidMint, 100000000n);
+      expect(quote).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('INVALID_MINT');
+    });
+
+    it('Uses on-chain swapFeeNumerator and swapFeeDenominator as full rational BigInt fraction', () => {
+      // Custom rational fee: 250 numerator / 100,000 denominator (25 bps) vs 350 / 100,000 (35 bps)
+      const customFeePool: PoolState = {
+        ...pool,
+        feeBps: 35,
+        extraData: {
+          ...pool.extraData,
+          swapFeeNumerator: '350',
+          swapFeeDenominator: '100000'
+        }
+      };
+      const amountIn = 100000000n; // $100 USDC
+      const quote = adapter.quoteExactInput(customFeePool, CANONICAL_USDC_MINT, amountIn);
+      expect(quote).not.toBeNull();
+      expect(quote!.feeAmount).toBe((amountIn * 350n) / 100000n); // 350,000 units = 0.35 USDC
+    });
+
     it('Marks quote as UNVERIFIED with BLOCKED_RPC_TIMEOUT when OpenOrders account verification is incomplete', () => {
       const quote = adapter.quoteExactInput(pool, CANONICAL_USDC_MINT, 100000000n);
       expect(quote).not.toBeNull();
@@ -157,19 +181,16 @@ describe('Phase 1.1 Final Gate: Independent Quote Parity & State Invariants', ()
 
       // Vector 3: Active mainnet SOL/USDC Whirlpool tick -24988 boundary
       const activeTick = tickIndexToSqrtPriceX64(-24988);
-      expect(activeTick).toBe(5288583008912297378n);
+      expect(activeTick).toBe(5288583008912297376n); // Official Orca Whirlpool core integer constant
       // The on-chain active sqrtPrice (5288671865725992663) strictly resides within [tick(-24988), tick(-24987))
       const nextTick = tickIndexToSqrtPriceX64(-24987);
       const onChainSqrtPrice = 5288671865725992663n;
       expect(activeTick <= onChainSqrtPrice && onChainSqrtPrice < nextTick).toBe(true);
 
       // Vector 4: MAX_TICK_INDEX = 443636
-      // Official Rust binary lookup yields 79226673515401279992447579055n; Decimal continuous exponentiation yields 79226673515401279992447579061n
+      // Official Rust binary lookup yields 79226673515401279992447579055n; exact zero-drift parity
       const maxTick = tickIndexToSqrtPriceX64(443636);
-      const diff = maxTick > 79226673515401279992447579055n
-        ? maxTick - 79226673515401279992447579055n
-        : 79226673515401279992447579055n - maxTick;
-      expect(diff).toBeLessThanOrEqual(6n); // Exact known boundary numerical difference of 6 units reported
+      expect(maxTick).toBe(79226673515401279992447579055n);
     });
 
     it('Single-tick exact output matches concentrated liquidity formula in both directions', () => {
@@ -237,6 +258,116 @@ describe('Phase 1.1 Final Gate: Independent Quote Parity & State Invariants', ()
 
       const crossedQuote = adapter.quoteExactInput(poolNarrow, CANONICAL_USDC_MINT, 500000000n);
       expect(crossedQuote).toBeNull();
+    });
+
+    it('Multi-tick quoting successfully traverses tick boundaries for $25, $50, $100, $250, $500, $1000 probes when tick arrays are loaded', () => {
+      // Build 3 consecutive tick arrays around active tick -25068 (spacing 4 -> delta 352)
+      // Ticks: [-25344, -24992, -24640]
+      const createMockTickArray = (startTickIndex: number): any => {
+        const ticks = [];
+        for (let i = 0; i < 88; i++) {
+          ticks.push({
+            initialized: i % 4 === 0, // regular initialized tick boundaries
+            liquidityNet: 0n,
+            liquidityGross: i % 4 === 0 ? 500000000000000n : 0n,
+            feeGrowthOutsideA: 0n,
+            feeGrowthOutsideB: 0n,
+            rewardGrowthsOutside: [0n, 0n, 0n]
+          });
+        }
+        return { startTickIndex, ticks };
+      };
+
+      const tickArraysMap: Record<number, any> = {
+        [-25344]: createMockTickArray(-25344),
+        [-24992]: createMockTickArray(-24992),
+        [-24640]: createMockTickArray(-24640),
+        [-25696]: createMockTickArray(-25696),
+        [-26048]: createMockTickArray(-26048)
+      };
+
+      const multiTickPool: PoolState = {
+        id: 'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE',
+        dex: 'ORCA_WHIRLPOOL',
+        programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        tokenADecimals: 9,
+        tokenBDecimals: 6,
+        reserveA: 0n,
+        reserveB: 0n,
+        feeBps: 4,
+        slot: 468700000,
+        receivedAt: Date.now(),
+        liquidityUsd: 50000000,
+        feedHealth: 'HEALTHY',
+        extraData: {
+          tickCurrent: -25068,
+          tickSpacing: 4,
+          feeRate: 400,
+          feeRateRaw: 400,
+          protocolFeeRate: 1300,
+          feeTierIndexSeed: [4, 0],
+          sqrtPrice: '5267498573947197513',
+          liquidity: '465467525220858',
+          tickArrays: tickArraysMap
+        }
+      };
+
+      // Test configured probe sizes: $25, $50, $100, $250, $500, $1000 in both directions
+      const probeSizesUSDC = [25, 50, 100, 250, 500, 1000];
+
+      // Direction 1: USDC -> WSOL
+      for (const size of probeSizesUSDC) {
+        const inAmount = BigInt(size * 1e6);
+        const quote = adapter.quoteExactInput(multiTickPool, CANONICAL_USDC_MINT, inAmount);
+        expect(quote).not.toBeNull();
+        expect(quote!.outAmount).toBeGreaterThan(0n);
+        expect(quote!.feeAmount).toBe((inAmount * 400n) / 1000000n);
+        expect(quote!.quoteSource).toBe('DIRECT_POOL');
+        expect(quote!.executionType).toBe('POTENTIAL_ATOMIC');
+      }
+
+      // Direction 2: WSOL -> USDC
+      for (const size of probeSizesUSDC) {
+        const solLamports = BigInt(Math.floor((size / 160) * 1e9));
+        const quote = adapter.quoteExactInput(multiTickPool, CANONICAL_WSOL_MINT, solLamports);
+        expect(quote).not.toBeNull();
+        expect(quote!.outAmount).toBeGreaterThan(0n);
+        expect(quote!.feeAmount).toBe((solLamports * 400n) / 1000000n);
+        expect(quote!.quoteSource).toBe('DIRECT_POOL');
+        expect(quote!.executionType).toBe('POTENTIAL_ATOMIC');
+      }
+    });
+
+    it('Rejects invalid input mint with INVALID_MINT failure reason', () => {
+      const pool: PoolState = {
+        id: 'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE',
+        dex: 'ORCA_WHIRLPOOL',
+        programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        tokenADecimals: 9,
+        tokenBDecimals: 6,
+        reserveA: 0n,
+        reserveB: 0n,
+        feeBps: 4,
+        slot: 468550000,
+        receivedAt: Date.now(),
+        liquidityUsd: 10000,
+        feedHealth: 'HEALTHY',
+        extraData: {
+          tickCurrent: -24988,
+          tickSpacing: 4,
+          feeRateRaw: 400,
+          sqrtPrice: '5288671865725992663',
+          liquidity: '100000000'
+        }
+      };
+
+      const invalidQuote = adapter.quoteExactInput(pool, 'InvalidMint1111111111111111111111111111111111', 1000000n);
+      expect(invalidQuote).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('INVALID_MINT');
     });
   });
 

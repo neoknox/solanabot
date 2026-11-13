@@ -1,11 +1,17 @@
 import { PublicKey } from '@solana/web3.js';
 import { DexAdapter } from './types.js';
-import { DexType, PoolState, SwapQuote } from '../types/index.js';
+import { DexType, PoolState, SwapQuote, RejectionReasonCode } from '../types/index.js';
 import { KNOWN_PROGRAM_IDS, CANONICAL_WSOL_MINT, CANONICAL_USDC_MINT, getKnownTokenDecimals } from '../config/index.js';
 
 export class RaydiumAmmAdapter implements DexAdapter {
   public readonly dex: DexType = 'RAYDIUM_AMM';
   public readonly programId: string = KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4;
+
+  private lastFailureReason: RejectionReasonCode | null = null;
+
+  public getLastFailureReason(): RejectionReasonCode | null {
+    return this.lastFailureReason;
+  }
 
   public decodePoolState(data: Buffer, poolId: string, slot: number): PoolState | null {
     if (data.length < 752) return null;
@@ -68,25 +74,46 @@ export class RaydiumAmmAdapter implements DexAdapter {
     inputMint: string,
     amountIn: bigint
   ): SwapQuote | null {
-    if (amountIn <= 0n) return null;
-    if (!pool.receivedAt || pool.receivedAt <= 0) return null;
+    if (amountIn <= 0n) {
+      this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+      return null;
+    }
+    if (!pool.receivedAt || pool.receivedAt <= 0) {
+      this.lastFailureReason = 'STALE_QUOTE';
+      return null;
+    }
+
+    // Exact input mint validation: Must reject input mints other than the pool's two verified mints
+    if (inputMint !== pool.tokenAMint && inputMint !== pool.tokenBMint) {
+      this.lastFailureReason = 'INVALID_MINT';
+      return null;
+    }
 
     const rawReserveA = pool.reserveA ?? 0n;
     const rawReserveB = pool.reserveB ?? 0n;
-    if (rawReserveA <= 0n || rawReserveB <= 0n) return null;
+    if (rawReserveA <= 0n || rawReserveB <= 0n) {
+      this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+      return null;
+    }
 
     const extra = pool.extraData as {
+      openOrders?: string;
       baseNeedTakePnl?: string;
       quoteNeedTakePnl?: string;
       openOrdersVerified?: boolean;
       openOrdersBaseTokenTotal?: string;
       openOrdersQuoteTokenTotal?: string;
+      swapFeeNumerator?: string;
+      swapFeeDenominator?: string;
+      unverifiedReason?: string;
     } | undefined;
 
     const basePnl = BigInt(extra?.baseNeedTakePnl || '0');
     const quotePnl = BigInt(extra?.quoteNeedTakePnl || '0');
     const openOrdersBase = BigInt(extra?.openOrdersBaseTokenTotal || '0');
     const openOrdersQuote = BigInt(extra?.openOrdersQuoteTokenTotal || '0');
+
+    // OpenOrders verification check: pool must be verified by OpenOrders audit
     const isOpenOrdersVerified = extra?.openOrdersVerified === true;
 
     // Classic Raydium V4 reserve formula verified against official Raydium SDK source:
@@ -95,30 +122,47 @@ export class RaydiumAmmAdapter implements DexAdapter {
     const totalRawB = rawReserveB + openOrdersQuote;
     const reserveA = totalRawA > basePnl ? totalRawA - basePnl : 0n;
     const reserveB = totalRawB > quotePnl ? totalRawB - quotePnl : 0n;
-    if (reserveA <= 0n || reserveB <= 0n) return null;
+    if (reserveA <= 0n || reserveB <= 0n) {
+      this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+      return null;
+    }
 
     const isInputA = inputMint === pool.tokenAMint;
     const reserveIn = isInputA ? reserveA : reserveB;
     const reserveOut = isInputA ? reserveB : reserveA;
     const outputMint = isInputA ? pool.tokenBMint : pool.tokenAMint;
 
-    const feeNumerator = BigInt(pool.feeBps);
-    const feeDenominator = 10000n;
-    const feeDeduction = (amountIn * feeNumerator) / feeDenominator;
+    // Use on-chain swapFeeNumerator and swapFeeDenominator as full BigInt rational values,
+    // avoiding feeBps truncation and matching on-chain program/SDK math exactly.
+    const swapFeeNumerator = extra?.swapFeeNumerator ? BigInt(extra.swapFeeNumerator) : BigInt(pool.feeBps);
+    const swapFeeDenominator = extra?.swapFeeDenominator ? BigInt(extra.swapFeeDenominator) : 10000n;
+    if (swapFeeDenominator <= 0n) {
+      this.lastFailureReason = 'QUOTE_UNVERIFIED';
+      return null;
+    }
+
+    const feeDeduction = (amountIn * swapFeeNumerator) / swapFeeDenominator;
     const amountInAfterFee = amountIn - feeDeduction;
 
-    if (amountInAfterFee <= 0n) return null;
+    if (amountInAfterFee <= 0n) {
+      this.lastFailureReason = 'EXCESSIVE_PRICE_IMPACT';
+      return null;
+    }
 
     // Standard constant product AMM formula: amountOut = (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee)
     const numerator = reserveOut * amountInAfterFee;
     const denominator = reserveIn + amountInAfterFee;
     const amountOut = numerator / denominator;
 
-    if (amountOut <= 0n || amountOut >= reserveOut) return null;
+    if (amountOut <= 0n || amountOut >= reserveOut) {
+      this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+      return null;
+    }
 
     // Exact price impact: (amountInWithFee * 10000) / (reserveIn + amountInWithFee)
     const priceImpactBps = Number((amountInAfterFee * 10000n) / denominator);
 
+    this.lastFailureReason = null;
     const quote: SwapQuote = {
       quoteSource: isOpenOrdersVerified ? 'DIRECT_POOL' : 'UNVERIFIED',
       poolId: pool.id,
@@ -137,7 +181,7 @@ export class RaydiumAmmAdapter implements DexAdapter {
 
     if (!isOpenOrdersVerified) {
       (quote as any).isUnverified = true;
-      (quote as any).unverifiedReason = (extra as any)?.unverifiedReason || 'BLOCKED_RPC_TIMEOUT';
+      (quote as any).unverifiedReason = extra?.unverifiedReason || 'BLOCKED_RPC_TIMEOUT';
     }
 
     return quote;

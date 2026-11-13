@@ -11,7 +11,12 @@ export function getQuoteRelevantSignature(state: PoolState): string {
   const extra = (state.extraData || {}) as any;
   const basePart = `rA:${state.reserveA?.toString() ?? '0'},rB:${state.reserveB?.toString() ?? '0'},fee:${state.feeBps}`;
   if (state.dex === 'ORCA_WHIRLPOOL') {
-    return `${basePart},p:${extra.sqrtPrice ?? '0'},t:${extra.tickCurrent ?? '0'},L:${extra.liquidity ?? '0'},ts:${extra.tickSpacing ?? '0'}`;
+    const tickArrayKeys = extra.tickArrays
+      ? (extra.tickArrays instanceof Map
+          ? Array.from(extra.tickArrays.keys()).sort((a, b) => Number(a) - Number(b)).join(';')
+          : Object.keys(extra.tickArrays).sort().join(';'))
+      : '';
+    return `${basePart},p:${extra.sqrtPrice ?? '0'},t:${extra.tickCurrent ?? '0'},L:${extra.liquidity ?? '0'},ts:${extra.tickSpacing ?? '0'},ta:${tickArrayKeys}`;
   }
   if (state.dex === 'RAYDIUM_AMM') {
     return `${basePart},ooB:${extra.openOrdersBaseTokenTotal ?? '0'},ooQ:${extra.openOrdersQuoteTokenTotal ?? '0'},ooSlot:${extra.openOrdersSlot ?? '0'},vASlot:${extra.vaultASlot ?? '0'},vBSlot:${extra.vaultBSlot ?? '0'}`;

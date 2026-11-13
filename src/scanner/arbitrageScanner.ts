@@ -28,6 +28,8 @@ import { TradeSizer, QuoterLeg } from '../profit/tradeSizer.js';
 import { CompetitorAnalyzer } from '../competition/analyzer.js';
 import { CompetitionScorer } from '../profit/competitionScorer.js';
 import { OpportunityTracker } from './opportunityTracker.js';
+import { deriveTickArrayPda, decodeTickArrayAccount, getSurroundingTickArrayStartIndices } from '../dex/orcaTickArray.js';
+import { KNOWN_PROGRAM_IDS } from '../config/index.js';
 
 export type CandidateListener = (candidate: ArbitrageCandidate) => void;
 
@@ -59,6 +61,7 @@ export class ArbitrageScanner {
   private candidateListeners: CandidateListener[] = [];
   private vaultToPool = new Map<string, { poolId: string; isA: boolean }>();
   private openOrdersToPool = new Map<string, string>();
+  private tickArrayToPool = new Map<string, { poolId: string; startTickIndex: number }>();
 
   private qualifiedCount = 0;
   private rejectedCount = 0;
@@ -225,6 +228,8 @@ export class ArbitrageScanner {
           this.processVaultAccountUpdate(update);
         } else if (update.type === 'OPENORDERS_ACCOUNT') {
           this.processOpenOrdersAccountUpdate(update);
+        } else if (update.type === 'TICK_ARRAY_ACCOUNT') {
+          this.processTickArrayAccountUpdate(update);
         }
       }
     } finally {
@@ -266,6 +271,14 @@ export class ArbitrageScanner {
       if (existing) {
         if (decoded.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) decoded.reserveA = existing.reserveA;
         if (decoded.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) decoded.reserveB = existing.reserveB;
+
+        if (decoded.dex === 'ORCA_WHIRLPOOL' && existing.extraData && decoded.extraData) {
+          const oldExtra = existing.extraData as any;
+          const newExtra = decoded.extraData as any;
+          if (oldExtra.tickArrays) {
+            newExtra.tickArrays = oldExtra.tickArrays;
+          }
+        }
 
         if (decoded.dex === 'RAYDIUM_AMM' && existing.extraData && decoded.extraData) {
           const oldExtra = existing.extraData as any;
@@ -431,6 +444,25 @@ export class ArbitrageScanner {
     }
   }
 
+  private processTickArrayAccountUpdate(update: QueuedAccountUpdate): void {
+    const mapping = this.tickArrayToPool.get(update.key);
+    if (!mapping) return;
+
+    const pool = this.stateCache.getPoolState(mapping.poolId);
+    if (!pool || pool.dex !== 'ORCA_WHIRLPOOL') return;
+
+    const decoded = decodeTickArrayAccount(update.data, mapping.poolId);
+    if (!decoded) return;
+
+    const extra = (pool.extraData || {}) as any;
+    if (!extra.tickArrays) extra.tickArrays = {};
+    extra.tickArrays[mapping.startTickIndex] = decoded;
+    pool.slot = update.slot;
+    pool.receivedAt = update.receivedAtMs;
+    this.stateCache.setPoolState(pool);
+    this.evaluateAffectedRoutes(mapping.poolId, update.monotonicReceiptTime);
+  }
+
   private lastReconfirmationTime = new Map<string, number>();
 
   public async reconfirmOpenOrders(poolId: string): Promise<boolean> {
@@ -569,7 +601,8 @@ export class ArbitrageScanner {
     const extra = (pool.extraData || {}) as any;
     const rev = pool.stateRevision || 1;
     if (pool.dex === 'ORCA_WHIRLPOOL') {
-      return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}:p${extra.sqrtPrice || 0}:t${extra.tickCurrent || 0}:L${extra.liquidity || 0}`;
+      const taKeys = extra.tickArrays ? Object.keys(extra.tickArrays).sort().join(',') : 'none';
+      return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}:p${extra.sqrtPrice || 0}:t${extra.tickCurrent || 0}:L${extra.liquidity || 0}:ta${taKeys}`;
     }
     if (pool.dex === 'RAYDIUM_AMM') {
       return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}:ooB${extra.openOrdersBaseTokenTotal || 0}:ooQ${extra.openOrdersQuoteTokenTotal || 0}:ooSlot${extra.openOrdersSlot || 0}:vA${extra.vaultASlot || 0}:vB${extra.vaultBSlot || 0}`;
@@ -1092,6 +1125,71 @@ export class ArbitrageScanner {
         }
       }
 
+      // Step 4: Batch fetch and subscribe to nearby initialized TickArrays for Orca Whirlpool pools
+      const tickArraysToFetch: { pda: PublicKey; poolIndex: number; startTickIndex: number; poolId: string }[] = [];
+      for (let pIdx = 0; pIdx < decodedPools.length; pIdx++) {
+        const pool = decodedPools[pIdx];
+        if (pool.dex === 'ORCA_WHIRLPOOL') {
+          const extra = (pool.extraData || {}) as any;
+          const tickSpacing = extra.tickSpacing || 1;
+          const tickCurrent = extra.tickCurrent;
+          if (tickCurrent !== undefined) {
+            if (!extra.tickArrays) extra.tickArrays = {};
+            const surroundingStarts = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+            for (const startIdx of surroundingStarts) {
+              const pda = deriveTickArrayPda(pool.id, startIdx);
+              const pdaStr = pda.toBase58();
+              if (!this.tickArrayToPool.has(pdaStr)) {
+                this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx });
+                this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
+                  this.enqueueUpdate({
+                    type: 'TICK_ARRAY_ACCOUNT',
+                    key: pdaStr,
+                    data: buf,
+                    slot: s,
+                    receivedAtMs: rxTime || Date.now(),
+                    monotonicReceiptTime: monoTime || performance.now()
+                  });
+                });
+              }
+              tickArraysToFetch.push({ pda, poolIndex: pIdx, startTickIndex: startIdx, poolId: pool.id });
+            }
+          }
+        }
+      }
+
+      if (tickArraysToFetch.length > 0) {
+        try {
+          const tRpcStart = performance.now();
+          const tRpcRes = await this.rpc.getMultipleAccountsAndContext(tickArraysToFetch.map(t => t.pda));
+          this.latencyTracker.recordRpcLatency(performance.now() - tRpcStart);
+          const tSlot = tRpcRes.slot;
+          const tAccounts = tRpcRes.value;
+
+          for (let i = 0; i < tickArraysToFetch.length; i++) {
+            const item = tickArraysToFetch[i];
+            const acc = tAccounts[i];
+            const pool = decodedPools[item.poolIndex];
+            if (!pool || !acc || !acc.data) continue;
+
+            const ownerStr = acc.owner ? acc.owner.toBase58() : '';
+            if (ownerStr && ownerStr !== KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL) {
+              continue;
+            }
+
+            const decodedArray = decodeTickArrayAccount(acc.data, item.poolId);
+            if (decodedArray) {
+              const extra = (pool.extraData || {}) as any;
+              if (!extra.tickArrays) extra.tickArrays = {};
+              extra.tickArrays[item.startTickIndex] = decodedArray;
+              pool.slot = Math.max(pool.slot, tSlot);
+            }
+          }
+        } catch {
+          // Bounded timeout: continue without blocking
+        }
+      }
+
       for (const pool of decodedPools) {
         pool.receivedAt = Date.now();
         const existing = this.stateCache.getPoolState(pool.id);
@@ -1196,6 +1294,10 @@ export class ArbitrageScanner {
 
   public getRouteIndex(): RouteIndex {
     return this.routeIndex;
+  }
+
+  public getStateCache(): StateCache {
+    return this.stateCache;
   }
 
   public getPoolRegistry(): PoolRegistry {
