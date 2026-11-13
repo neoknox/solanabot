@@ -920,7 +920,7 @@ export class ArbitrageScanner {
         const direction = legDef.inputMint === pool.tokenAMint ? 'A_TO_B' : 'B_TO_A';
         const requiredStarts = getRequiredTickArrayStartIndices(tickCurrent, tickSpacing, direction);
         const tickArrays = extra?.tickArrays;
-        if (!tickArrays) {
+        if (!tickArrays || !extra?.tickArrayReceivedAt || !extra?.tickArraySlots) {
           this.rejectedCount++;
           this.auditMetrics.rejectedRoutes++;
           this.rejectionBreakdown['MISSING_TICK_DATA'] = (this.rejectionBreakdown['MISSING_TICK_DATA'] || 0) + 1;

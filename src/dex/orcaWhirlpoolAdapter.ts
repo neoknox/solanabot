@@ -167,27 +167,31 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
         return null;
       }
 
-      // Independent Freshness: Validate observation freshness of required tick arrays
-      const now = Date.now();
-      const ttl = (extra as any)?.observationFreshnessTtlMs || 30000;
+      // When tick arrays are loaded, require both tickArrayReceivedAt and tickArraySlots
       const arrayTimestamps = (extra as any)?.tickArrayReceivedAt;
       const arraySlots = (extra as any)?.tickArraySlots;
-      if (arrayTimestamps || arraySlots) {
-        for (const idx of requiredStartIndices) {
-          const t = arrayTimestamps?.[idx];
-          const s = arraySlots?.[idx];
-          if (!t || t <= 0 || !s || s <= 0) {
-            this.lastFailureReason = 'MISSING_TICK_DATA';
-            return null;
-          }
-          if (t > now + 5000 || now - t > ttl) {
-            this.lastFailureReason = 'STALE_QUOTE';
-            return null;
-          }
-          if (pool.slot && s && Math.abs(pool.slot - s) > 100) {
-            this.lastFailureReason = 'SLOT_MISMATCH';
-            return null;
-          }
+      if (!arrayTimestamps || !arraySlots) {
+        this.lastFailureReason = 'MISSING_TICK_DATA';
+        return null;
+      }
+
+      // Independent Freshness: Validate observation freshness of every required tick array
+      const now = Date.now();
+      const ttl = (extra as any)?.observationFreshnessTtlMs || 30000;
+      for (const idx of requiredStartIndices) {
+        const t = arrayTimestamps[idx];
+        const s = arraySlots[idx];
+        if (!t || t <= 0 || !s || s <= 0) {
+          this.lastFailureReason = 'MISSING_TICK_DATA';
+          return null;
+        }
+        if (t > now + 5000 || now - t > ttl) {
+          this.lastFailureReason = 'STALE_QUOTE';
+          return null;
+        }
+        if (pool.slot && s && Math.abs(pool.slot - s) > 100) {
+          this.lastFailureReason = 'SLOT_MISMATCH';
+          return null;
         }
       }
 

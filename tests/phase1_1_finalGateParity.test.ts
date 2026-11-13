@@ -310,7 +310,21 @@ describe('Phase 1.1 Final Gate: Independent Quote Parity & State Invariants', ()
           feeTierIndexSeed: [4, 0],
           sqrtPrice: '5267498573947197513',
           liquidity: '465467525220858',
-          tickArrays: tickArraysMap
+          tickArrays: tickArraysMap,
+          tickArrayReceivedAt: {
+            [-25344]: Date.now(),
+            [-24992]: Date.now(),
+            [-24640]: Date.now(),
+            [-25696]: Date.now(),
+            [-26048]: Date.now()
+          },
+          tickArraySlots: {
+            [-25344]: 468700000,
+            [-24992]: 468700000,
+            [-24640]: 468700000,
+            [-25696]: 468700000,
+            [-26048]: 468700000
+          }
         }
       };
 

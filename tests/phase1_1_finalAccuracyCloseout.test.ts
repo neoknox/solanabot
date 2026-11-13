@@ -106,7 +106,21 @@ describe('Phase 1.1 Final Accuracy Closeout: Orca Multi-Tick Parity, Fingerprint
           sqrtPrice: sqrtPrice.toString(),
           liquidity: '50000000000', // Shallow liquidity
           maxPriceImpactBps: 200,
-          tickArrays: tickArraysMap
+          tickArrays: tickArraysMap,
+          tickArrayReceivedAt: {
+            [-25344]: Date.now(),
+            [-24992]: Date.now(),
+            [-24640]: Date.now(),
+            [-25696]: Date.now(),
+            [-26048]: Date.now()
+          },
+          tickArraySlots: {
+            [-25344]: 1000,
+            [-24992]: 1000,
+            [-24640]: 1000,
+            [-25696]: 1000,
+            [-26048]: 1000
+          }
         }
       };
 
@@ -152,6 +166,18 @@ describe('Phase 1.1 Final Accuracy Closeout: Orca Multi-Tick Parity, Fingerprint
             [-25344]: createTickArrayWithTicks(-25344, {}),
             [-24992]: createTickArrayWithTicks(-24992, {}),
             [-24640]: createTickArrayWithTicks(-24640, {})
+          },
+          tickArrayReceivedAt: {
+            [-25696]: Date.now(),
+            [-25344]: Date.now(),
+            [-24992]: Date.now(),
+            [-24640]: Date.now()
+          },
+          tickArraySlots: {
+            [-25696]: 1000,
+            [-25344]: 1000,
+            [-24992]: 1000,
+            [-24640]: 1000
           }
         }
       };
@@ -455,7 +481,21 @@ describe('Phase 1.1 Final Accuracy Closeout: Orca Multi-Tick Parity, Fingerprint
         feeTierIndexSeed: [4, 0],
         sqrtPrice: sqrtPrice.toString(),
         liquidity: deepLiquidity.toString(),
-        tickArrays: tickArraysMap
+        tickArrays: tickArraysMap,
+        tickArrayReceivedAt: {
+          [-26048]: Date.now(),
+          [-25696]: Date.now(),
+          [-25344]: Date.now(),
+          [-24992]: Date.now(),
+          [-24640]: Date.now()
+        },
+        tickArraySlots: {
+          [-26048]: 468700000,
+          [-25696]: 468700000,
+          [-25344]: 468700000,
+          [-24992]: 468700000,
+          [-24640]: 468700000
+        }
       }
     };
 
