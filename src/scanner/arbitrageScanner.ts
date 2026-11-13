@@ -244,8 +244,19 @@ export class ArbitrageScanner {
   }
 
   private processPoolAccountUpdate(update: QueuedAccountUpdate): void {
+    const now = Date.now();
+    if (!update.slot || update.slot <= 0 || !update.receivedAtMs || update.receivedAtMs > now + 5000) {
+      return;
+    }
+
     const poolConfig = this.poolRegistry.getPool(update.key);
     if (!poolConfig) return;
+
+    const existing = this.stateCache.getPoolState(update.key);
+    if (existing && existing.slot > update.slot) {
+      // Reject out-of-order account updates
+      return;
+    }
 
     const adapter = dexRegistry.getAdapter(poolConfig.dex);
     if (!adapter) return;
@@ -424,6 +435,10 @@ export class ArbitrageScanner {
     if (!pool || pool.dex !== 'RAYDIUM_AMM' || !pool.extraData) return;
 
     const extra = pool.extraData as any;
+    if (extra.openOrdersSlot && update.slot < extra.openOrdersSlot) {
+      // Reject out-of-order open orders updates
+      return;
+    }
     if (update.data.length < 3228) {
       extra.openOrdersVerified = false;
       extra.unverifiedReason = 'OPENORDERS_LAYOUT_INVALID';
@@ -529,6 +544,11 @@ export class ArbitrageScanner {
           const pool = this.stateCache.getPoolState(mapping.poolId);
           if (pool) {
             const extra = (pool.extraData || {}) as any;
+            const currentVaultSlot = mapping.isA ? (extra.vaultASlot || 0) : (extra.vaultBSlot || 0);
+            if (update.slot < currentVaultSlot) {
+              // Reject out-of-order vault updates
+              return;
+            }
             if (mapping.isA) {
               pool.reserveA = rawAmount;
               extra.vaultASlot = update.slot;
@@ -579,16 +599,27 @@ export class ArbitrageScanner {
   }
 
   private processTickArrayAccountUpdate(update: QueuedAccountUpdate): void {
+    const now = Date.now();
+    if (!update.slot || update.slot <= 0 || !update.receivedAtMs || update.receivedAtMs > now + 5000) {
+      return;
+    }
+
     const mapping = this.tickArrayToPool.get(update.key);
     if (!mapping) return;
 
     const pool = this.stateCache.getPoolState(mapping.poolId);
     if (!pool || pool.dex !== 'ORCA_WHIRLPOOL') return;
 
+    const extra = (pool.extraData || {}) as any;
+    const currentArraySlot = extra.tickArraySlots?.[mapping.startTickIndex] || 0;
+    if (update.slot < currentArraySlot) {
+      // Reject out-of-order account updates
+      return;
+    }
+
     const decoded = decodeTickArrayAccount(update.data, mapping.poolId);
     if (!decoded) return;
 
-    const extra = (pool.extraData || {}) as any;
     if (!extra.tickArrays) extra.tickArrays = {};
     if (!extra.tickArraySlots) extra.tickArraySlots = {};
     if (!extra.tickArrayReceivedAt) extra.tickArrayReceivedAt = {};
@@ -785,10 +816,15 @@ export class ArbitrageScanner {
         entries.sort((a, b) => a[0] - b[0]);
         taSummary = entries.map(([startIdx, arr]) => `${startIdx}:${getTickArrayContentSignature(arr)}`).join(';');
       }
-      return `${pool.id}@s${pool.slot}:rev${rev}:p${extra.sqrtPrice || 0}:t${extra.tickCurrent || 0}:L${extra.liquidity || 0}:ta${taSummary}`;
+      const feeRate = extra.feeRate ?? extra.feeRateRaw ?? ((pool.feeBps || 0) * 100);
+      return `${pool.id}@s${pool.slot}:rev${rev}:fr${feeRate}:ts${extra.tickSpacing || 0}:p${extra.sqrtPrice || 0}:t${extra.tickCurrent || 0}:L${extra.liquidity || 0}:ta${taSummary}`;
     }
     if (pool.dex === 'RAYDIUM_AMM') {
-      return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}:ooB${extra.openOrdersBaseTokenTotal || 0}:ooQ${extra.openOrdersQuoteTokenTotal || 0}:ooSlot${extra.openOrdersSlot || 0}:vA${extra.vaultASlot || 0}:vB${extra.vaultBSlot || 0}`;
+      const sfn = extra.swapFeeNumerator ?? '25';
+      const sfd = extra.swapFeeDenominator ?? '10000';
+      const pnlA = extra.baseNeedTakePnl ?? '0';
+      const pnlB = extra.quoteNeedTakePnl ?? '0';
+      return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}:sfn${sfn}:sfd${sfd}:pnlA${pnlA}:pnlB${pnlB}:ooB${extra.openOrdersBaseTokenTotal || 0}:ooQ${extra.openOrdersQuoteTokenTotal || 0}:ooSlot${extra.openOrdersSlot || 0}:vA${extra.vaultASlot || 0}:vB${extra.vaultBSlot || 0}`;
     }
     return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}`;
   }
@@ -903,12 +939,16 @@ export class ArbitrageScanner {
             break;
           }
           const t = extra.tickArrayReceivedAt?.[startIdx];
-          if (t && (now - t > ttl)) {
+          const s = extra.tickArraySlots?.[startIdx];
+          if (!t || t <= 0 || !s || s <= 0) {
+            failCode = 'MISSING_TICK_DATA';
+            break;
+          }
+          if (t > now + 5000 || now - t > ttl) {
             failCode = 'STALE_QUOTE';
             break;
           }
-          const s = extra.tickArraySlots?.[startIdx];
-          if (s && pool.slot && Math.abs(pool.slot - s) > this.config.MAX_SLOT_GAP) {
+          if (pool.slot && Math.abs(pool.slot - s) > this.config.MAX_SLOT_GAP) {
             failCode = 'SLOT_MISMATCH';
             break;
           }

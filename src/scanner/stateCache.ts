@@ -27,10 +27,15 @@ export function getQuoteRelevantSignature(state: PoolState): string {
       entries.sort((a, b) => a[0] - b[0]);
       tickArrayContent = entries.map(([startIdx, arr]) => `${startIdx}:${getTickArrayContentSignature(arr)}`).join(';');
     }
-    return `${basePart},p:${extra.sqrtPrice ?? '0'},t:${extra.tickCurrent ?? '0'},L:${extra.liquidity ?? '0'},ts:${extra.tickSpacing ?? '0'},ta:${tickArrayContent}`;
+    const feeRate = extra.feeRate ?? extra.feeRateRaw ?? (state.feeBps * 100);
+    return `${basePart},fr:${feeRate},p:${extra.sqrtPrice ?? '0'},t:${extra.tickCurrent ?? '0'},L:${extra.liquidity ?? '0'},ts:${extra.tickSpacing ?? '0'},ta:${tickArrayContent}`;
   }
   if (state.dex === 'RAYDIUM_AMM') {
-    return `${basePart},ooB:${extra.openOrdersBaseTokenTotal ?? '0'},ooQ:${extra.openOrdersQuoteTokenTotal ?? '0'},ooSlot:${extra.openOrdersSlot ?? '0'},vASlot:${extra.vaultASlot ?? '0'},vBSlot:${extra.vaultBSlot ?? '0'}`;
+    const sfn = extra.swapFeeNumerator ?? '25';
+    const sfd = extra.swapFeeDenominator ?? '10000';
+    const pnlA = extra.baseNeedTakePnl ?? '0';
+    const pnlB = extra.quoteNeedTakePnl ?? '0';
+    return `${basePart},sfn:${sfn},sfd:${sfd},pnlA:${pnlA},pnlB:${pnlB},ooB:${extra.openOrdersBaseTokenTotal ?? '0'},ooQ:${extra.openOrdersQuoteTokenTotal ?? '0'},ooSlot:${extra.openOrdersSlot ?? '0'},vASlot:${extra.vaultASlot ?? '0'},vBSlot:${extra.vaultBSlot ?? '0'}`;
   }
   return `${basePart},extra:${JSON.stringify(extra)}`;
 }
