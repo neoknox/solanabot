@@ -9,6 +9,7 @@
     "test:watch": "vitest",
     "scanner": "tsx src/cli/index.ts",
     "scanner:smoke": "tsx src/cli/smokeTest.ts",
+    "discover:pools": "tsx src/cli/discoverPools.ts",
     "report": "tsx src/cli/report.ts",
     "export:csv": "tsx src/cli/exportCsv.ts",
     "build": "tsc"
