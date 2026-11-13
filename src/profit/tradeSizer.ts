@@ -114,6 +114,14 @@ export class TradeSizer {
         break;
       }
 
+      if (q.priceImpactBps > this.config.MAX_PRICE_IMPACT_BPS) {
+        expectedFailedReason = 'EXCESSIVE_PRICE_IMPACT';
+        if (leg.pool.dex === 'ORCA_WHIRLPOOL') {
+          this.orcaOtherFailureAttempts++;
+        }
+        break;
+      }
+
       expectedQuotes.push(q);
       currentExpectedUnits = q.outAmount;
     }
@@ -175,6 +183,14 @@ export class TradeSizer {
           } else {
             this.orcaOtherFailureAttempts++;
           }
+        }
+        break;
+      }
+
+      if (q.priceImpactBps > this.config.MAX_PRICE_IMPACT_BPS) {
+        conservativeFailedReason = 'EXCESSIVE_PRICE_IMPACT';
+        if (leg.pool.dex === 'ORCA_WHIRLPOOL') {
+          this.orcaOtherFailureAttempts++;
         }
         break;
       }

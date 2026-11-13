@@ -28,7 +28,13 @@ import { TradeSizer, QuoterLeg } from '../profit/tradeSizer.js';
 import { CompetitorAnalyzer } from '../competition/analyzer.js';
 import { CompetitionScorer } from '../profit/competitionScorer.js';
 import { OpportunityTracker } from './opportunityTracker.js';
-import { deriveTickArrayPda, decodeTickArrayAccount, getSurroundingTickArrayStartIndices } from '../dex/orcaTickArray.js';
+import {
+  deriveTickArrayPda,
+  decodeTickArrayAccount,
+  getSurroundingTickArrayStartIndices,
+  getRequiredTickArrayStartIndices,
+  getTickArrayContentSignature
+} from '../dex/orcaTickArray.js';
 import { KNOWN_PROGRAM_IDS } from '../config/index.js';
 
 export type CandidateListener = (candidate: ArbitrageCandidate) => void;
@@ -277,6 +283,12 @@ export class ArbitrageScanner {
           if (oldExtra.tickArrays) {
             newExtra.tickArrays = oldExtra.tickArrays;
           }
+          if (oldExtra.tickArraySlots) {
+            newExtra.tickArraySlots = oldExtra.tickArraySlots;
+          }
+          if (oldExtra.tickArrayReceivedAt) {
+            newExtra.tickArrayReceivedAt = oldExtra.tickArrayReceivedAt;
+          }
         }
 
         if (decoded.dex === 'RAYDIUM_AMM' && existing.extraData && decoded.extraData) {
@@ -395,10 +407,10 @@ export class ArbitrageScanner {
         }
       }
 
-      this.stateCache.setPoolState(decoded);
+      const { hasChanged } = this.stateCache.setPoolState(decoded);
 
-      // Reevaluate only routes affected by this pool update
-      if (decoded.dex !== 'RAYDIUM_AMM' || ((decoded.reserveA ?? 0n) > 0n && (decoded.reserveB ?? 0n) > 0n)) {
+      // Reevaluate only routes affected by this pool update if quote-relevant state changed
+      if (hasChanged && (decoded.dex !== 'RAYDIUM_AMM' || ((decoded.reserveA ?? 0n) > 0n && (decoded.reserveB ?? 0n) > 0n))) {
         this.evaluateAffectedRoutes(update.key, update.monotonicReceiptTime);
       }
     }
@@ -554,10 +566,10 @@ export class ArbitrageScanner {
               }
             }
 
-            this.stateCache.setPoolState(pool);
+            const { hasChanged } = this.stateCache.setPoolState(pool);
 
-            // Reevaluate only routes affected by this vault update
-            if (pool.dex !== 'RAYDIUM_AMM' || ((pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n)) {
+            // Reevaluate only routes affected by this vault update if state changed
+            if (hasChanged && (pool.dex !== 'RAYDIUM_AMM' || ((pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n))) {
               this.evaluateAffectedRoutes(mapping.poolId, update.monotonicReceiptTime);
             }
           }
@@ -578,11 +590,20 @@ export class ArbitrageScanner {
 
     const extra = (pool.extraData || {}) as any;
     if (!extra.tickArrays) extra.tickArrays = {};
+    if (!extra.tickArraySlots) extra.tickArraySlots = {};
+    if (!extra.tickArrayReceivedAt) extra.tickArrayReceivedAt = {};
+
     extra.tickArrays[mapping.startTickIndex] = decoded;
-    pool.slot = update.slot;
-    pool.receivedAt = update.receivedAtMs;
-    this.stateCache.setPoolState(pool);
-    this.evaluateAffectedRoutes(mapping.poolId, update.monotonicReceiptTime);
+    extra.tickArraySlots[mapping.startTickIndex] = update.slot;
+    extra.tickArrayReceivedAt[mapping.startTickIndex] = update.receivedAtMs;
+
+    // Independent Freshness: Do NOT overwrite pool.slot or pool.receivedAt with tick array update!
+    // The Whirlpool's observation timestamp and slot represent the pool state itself.
+
+    const { hasChanged } = this.stateCache.setPoolState(pool);
+    if (hasChanged) {
+      this.evaluateAffectedRoutes(mapping.poolId, update.monotonicReceiptTime);
+    }
   }
 
   private lastReconfirmationTime = new Map<string, number>();
@@ -749,8 +770,22 @@ export class ArbitrageScanner {
     const extra = (pool.extraData || {}) as any;
     const rev = pool.stateRevision || 1;
     if (pool.dex === 'ORCA_WHIRLPOOL') {
-      const taKeys = extra.tickArrays ? Object.keys(extra.tickArrays).sort().join(',') : 'none';
-      return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}:p${extra.sqrtPrice || 0}:t${extra.tickCurrent || 0}:L${extra.liquidity || 0}:ta${taKeys}`;
+      let taSummary = 'none';
+      if (extra.tickArrays) {
+        const entries: [number, any][] = [];
+        if (extra.tickArrays instanceof Map) {
+          for (const [k, v] of extra.tickArrays.entries()) {
+            entries.push([Number(k), v]);
+          }
+        } else {
+          for (const [k, v] of Object.entries(extra.tickArrays)) {
+            entries.push([Number(k), v]);
+          }
+        }
+        entries.sort((a, b) => a[0] - b[0]);
+        taSummary = entries.map(([startIdx, arr]) => `${startIdx}:${getTickArrayContentSignature(arr)}`).join(';');
+      }
+      return `${pool.id}@s${pool.slot}:rev${rev}:p${extra.sqrtPrice || 0}:t${extra.tickCurrent || 0}:L${extra.liquidity || 0}:ta${taSummary}`;
     }
     if (pool.dex === 'RAYDIUM_AMM') {
       return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}:ooB${extra.openOrdersBaseTokenTotal || 0}:ooQ${extra.openOrdersQuoteTokenTotal || 0}:ooSlot${extra.openOrdersSlot || 0}:vA${extra.vaultASlot || 0}:vB${extra.vaultBSlot || 0}`;
@@ -829,6 +864,61 @@ export class ArbitrageScanner {
           this.rejectedCount++;
           this.auditMetrics.rejectedRoutes++;
           this.rejectionBreakdown['INSUFFICIENT_LIQUIDITY'] = (this.rejectionBreakdown['INSUFFICIENT_LIQUIDITY'] || 0) + 1;
+          return;
+        }
+      }
+
+      // Fail closed if Orca Whirlpool dependencies are unhydrated, missing tick arrays, or stale
+      if (pool.dex === 'ORCA_WHIRLPOOL') {
+        const extra = pool.extraData as any;
+        const tickSpacing = extra?.tickSpacing || 1;
+        const tickCurrent = extra?.tickCurrent;
+        if (tickCurrent === undefined || !extra?.sqrtPrice) {
+          this.rejectedCount++;
+          this.auditMetrics.rejectedRoutes++;
+          this.rejectionBreakdown['MISSING_TICK_DATA'] = (this.rejectionBreakdown['MISSING_TICK_DATA'] || 0) + 1;
+          this.auditMetrics.quoteValidationFailures++;
+          return;
+        }
+
+        const direction = legDef.inputMint === pool.tokenAMint ? 'A_TO_B' : 'B_TO_A';
+        const requiredStarts = getRequiredTickArrayStartIndices(tickCurrent, tickSpacing, direction);
+        const tickArrays = extra?.tickArrays;
+        if (!tickArrays) {
+          this.rejectedCount++;
+          this.auditMetrics.rejectedRoutes++;
+          this.rejectionBreakdown['MISSING_TICK_DATA'] = (this.rejectionBreakdown['MISSING_TICK_DATA'] || 0) + 1;
+          this.auditMetrics.quoteValidationFailures++;
+          return;
+        }
+
+        const now = Date.now();
+        const ttl = extra?.observationFreshnessTtlMs || this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
+        let failCode: RejectionReasonCode | null = null;
+
+        for (const startIdx of requiredStarts) {
+          const arr = tickArrays instanceof Map ? tickArrays.get(startIdx) : tickArrays[startIdx];
+          if (!arr) {
+            failCode = 'MISSING_TICK_DATA';
+            break;
+          }
+          const t = extra.tickArrayReceivedAt?.[startIdx];
+          if (t && (now - t > ttl)) {
+            failCode = 'STALE_QUOTE';
+            break;
+          }
+          const s = extra.tickArraySlots?.[startIdx];
+          if (s && pool.slot && Math.abs(pool.slot - s) > this.config.MAX_SLOT_GAP) {
+            failCode = 'SLOT_MISMATCH';
+            break;
+          }
+        }
+
+        if (failCode) {
+          this.rejectedCount++;
+          this.auditMetrics.rejectedRoutes++;
+          this.rejectionBreakdown[failCode] = (this.rejectionBreakdown[failCode] || 0) + 1;
+          this.auditMetrics.quoteValidationFailures++;
           return;
         }
       }
@@ -1355,8 +1445,11 @@ export class ArbitrageScanner {
             if (decodedArray) {
               const extra = (pool.extraData || {}) as any;
               if (!extra.tickArrays) extra.tickArrays = {};
+              if (!extra.tickArraySlots) extra.tickArraySlots = {};
+              if (!extra.tickArrayReceivedAt) extra.tickArrayReceivedAt = {};
               extra.tickArrays[item.startTickIndex] = decodedArray;
-              pool.slot = Math.max(pool.slot, tSlot);
+              extra.tickArraySlots[item.startTickIndex] = tSlot;
+              extra.tickArrayReceivedAt[item.startTickIndex] = Date.now();
             }
           }
         } catch {

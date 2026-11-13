@@ -129,3 +129,20 @@ export function getSurroundingTickArrayStartIndices(
     start + 2 * delta
   ];
 }
+
+/**
+ * Computes a deterministic content-based signature of a TickArray's quote-relevant state:
+ * initialized tick states, liquidityNet, and liquidityGross across all active ticks.
+ */
+export function getTickArrayContentSignature(array: TickArrayFacade): string {
+  if (!array || !array.ticks) return 'empty';
+  const parts: string[] = [];
+  for (let i = 0; i < array.ticks.length; i++) {
+    const t = array.ticks[i];
+    if (t.initialized || t.liquidityGross > 0n || t.liquidityNet !== 0n) {
+      parts.push(`${i}:${t.initialized ? 1 : 0}:${t.liquidityNet.toString()}:${t.liquidityGross.toString()}`);
+    }
+  }
+  return parts.length > 0 ? parts.join('|') : 'uninit';
+}
+

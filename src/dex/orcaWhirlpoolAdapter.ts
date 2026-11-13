@@ -162,11 +162,28 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
 
     if (loadedTickArrays) {
       hasAllRequiredArrays = requiredStartIndices.every(idx => !!getTickArray(idx));
-      if (hasAllRequiredArrays) {
+      if (!hasAllRequiredArrays) {
+        this.lastFailureReason = 'MISSING_TICK_DATA';
+        return null;
+      }
+
+      // Independent Freshness: Validate observation freshness of required tick arrays
+      const now = Date.now();
+      const ttl = (extra as any)?.observationFreshnessTtlMs || 30000;
+      const arrayTimestamps = (extra as any)?.tickArrayReceivedAt;
+      if (arrayTimestamps) {
         for (const idx of requiredStartIndices) {
-          const arr = getTickArray(idx);
-          if (arr) sequenceArrays.push(arr);
+          const t = arrayTimestamps[idx];
+          if (!t || (now - t > ttl)) {
+            this.lastFailureReason = 'STALE_QUOTE';
+            return null;
+          }
         }
+      }
+
+      for (const idx of requiredStartIndices) {
+        const arr = getTickArray(idx);
+        if (arr) sequenceArrays.push(arr);
       }
     }
 
@@ -206,6 +223,39 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
           return null;
         }
 
+        // Protocol-correct effective price impact calculation:
+        // Compares post-fee actual output against instantaneous marginal output at starting spot price.
+        const netAmountIn = amountIn - quoteRes.tradeFee;
+        let priceImpactBps = 0;
+        if (netAmountIn > 0n && sqrtPrice > 0n) {
+          const Q128 = 1n << 128n;
+          let idealOut = 0n;
+          if (isInputA) {
+            // Token A -> Token B: idealOut = (netAmountIn * sqrtPrice^2) / 2^128
+            idealOut = (netAmountIn * sqrtPrice * sqrtPrice) / Q128;
+          } else {
+            // Token B -> Token A: idealOut = (netAmountIn * 2^128) / (sqrtPrice^2)
+            idealOut = (netAmountIn * Q128) / (sqrtPrice * sqrtPrice);
+          }
+
+          if (idealOut > 0n) {
+            const diff = idealOut > quoteRes.tokenEstOut ? idealOut - quoteRes.tokenEstOut : 0n;
+            priceImpactBps = Number((diff * 10000n) / idealOut);
+          } else {
+            this.lastFailureReason = 'EXCESSIVE_PRICE_IMPACT';
+            return null;
+          }
+        } else {
+          this.lastFailureReason = 'EXCESSIVE_PRICE_IMPACT';
+          return null;
+        }
+
+        const maxPriceImpactBps = (extra as any)?.maxPriceImpactBps ?? 200;
+        if (priceImpactBps > maxPriceImpactBps) {
+          this.lastFailureReason = 'EXCESSIVE_PRICE_IMPACT';
+          return null;
+        }
+
         this.lastFailureReason = null;
         return {
           quoteSource: 'DIRECT_POOL',
@@ -217,7 +267,7 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
           outAmount: quoteRes.tokenEstOut,
           feeIncluded: true,
           feeAmount: quoteRes.tradeFee,
-          priceImpactBps: 0,
+          priceImpactBps,
           slot: pool.slot,
           timestamp: pool.receivedAt,
           executionType: 'POTENTIAL_ATOMIC'
@@ -321,6 +371,12 @@ export class OrcaWhirlpoolAdapter implements DexAdapter {
 
     if (amountOut <= 0n) {
       this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+      return null;
+    }
+
+    const maxPriceImpactBps = (extra as any)?.maxPriceImpactBps ?? 200;
+    if (priceImpactBps > maxPriceImpactBps) {
+      this.lastFailureReason = 'EXCESSIVE_PRICE_IMPACT';
       return null;
     }
 

@@ -1,4 +1,5 @@
 import { PoolState, FeedHealth } from '../types/index.js';
+import { getTickArrayContentSignature } from '../dex/orcaTickArray.js';
 
 export interface DedupeKey {
   route: string;
@@ -11,12 +12,22 @@ export function getQuoteRelevantSignature(state: PoolState): string {
   const extra = (state.extraData || {}) as any;
   const basePart = `rA:${state.reserveA?.toString() ?? '0'},rB:${state.reserveB?.toString() ?? '0'},fee:${state.feeBps}`;
   if (state.dex === 'ORCA_WHIRLPOOL') {
-    const tickArrayKeys = extra.tickArrays
-      ? (extra.tickArrays instanceof Map
-          ? Array.from(extra.tickArrays.keys()).sort((a, b) => Number(a) - Number(b)).join(';')
-          : Object.keys(extra.tickArrays).sort().join(';'))
-      : '';
-    return `${basePart},p:${extra.sqrtPrice ?? '0'},t:${extra.tickCurrent ?? '0'},L:${extra.liquidity ?? '0'},ts:${extra.tickSpacing ?? '0'},ta:${tickArrayKeys}`;
+    let tickArrayContent = '';
+    if (extra.tickArrays) {
+      const entries: [number, any][] = [];
+      if (extra.tickArrays instanceof Map) {
+        for (const [k, v] of extra.tickArrays.entries()) {
+          entries.push([Number(k), v]);
+        }
+      } else {
+        for (const [k, v] of Object.entries(extra.tickArrays)) {
+          entries.push([Number(k), v]);
+        }
+      }
+      entries.sort((a, b) => a[0] - b[0]);
+      tickArrayContent = entries.map(([startIdx, arr]) => `${startIdx}:${getTickArrayContentSignature(arr)}`).join(';');
+    }
+    return `${basePart},p:${extra.sqrtPrice ?? '0'},t:${extra.tickCurrent ?? '0'},L:${extra.liquidity ?? '0'},ts:${extra.tickSpacing ?? '0'},ta:${tickArrayContent}`;
   }
   if (state.dex === 'RAYDIUM_AMM') {
     return `${basePart},ooB:${extra.openOrdersBaseTokenTotal ?? '0'},ooQ:${extra.openOrdersQuoteTokenTotal ?? '0'},ooSlot:${extra.openOrdersSlot ?? '0'},vASlot:${extra.vaultASlot ?? '0'},vBSlot:${extra.vaultBSlot ?? '0'}`;
@@ -31,22 +42,25 @@ export class StateCache {
   private lastQuoteStateSignatures = new Map<string, string>();
   private readonly dedupeWindowMs = 5000;
 
-  public setPoolState(state: PoolState): void {
+  public setPoolState(state: PoolState): { hasChanged: boolean; stateRevision: number } {
     const existing = this.poolStates.get(state.id);
     const newSig = getQuoteRelevantSignature(state);
     const prevSig = this.lastQuoteStateSignatures.get(state.id);
 
+    let hasChanged = false;
     let rev = this.poolRevisions.get(state.id) || 1;
     if (!existing || prevSig !== newSig) {
       if (existing) {
         rev = rev + 1;
       }
+      hasChanged = true;
       this.poolRevisions.set(state.id, rev);
       this.lastQuoteStateSignatures.set(state.id, newSig);
     }
 
     state.stateRevision = rev;
     this.poolStates.set(state.id, state);
+    return { hasChanged, stateRevision: rev };
   }
 
   public getPoolState(poolId: string): PoolState | undefined {
