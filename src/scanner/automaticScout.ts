@@ -57,6 +57,13 @@ export class AutomaticScout {
   private totalVerifiedCount = 0;
   private totalRejectedCount = 0;
 
+  private scoutDurationMs = 0;
+  private scoutRpcRequestsCount = 0;
+  private discoveryErrorsCount = 0;
+  private subscriptionFailuresCount = 0;
+  private hotActivatedPoolsCount = 0;
+  private newlyAddedRoutesCount = 0;
+
   private onPoolActivated?: (pool: PoolConfig) => Promise<void> | void;
 
   constructor(
@@ -216,14 +223,20 @@ export class AutomaticScout {
       }
 
       if (orcaFailed && raydiumFailed) {
+        this.discoveryErrorsCount += discoveryErrors.length;
         throw new Error(`All discovery sources failed: ${discoveryErrors.join('; ')}`);
+      }
+
+      if (discoveryErrors.length > 0) {
+        this.discoveryErrorsCount += discoveryErrors.length;
       }
 
       candidatesFound = allCandidates.length;
       this.totalDiscoveredCount += candidatesFound;
 
-      // Filter candidates: limit to maxCandidatesPerRun
-      const candidatesToProcess = allCandidates.slice(0, this.options.maxCandidatesPerRun);
+      // FIX 1: Filter existing pools FIRST before limiting to maxCandidatesPerRun (Eliminates Starvation)
+      const newCandidates = allCandidates.filter(c => !this.poolRegistry.getPool(c.address));
+      const candidatesToProcess = newCandidates.slice(0, this.options.maxCandidatesPerRun);
       const verifiedPoolsForPersistence: DiscoveredCandidate[] = [];
 
       // 2. Perform on-chain verification in bounded concurrency chunks
@@ -232,11 +245,12 @@ export class AutomaticScout {
         const chunk = candidatesToProcess.slice(i, i + concurrency);
         const chunkResults = await Promise.all(
           chunk.map(async (candidate) => {
-            // Skip already registered pools
+            // Re-check in case another task registered it
             if (this.poolRegistry.getPool(candidate.address)) {
               return null;
             }
 
+            this.scoutRpcRequestsCount++;
             if (candidate.source === 'RAYDIUM_API') {
               return await this.raydiumDiscovery.verifyCandidateOnChain(candidate, this.rpcProvider);
             } else {
@@ -252,6 +266,10 @@ export class AutomaticScout {
           if (res.verified && res.poolConfig) {
             candidatesVerified++;
             this.totalVerifiedCount++;
+
+            // Preserve verified DEX metadata on candidate record
+            chunk[j].dexType = res.poolConfig.dex;
+            chunk[j].programId = res.poolConfig.programId;
 
             // Step 4.1: Register pool in poolRegistry
             this.poolRegistry.register(res.poolConfig);
@@ -282,6 +300,7 @@ export class AutomaticScout {
             const newRoutes = this.routeIndex.addPoolAndGenerateRoutes(res.poolConfig);
             this.lastRouteGenTimeMs = Math.round(performance.now() - genStart);
             routesGenerated += newRoutes.length;
+            this.newlyAddedRoutesCount += newRoutes.length;
 
             // Step 4.3: Persist newly generated routes in SQLite library
             for (const route of newRoutes) {
@@ -296,7 +315,9 @@ export class AutomaticScout {
             if (this.onPoolActivated) {
               try {
                 await this.onPoolActivated(res.poolConfig);
+                this.hotActivatedPoolsCount++;
               } catch (activateErr) {
+                this.subscriptionFailuresCount++;
                 console.warn(`[AutomaticScout] Failed to hot-activate pool ${res.poolConfig.id}:`, activateErr);
               }
             }
@@ -322,6 +343,7 @@ export class AutomaticScout {
     } finally {
       const completedAt = Date.now();
       const durationMs = completedAt - startedAt;
+      this.scoutDurationMs = durationMs;
       this.isCycleActive = false;
 
       // Persist last completed discovery timestamp in SQLite metadata
@@ -403,7 +425,13 @@ export class AutomaticScout {
       intraDexRoutesCount,
       interDexRoutesCount,
       routeGenerationTimeMs: this.lastRouteGenTimeMs,
-      lastScoutError: this.lastError
+      lastScoutError: this.lastError,
+      scoutDurationMs: this.scoutDurationMs,
+      scoutRpcRequestsCount: this.scoutRpcRequestsCount,
+      discoveryErrorsCount: this.discoveryErrorsCount,
+      subscriptionFailuresCount: this.subscriptionFailuresCount,
+      hotActivatedPoolsCount: this.hotActivatedPoolsCount,
+      newlyAddedRoutesCount: this.newlyAddedRoutesCount
     };
   }
 

@@ -10,6 +10,7 @@ import {
   AppConfig
 } from '../config/index.js';
 import { PoolRegistry, PoolConfig } from './poolRegistry.js';
+import { DexType } from '../types/index.js';
 import { SolanaRpcProvider } from '../providers/solanaRpc.js';
 import { OrcaWhirlpoolAdapter } from '../dex/orcaWhirlpoolAdapter.js';
 
@@ -23,7 +24,7 @@ export interface DiscoveredCandidate {
   liquidity?: string;
   source: 'ORCA_API' | 'RAYDIUM_API';
   discoveredAt: number;
-  dexType?: 'ORCA_WHIRLPOOL' | 'RAYDIUM_AMM' | 'RAYDIUM_CLMM';
+  dexType?: DexType;
   programId?: string;
 }
 
@@ -64,6 +65,7 @@ export class OrcaPoolDiscovery {
   private timeoutMs: number;
   private maxRetries: number;
   private adapter: OrcaWhirlpoolAdapter;
+  private lastCursor: string | null = null;
 
   constructor(options: OrcaDiscoveryOptions = {}) {
     this.apiBaseUrl = options.apiBaseUrl || 'https://api.orca.so/v2/solana/pools';
@@ -74,11 +76,19 @@ export class OrcaPoolDiscovery {
     this.adapter = new OrcaWhirlpoolAdapter();
   }
 
+  public getLastCursor(): string | null {
+    return this.lastCursor;
+  }
+
+  public resetCursor(): void {
+    this.lastCursor = null;
+  }
+
   /**
    * Fetches candidate pools from Orca's official public API using bounded pagination,
    * strict 10s AbortSignal timeout, 429 rate-limit handling, and allowlisted mint filtering.
    */
-  public async discoverCandidates(): Promise<{
+  public async discoverCandidates(startCursor?: string | null): Promise<{
     candidates: DiscoveredCandidate[];
     pagesFetched: number;
     apiStatus: 'SUCCESS' | 'RATE_LIMITED' | 'FAILED' | 'TIMEOUT';
@@ -87,7 +97,7 @@ export class OrcaPoolDiscovery {
     const candidates: DiscoveredCandidate[] = [];
     const seenAddresses = new Set<string>();
     const errors: string[] = [];
-    let cursor: string | null = null;
+    let cursor: string | null = startCursor !== undefined ? startCursor : this.lastCursor;
     let pagesFetched = 0;
     let apiStatus: 'SUCCESS' | 'RATE_LIMITED' | 'FAILED' | 'TIMEOUT' = 'SUCCESS';
 
@@ -148,12 +158,15 @@ export class OrcaPoolDiscovery {
                 tvlUsdc: raw.tvlUsdc?.toString(),
                 liquidity: raw.liquidity?.toString(),
                 source: 'ORCA_API',
+                dexType: 'ORCA_WHIRLPOOL',
+                programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
                 discoveredAt: Date.now()
               });
             }
           }
 
           cursor = json.meta?.cursor?.next || null;
+          this.lastCursor = cursor;
           if (!cursor) {
             // No further pages available
             break;
@@ -424,6 +437,8 @@ export class OrcaPoolDiscovery {
           report.candidatesVerified++;
           // Register as QUOTE_UNVERIFIED (Requirement 3 & 4)
           poolRegistry.register(verification.poolConfig);
+          candidate.dexType = 'ORCA_WHIRLPOOL';
+          candidate.programId = KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL;
           verifiedCandidatesForPersistence.push(candidate);
         } else {
           report.candidatesRejected++;
@@ -448,6 +463,7 @@ export class OrcaPoolDiscovery {
 export interface RaydiumDiscoveryOptions {
   apiBaseUrl?: string;
   pageSize?: number;
+  maxPages?: number;
   timeoutMs?: number;
   maxRetries?: number;
 }
@@ -455,12 +471,14 @@ export interface RaydiumDiscoveryOptions {
 export class RaydiumPoolDiscovery {
   private apiBaseUrl: string;
   private pageSize: number;
+  private maxPages: number;
   private timeoutMs: number;
   private maxRetries: number;
 
   constructor(options: RaydiumDiscoveryOptions = {}) {
     this.apiBaseUrl = options.apiBaseUrl || 'https://api-v3.raydium.io/pools/info/mint';
     this.pageSize = Math.min(options.pageSize || 10, 50);
+    this.maxPages = Math.min(options.maxPages || 5, 20);
     this.timeoutMs = options.timeoutMs || 10000;
     this.maxRetries = options.maxRetries !== undefined ? options.maxRetries : 1;
   }
@@ -484,74 +502,88 @@ export class RaydiumPoolDiscovery {
     ];
 
     for (const pair of pairs) {
-      let pairSuccess = false;
-      let retriesLeft = this.maxRetries;
+      for (let page = 1; page <= this.maxPages; page++) {
+        let pageSuccess = false;
+        let retriesLeft = this.maxRetries;
 
-      while (!pairSuccess && retriesLeft >= 0) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
+        while (!pageSuccess && retriesLeft >= 0) {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
-        try {
-          const url = `${this.apiBaseUrl}?mint1=${pair.mint1}&mint2=${pair.mint2}&poolType=all&poolSortField=default&sortType=desc&pageSize=${this.pageSize}&page=1`;
-          const response = await fetch(url, {
-            signal: controller.signal,
-            headers: {
-              'Accept': 'application/json',
-              'User-Agent': 'SolanaArbitrageBot-Phase1.5/RaydiumDiscovery'
+          try {
+            const url = `${this.apiBaseUrl}?mint1=${pair.mint1}&mint2=${pair.mint2}&poolType=all&poolSortField=default&sortType=desc&pageSize=${this.pageSize}&page=${page}`;
+            const response = await fetch(url, {
+              signal: controller.signal,
+              headers: {
+                'Accept': 'application/json',
+                'User-Agent': 'SolanaArbitrageBot-Phase1.5/RaydiumDiscovery'
+              }
+            });
+
+            if (response.status === 429) {
+              console.warn('[RAYDIUM_DISCOVERY] Received 429 Rate Limited response from Raydium API. Halting cleanly.');
+              apiStatus = 'RATE_LIMITED';
+              errors.push('HTTP_429_RATE_LIMITED');
+              return { candidates, pagesFetched, apiStatus, errors };
             }
-          });
 
-          if (response.status === 429) {
-            console.warn('[RAYDIUM_DISCOVERY] Received 429 Rate Limited response from Raydium API. Halting cleanly.');
-            apiStatus = 'RATE_LIMITED';
-            errors.push('HTTP_429_RATE_LIMITED');
-            return { candidates, pagesFetched, apiStatus, errors };
-          }
-
-          if (!response.ok) {
-            throw new Error(`HTTP_${response.status}_${response.statusText}`);
-          }
-
-          const json: any = await response.json();
-          pagesFetched++;
-          pairSuccess = true;
-
-          const poolList: any[] = json?.data?.data || (Array.isArray(json?.data) ? json.data : []);
-          for (const item of poolList) {
-            const address = item.id;
-            if (!address || seen.has(address)) continue;
-
-            const mintA = item.mintA?.address;
-            const mintB = item.mintB?.address;
-            if (mintA && mintB && ALLOWLISTED_MINTS.has(mintA) && ALLOWLISTED_MINTS.has(mintB) && mintA !== mintB) {
-              seen.add(address);
-              candidates.push({
-                address,
-                tokenMintA: mintA,
-                tokenMintB: mintB,
-                feeRate: item.feeRate || 0,
-                tvlUsdc: item.tvl?.toString(),
-                source: 'RAYDIUM_API',
-                programId: item.programId,
-                discoveredAt: Date.now()
-              });
+            if (!response.ok) {
+              throw new Error(`HTTP_${response.status}_${response.statusText}`);
             }
-          }
-        } catch (err: any) {
-          retriesLeft--;
-          if (err.name === 'AbortError') {
-            console.warn(`[RAYDIUM_DISCOVERY] Pair ${pair.mint1}/${pair.mint2} request timed out.`);
-            if (retriesLeft < 0) {
-              errors.push(`RAYDIUM_${pair.mint1}_TIMEOUT`);
+
+            const json: any = await response.json();
+            pagesFetched++;
+            pageSuccess = true;
+
+            const poolList: any[] = json?.data?.data || (Array.isArray(json?.data) ? json.data : []);
+            if (poolList.length === 0) {
+              // No further pools available for this pair
+              break;
             }
-          } else {
-            console.warn(`[RAYDIUM_DISCOVERY] Pair ${pair.mint1}/${pair.mint2} request failed: ${err.message}`);
-            if (retriesLeft < 0) {
-              errors.push(`RAYDIUM_${pair.mint1}_FAILED: ${err.message}`);
+
+            for (const item of poolList) {
+              const address = item.id;
+              if (!address || seen.has(address)) continue;
+
+              const mintA = item.mintA?.address;
+              const mintB = item.mintB?.address;
+              if (mintA && mintB && ALLOWLISTED_MINTS.has(mintA) && ALLOWLISTED_MINTS.has(mintB) && mintA !== mintB) {
+                seen.add(address);
+                const isClmm = item.programId === KNOWN_PROGRAM_IDS.RAYDIUM_CLMM;
+                candidates.push({
+                  address,
+                  tokenMintA: mintA,
+                  tokenMintB: mintB,
+                  feeRate: item.feeRate || 0,
+                  tvlUsdc: item.tvl?.toString(),
+                  source: 'RAYDIUM_API',
+                  dexType: isClmm ? 'RAYDIUM_CLMM' : 'RAYDIUM_AMM',
+                  programId: item.programId || (isClmm ? KNOWN_PROGRAM_IDS.RAYDIUM_CLMM : KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4),
+                  discoveredAt: Date.now()
+                });
+              }
             }
+          } catch (err: any) {
+            retriesLeft--;
+            if (err.name === 'AbortError') {
+              console.warn(`[RAYDIUM_DISCOVERY] Pair ${pair.mint1}/${pair.mint2} page ${page} request timed out.`);
+              if (retriesLeft < 0) {
+                errors.push(`RAYDIUM_${pair.mint1}_P${page}_TIMEOUT`);
+              }
+            } else {
+              console.warn(`[RAYDIUM_DISCOVERY] Pair ${pair.mint1}/${pair.mint2} page ${page} request failed: ${err.message}`);
+              if (retriesLeft < 0) {
+                errors.push(`RAYDIUM_${pair.mint1}_P${page}_FAILED: ${err.message}`);
+              }
+            }
+          } finally {
+            clearTimeout(timeoutId);
           }
-        } finally {
-          clearTimeout(timeoutId);
+        }
+
+        if (!pageSuccess) {
+          // If a page failed after all retries, halt pagination for this pair cleanly
+          break;
         }
       }
     }
@@ -616,6 +648,75 @@ export class RaydiumPoolDiscovery {
           return { address: candidate.address, verified: false, onChainOwner, dataLength, blockerReason: 'MINT_PAIR_MISMATCH' };
         }
 
+        // On-chain fee configuration: decode exact swap fee numerator and denominator
+        const swapFeeNumerator = accountInfo.data.readBigUInt64LE(176);
+        const swapFeeDenominator = accountInfo.data.readBigUInt64LE(184);
+        const feeBps = swapFeeDenominator > 0n
+          ? Number((swapFeeNumerator * 10000n) / swapFeeDenominator)
+          : 25;
+
+        // On-chain vault reserves verification: Never accept API TVL as proof of on-chain liquidity
+        const baseVault = new PublicKey(accountInfo.data.subarray(336, 368));
+        const quoteVault = new PublicKey(accountInfo.data.subarray(368, 400));
+
+        let reserveA = 0n;
+        let reserveB = 0n;
+        try {
+          const vaultAccounts = await rpcProvider.getMultipleAccounts([baseVault, quoteVault]);
+          const accA = vaultAccounts[0];
+          const accB = vaultAccounts[1];
+
+          if (!accA || !accB || accA.data.length < 72 || accB.data.length < 72) {
+            return {
+              address: candidate.address,
+              verified: false,
+              onChainOwner,
+              dataLength,
+              blockerReason: 'VAULT_ACCOUNT_NOT_FOUND'
+            };
+          }
+
+          const ownerA = accA.owner ? accA.owner.toBase58() : '';
+          const ownerB = accB.owner ? accB.owner.toBase58() : '';
+          const validOwners = new Set([
+            'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+            'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'
+          ]);
+
+          if (!validOwners.has(ownerA) || !validOwners.has(ownerB)) {
+            return {
+              address: candidate.address,
+              verified: false,
+              onChainOwner,
+              dataLength,
+              blockerReason: 'INVALID_VAULT_OWNER'
+            };
+          }
+
+          reserveA = accA.data.readBigUInt64LE(64);
+          reserveB = accB.data.readBigUInt64LE(64);
+        } catch (vaultErr: any) {
+          return {
+            address: candidate.address,
+            verified: false,
+            onChainOwner,
+            dataLength,
+            blockerReason: `VAULT_VERIFICATION_ERROR: ${vaultErr.message}`
+          };
+        }
+
+        // Positive on-chain liquidity verification
+        if (reserveA <= 0n || reserveB <= 0n) {
+          return {
+            address: candidate.address,
+            verified: false,
+            onChainOwner,
+            dataLength,
+            activeLiquidity: '0',
+            blockerReason: 'ZERO_ONCHAIN_LIQUIDITY'
+          };
+        }
+
         const candidateTvl = parseFloat(candidate.tvlUsdc || '0');
         const poolConfig: PoolConfig = {
           id: candidate.address,
@@ -623,9 +724,9 @@ export class RaydiumPoolDiscovery {
           programId: KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4,
           tokenAMint: baseMint,
           tokenBMint: quoteMint,
-          feeBps: 25,
+          feeBps,
           initialLiquidityUsd: candidateTvl > 0 ? candidateTvl : undefined,
-          description: `Raydium AMM V4 (Discovered)`,
+          description: `Raydium AMM V4 (Discovered) ${feeBps} bps`,
           verificationStatus: 'QUOTE_UNVERIFIED',
           blockerReason: 'RAYDIUM_AMM_V4_ADAPTER_PENDING'
         };
@@ -636,7 +737,7 @@ export class RaydiumPoolDiscovery {
           poolConfig,
           onChainOwner,
           dataLength,
-          activeLiquidity: candidate.tvlUsdc || '1'
+          activeLiquidity: (reserveA + reserveB).toString()
         };
       }
 
@@ -644,6 +745,23 @@ export class RaydiumPoolDiscovery {
       if (onChainOwner === KNOWN_PROGRAM_IDS.RAYDIUM_CLMM) {
         if (dataLength < 1540) {
           return { address: candidate.address, verified: false, onChainOwner, dataLength, blockerReason: 'INVALID_ACCOUNT_LAYOUT' };
+        }
+
+        // Positive on-chain liquidity verification in CLMM layout (offset 233, 8-16 bytes)
+        let clmmLiquidity = 0n;
+        try {
+          clmmLiquidity = accountInfo.data.readBigUInt64LE(233);
+        } catch {}
+
+        if (clmmLiquidity <= 0n && (!candidate.liquidity || BigInt(candidate.liquidity) <= 0n)) {
+          return {
+            address: candidate.address,
+            verified: false,
+            onChainOwner,
+            dataLength,
+            activeLiquidity: '0',
+            blockerReason: 'ZERO_ONCHAIN_LIQUIDITY'
+          };
         }
 
         const candidateTvl = parseFloat(candidate.tvlUsdc || '0');
@@ -666,7 +784,7 @@ export class RaydiumPoolDiscovery {
           poolConfig,
           onChainOwner,
           dataLength,
-          activeLiquidity: candidate.tvlUsdc || '1'
+          activeLiquidity: clmmLiquidity > 0n ? clmmLiquidity.toString() : (candidate.liquidity || candidate.tvlUsdc || '1')
         };
       }
 
@@ -724,6 +842,8 @@ export class RaydiumPoolDiscovery {
         if (verification.verified && verification.poolConfig) {
           report.candidatesVerified++;
           poolRegistry.register(verification.poolConfig);
+          candidate.dexType = verification.poolConfig.dex;
+          candidate.programId = verification.poolConfig.programId;
           verifiedCandidatesForPersistence.push(candidate);
         } else {
           report.candidatesRejected++;

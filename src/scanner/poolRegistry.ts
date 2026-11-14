@@ -1,4 +1,5 @@
 import { DexType, PoolState, VerifiedPoolRecord } from '../types/index.js';
+export type { DexType };
 import type { DiscoveredCandidate } from './poolDiscovery.js';
 import {
   CANONICAL_WSOL_MINT,
@@ -174,16 +175,47 @@ export class PoolRegistry {
         continue;
       }
 
+      let dex: DexType = 'ORCA_WHIRLPOOL';
+      let programId: string = KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL;
+
+      if (candidate.dexType === 'RAYDIUM_AMM' || candidate.programId === KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4) {
+        dex = 'RAYDIUM_AMM';
+        programId = KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4;
+      } else if (candidate.dexType === 'RAYDIUM_CLMM' || candidate.programId === KNOWN_PROGRAM_IDS.RAYDIUM_CLMM) {
+        dex = 'RAYDIUM_CLMM';
+        programId = KNOWN_PROGRAM_IDS.RAYDIUM_CLMM;
+      } else if (candidate.source === 'RAYDIUM_API') {
+        dex = 'RAYDIUM_AMM';
+        programId = KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4;
+      }
+
+      const feeBps = candidate.feeRate
+        ? (dex === 'RAYDIUM_AMM' || dex === 'RAYDIUM_CLMM'
+            ? (candidate.feeRate > 1 ? Math.round(candidate.feeRate) : Math.round(candidate.feeRate * 10000))
+            : Math.max(1, Math.round(candidate.feeRate / 100)))
+        : (dex === 'RAYDIUM_AMM' ? 25 : 1);
+
+      const description = dex === 'ORCA_WHIRLPOOL'
+        ? `Orca Whirlpool (Discovered) ${feeBps} bps`
+        : dex === 'RAYDIUM_AMM'
+          ? `Raydium AMM V4 (Discovered) ${feeBps} bps`
+          : `Raydium CLMM (Discovered) ${feeBps} bps`;
+
+      const blockerReason = dex === 'RAYDIUM_CLMM'
+        ? 'UNSUPPORTED_PRICING_ADAPTER_CLMM'
+        : 'PENDING_ONCHAIN_REVALIDATION';
+
       this.register({
         id: candidate.address,
-        dex: 'ORCA_WHIRLPOOL',
-        programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
+        dex,
+        programId,
         tokenAMint: candidate.tokenMintA,
         tokenBMint: candidate.tokenMintB,
-        feeBps: candidate.feeRate ? Math.max(1, Math.round(candidate.feeRate / 100)) : 1,
-        description: `Orca Whirlpool (Discovered) ${candidate.feeRate ? Math.round(candidate.feeRate / 100) : 1} bps`,
+        feeBps,
+        initialLiquidityUsd: candidate.tvlUsdc ? parseFloat(candidate.tvlUsdc) : undefined,
+        description,
         verificationStatus: 'QUOTE_UNVERIFIED',
-        blockerReason: 'PENDING_ONCHAIN_REVALIDATION',
+        blockerReason,
         lastVerifiedAt: 0
       });
       addedCount++;

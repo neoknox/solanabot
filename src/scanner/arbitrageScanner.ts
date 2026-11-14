@@ -76,6 +76,7 @@ export class ArbitrageScanner {
   private vaultToPool = new Map<string, { poolId: string; isA: boolean }>();
   private openOrdersToPool = new Map<string, string>();
   private tickArrayToPool = new Map<string, { poolId: string; startTickIndex: number }>();
+  private subscribedAccounts = new Set<string>();
 
   private qualifiedCount = 0;
   private rejectedCount = 0;
@@ -277,16 +278,19 @@ export class ArbitrageScanner {
     // 3. Subscribe to real-time WebSocket updates for all pool accounts
     const pools = this.poolRegistry.getAllPools();
     for (const pool of pools) {
-      this.ws.subscribeAccount(pool.id, (buf, slot, rxTime, monoTime) => {
-        this.enqueueUpdate({
-          type: 'POOL_ACCOUNT',
-          key: pool.id,
-          data: buf,
-          slot,
-          receivedAtMs: rxTime || Date.now(),
-          monotonicReceiptTime: monoTime || performance.now()
+      if (!this.subscribedAccounts.has(pool.id)) {
+        this.subscribedAccounts.add(pool.id);
+        this.ws.subscribeAccount(pool.id, (buf, slot, rxTime, monoTime) => {
+          this.enqueueUpdate({
+            type: 'POOL_ACCOUNT',
+            key: pool.id,
+            data: buf,
+            slot,
+            receivedAtMs: rxTime || Date.now(),
+            monotonicReceiptTime: monoTime || performance.now()
+          });
         });
-      });
+      }
     }
 
     // 4. High-frequency background drain loop
@@ -1440,7 +1444,8 @@ export class ArbitrageScanner {
             }
 
             if (vaultA && vaultB) {
-              if (!this.vaultToPool.has(vaultA)) {
+              if (!this.subscribedAccounts.has(vaultA)) {
+                this.subscribedAccounts.add(vaultA);
                 this.vaultToPool.set(vaultA, { poolId: decoded.id, isA: true });
                 this.ws.subscribeAccount(vaultA, (buf, s, rxTime, monoTime) => {
                   this.enqueueUpdate({
@@ -1453,7 +1458,8 @@ export class ArbitrageScanner {
                   });
                 });
               }
-              if (!this.vaultToPool.has(vaultB)) {
+              if (!this.subscribedAccounts.has(vaultB)) {
+                this.subscribedAccounts.add(vaultB);
                 this.vaultToPool.set(vaultB, { poolId: decoded.id, isA: false });
                 this.ws.subscribeAccount(vaultB, (buf, s, rxTime, monoTime) => {
                   this.enqueueUpdate({
@@ -1599,7 +1605,8 @@ export class ArbitrageScanner {
 
             // Map and subscribe to OpenOrders account for real-time WebSocket state maintenance
             const ooPubkeyStr = ooInfo.pubkey.toBase58();
-            if (!this.openOrdersToPool.has(ooPubkeyStr)) {
+            if (!this.subscribedAccounts.has(ooPubkeyStr)) {
+              this.subscribedAccounts.add(ooPubkeyStr);
               this.openOrdersToPool.set(ooPubkeyStr, pool.id);
               this.ws.subscribeAccount(ooPubkeyStr, (buf, s, rxTime, monoTime) => {
                 this.enqueueUpdate({
@@ -1641,7 +1648,8 @@ export class ArbitrageScanner {
             for (const startIdx of surroundingStarts) {
               const pda = deriveTickArrayPda(pool.id, startIdx);
               const pdaStr = pda.toBase58();
-              if (!this.tickArrayToPool.has(pdaStr)) {
+              if (!this.subscribedAccounts.has(pdaStr)) {
+                this.subscribedAccounts.add(pdaStr);
                 this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx });
                 this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
                   this.enqueueUpdate({
@@ -1921,7 +1929,11 @@ export class ArbitrageScanner {
   }
 
   public async hotActivateDiscoveredPool(pool: PoolConfig): Promise<void> {
-    if (this.isRunning && this.ws) {
+    if (!this.isRunning || !this.ws) return;
+
+    // 1. Prevent duplicate subscriptions for the pool account
+    if (!this.subscribedAccounts.has(pool.id)) {
+      this.subscribedAccounts.add(pool.id);
       this.ws.subscribeAccount(pool.id, (buf, slot, rxTime, monoTime) => {
         this.enqueueUpdate({
           type: 'POOL_ACCOUNT',
@@ -1932,32 +1944,261 @@ export class ArbitrageScanner {
           monotonicReceiptTime: monoTime || performance.now()
         });
       });
+    }
 
+    try {
+      // 2. Fetch initial live account state via RPC out-of-band
+      const poolPubkey = new PublicKey(pool.id);
+      const rpcRes = await this.rpc.getMultipleAccountsAndContext([poolPubkey]);
+      const snapshotSlot = rpcRes.slot;
+      const accountInfo = rpcRes.value[0];
+      if (!accountInfo) {
+        this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'ACCOUNT_NOT_FOUND');
+        this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+        return;
+      }
+
+      const adapter = dexRegistry.getAdapter(pool.dex);
+      if (!adapter) {
+        this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', `UNSUPPORTED_ADAPTER_${pool.dex}`);
+        this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+        return;
+      }
+
+      // 3. Decode and validate pool state
       if (pool.dex === 'ORCA_WHIRLPOOL') {
-        const poolState = this.stateCache.getPoolState(pool.id);
-        const tickCurrent = poolState?.extraData && (poolState.extraData as any).tickCurrent;
-        const tickSpacing = poolState?.extraData && (poolState.extraData as any).tickSpacing;
-        if (tickCurrent !== undefined && tickSpacing !== undefined) {
+        const onChainOwner = accountInfo.owner ? accountInfo.owner.toBase58() : '';
+        if (onChainOwner !== KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL) {
+          this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'INVALID_PROGRAM_OWNER');
+          this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+          return;
+        }
+        if (accountInfo.data.length < 653) {
+          this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'INVALID_ACCOUNT_LAYOUT');
+          this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+          return;
+        }
+
+        const decoded = adapter.decodePoolState(accountInfo.data, pool.id, snapshotSlot);
+        if (!decoded) {
+          this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'DECODE_FAILED');
+          this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+          return;
+        }
+
+        const extra = (decoded.extraData || {}) as any;
+        const tickSpacing = extra.tickSpacing || 1;
+        const tickCurrent = extra.tickCurrent;
+        const liquidity = BigInt(extra?.liquidity || '0');
+
+        if (liquidity <= 0n) {
+          this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'ZERO_LIQUIDITY');
+          this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+          decoded.receivedAt = Date.now();
+          this.stateCache.setPoolState(decoded);
+          return;
+        }
+
+        // 4. Resolve required account dependencies (Tick Arrays)
+        if (tickCurrent !== undefined) {
+          if (!extra.tickArrays) extra.tickArrays = {};
+          if (!extra.tickArraySlots) extra.tickArraySlots = {};
+          if (!extra.tickArrayReceivedAt) extra.tickArrayReceivedAt = {};
+
           const surroundingStarts = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+          const pdaPubkeys: PublicKey[] = [];
+          const startIndices: number[] = [];
+
           for (const startIdx of surroundingStarts) {
             try {
-              const pda = deriveTickArrayPda(new PublicKey(pool.id), startIdx);
+              const pda = deriveTickArrayPda(pool.id, startIdx);
               const pdaStr = pda.toBase58();
-              this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx });
-              this.ws.subscribeAccount(pdaStr, (buf, slot, rxTime, monoTime) => {
-                this.enqueueUpdate({
-                  type: 'TICK_ARRAY_ACCOUNT',
-                  key: pdaStr,
-                  data: buf,
-                  slot,
-                  receivedAtMs: rxTime || Date.now(),
-                  monotonicReceiptTime: monoTime || performance.now()
+              if (!this.subscribedAccounts.has(pdaStr)) {
+                this.subscribedAccounts.add(pdaStr);
+                this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx });
+                this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
+                  this.enqueueUpdate({
+                    type: 'TICK_ARRAY_ACCOUNT',
+                    key: pdaStr,
+                    data: buf,
+                    slot: s,
+                    receivedAtMs: rxTime || Date.now(),
+                    monotonicReceiptTime: monoTime || performance.now()
+                  });
                 });
-              });
+              }
+              pdaPubkeys.push(pda);
+              startIndices.push(startIdx);
             } catch {}
           }
+
+          // Hydrate required tick arrays via RPC out-of-band
+          if (pdaPubkeys.length > 0) {
+            try {
+              const tRes = await this.rpc.getMultipleAccountsAndContext(pdaPubkeys);
+              const tSlot = tRes.slot;
+              for (let i = 0; i < pdaPubkeys.length; i++) {
+                const acc = tRes.value[i];
+                const startIdx = startIndices[i];
+                if (acc && acc.data) {
+                  const decodedArray = decodeTickArrayAccount(acc.data, pool.id);
+                  if (decodedArray) {
+                    extra.tickArrays[startIdx] = decodedArray;
+                    extra.tickArraySlots[startIdx] = tSlot;
+                    extra.tickArrayReceivedAt[startIdx] = Date.now();
+                  }
+                }
+              }
+            } catch (tErr) {
+              console.warn(`[hotActivateDiscoveredPool] Failed to fetch tick arrays for ${pool.id}:`, tErr);
+            }
+          }
+
+          const now = Date.now();
+          const ttl = 30000;
+          const allSurroundingPresent = surroundingStarts.every(idx => {
+            const arr = extra.tickArrays[idx];
+            const t = extra.tickArrayReceivedAt[idx];
+            const s = extra.tickArraySlots[idx];
+            return arr && t && (now - t <= ttl) && s && Math.abs(snapshotSlot - s) <= 100;
+          });
+
+          if (allSurroundingPresent) {
+            delete extra.unverifiedReason;
+            this.poolRegistry.updatePoolVerification(pool.id, 'VERIFIED_DIRECT');
+            this.routeIndex.updatePoolStatus(pool.id, 'VERIFIED_DIRECT');
+          } else {
+            this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'MISSING_TICK_DATA');
+            this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+          }
+        }
+
+        decoded.receivedAt = Date.now();
+        this.stateCache.setPoolState(decoded);
+      } else if (pool.dex === 'RAYDIUM_AMM') {
+        const decoded = adapter.decodePoolState(accountInfo.data, pool.id, snapshotSlot);
+        if (!decoded) {
+          this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'DECODE_FAILED');
+          this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+          return;
+        }
+
+        const extra = (decoded.extraData || {}) as any;
+        const vaultA = extra?.baseVault;
+        const vaultB = extra?.quoteVault;
+        const openOrders = extra?.openOrders;
+
+        if (vaultA && !this.subscribedAccounts.has(vaultA)) {
+          this.subscribedAccounts.add(vaultA);
+          this.vaultToPool.set(vaultA, { poolId: pool.id, isA: true });
+          this.ws.subscribeAccount(vaultA, (buf, s, rxTime, monoTime) => {
+            this.enqueueUpdate({
+              type: 'VAULT_ACCOUNT',
+              key: vaultA,
+              data: buf,
+              slot: s,
+              receivedAtMs: rxTime || Date.now(),
+              monotonicReceiptTime: monoTime || performance.now()
+            });
+          });
+        }
+
+        if (vaultB && !this.subscribedAccounts.has(vaultB)) {
+          this.subscribedAccounts.add(vaultB);
+          this.vaultToPool.set(vaultB, { poolId: pool.id, isA: false });
+          this.ws.subscribeAccount(vaultB, (buf, s, rxTime, monoTime) => {
+            this.enqueueUpdate({
+              type: 'VAULT_ACCOUNT',
+              key: vaultB,
+              data: buf,
+              slot: s,
+              receivedAtMs: rxTime || Date.now(),
+              monotonicReceiptTime: monoTime || performance.now()
+            });
+          });
+        }
+
+        // Hydrate vault balances
+        if (vaultA && vaultB) {
+          try {
+            const vRes = await this.rpc.getMultipleAccountsAndContext([new PublicKey(vaultA), new PublicKey(vaultB)]);
+            const vSlot = vRes.slot;
+            if (vRes.value[0]?.data && vRes.value[0].data.length >= 72) {
+              decoded.reserveA = vRes.value[0].data.readBigUInt64LE(64);
+              extra.vaultASlot = vSlot;
+              extra.vaultAReceivedAt = Date.now();
+            }
+            if (vRes.value[1]?.data && vRes.value[1].data.length >= 72) {
+              decoded.reserveB = vRes.value[1].data.readBigUInt64LE(64);
+              extra.vaultBSlot = vSlot;
+              extra.vaultBReceivedAt = Date.now();
+            }
+          } catch {}
+        }
+
+        // Hydrate and subscribe OpenOrders
+        if (openOrders) {
+          const ooPubkeyStr = openOrders;
+          if (!this.subscribedAccounts.has(ooPubkeyStr)) {
+            this.subscribedAccounts.add(ooPubkeyStr);
+            this.openOrdersToPool.set(ooPubkeyStr, pool.id);
+            this.ws.subscribeAccount(ooPubkeyStr, (buf, s, rxTime, monoTime) => {
+              this.enqueueUpdate({
+                type: 'OPENORDERS_ACCOUNT',
+                key: ooPubkeyStr,
+                data: buf,
+                slot: s,
+                receivedAtMs: rxTime || Date.now(),
+                monotonicReceiptTime: monoTime || performance.now()
+              });
+            });
+          }
+
+          try {
+            const ooRes = await this.rpc.getMultipleAccountsAndContext([new PublicKey(openOrders)]);
+            const ooAcc = ooRes.value[0];
+            const ooSlot = ooRes.slot;
+            if (ooAcc && ooAcc.data && ooAcc.data.length >= 3228) {
+              const market = new PublicKey(ooAcc.data.subarray(13, 45)).toBase58();
+              const authority = new PublicKey(ooAcc.data.subarray(45, 77)).toBase58();
+              const expectedAuthority = '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
+
+              if (market === extra.marketId && authority === expectedAuthority) {
+                const baseTokenTotal = ooAcc.data.readBigUInt64LE(85);
+                const quoteTokenTotal = ooAcc.data.readBigUInt64LE(101);
+                extra.openOrdersVerified = true;
+                extra.openOrdersBaseTokenTotal = baseTokenTotal.toString();
+                extra.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
+                extra.lastAccountChangeSlot = ooSlot;
+                extra.lastRpcConfirmationContextSlot = ooSlot;
+                extra.lastConfirmedAt = Date.now();
+                extra.observationFreshnessTtlMs = this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
+                extra.openOrdersSlot = ooSlot;
+                extra.verifiedSlot = snapshotSlot;
+                extra.verifiedAt = Date.now();
+                delete extra.unverifiedReason;
+
+                this.poolRegistry.updatePoolVerification(pool.id, 'VERIFIED_DIRECT');
+                this.routeIndex.updatePoolStatus(pool.id, 'VERIFIED_DIRECT');
+              }
+            }
+          } catch {}
+        }
+
+        decoded.receivedAt = Date.now();
+        this.stateCache.setPoolState(decoded);
+      } else {
+        const decoded = adapter.decodePoolState(accountInfo.data, pool.id, snapshotSlot);
+        if (decoded) {
+          decoded.receivedAt = Date.now();
+          this.stateCache.setPoolState(decoded);
         }
       }
+
+      // 5. Evaluate fresh quotes on routes affected by this newly activated pool
+      this.evaluateAffectedRoutes(pool.id, performance.now());
+    } catch (err: any) {
+      console.warn(`[hotActivateDiscoveredPool] Error activating pool ${pool.id}:`, err);
     }
   }
 

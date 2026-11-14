@@ -460,6 +460,12 @@ export interface ScoutMetricsSummary {
   lastScoutError: string | null;
 
   // Compatibility fields
+  scoutDurationMs?: number;
+  scoutRpcRequestsCount?: number;
+  discoveryErrorsCount?: number;
+  subscriptionFailuresCount?: number;
+  hotActivatedPoolsCount?: number;
+  newlyAddedRoutesCount?: number;
   totalStructurallyVerifiedPools?: number;
   unverifiedPools?: number;
   storedDirectedRoutes?: number;

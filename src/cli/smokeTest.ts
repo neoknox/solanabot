@@ -212,7 +212,16 @@ async function main() {
   console.log(`  Total Discovered Pools:                ${scoutMetrics.totalDiscoveredPools}`);
   console.log(`  - Verified Pools:                      ${scoutMetrics.totalVerifiedPools}`);
   console.log(`  - Rejected Pools:                      ${scoutMetrics.totalRejectedPools}`);
-  console.log(`  Total Routes in Expanded Library:      ${scoutMetrics.totalRoutesInLibrary}`);
+  console.log(`  Successfully Hot-Activated Pools:      ${scoutMetrics.hotActivatedPoolsCount || 0}`);
+  console.log(`  Newly Added Routes:                    ${scoutMetrics.newlyAddedRoutesCount || 0}`);
+  console.log(`  Scout Duration:                        ${scoutMetrics.scoutDurationMs || 0} ms`);
+  console.log(`  Scout RPC Requests:                    ${scoutMetrics.scoutRpcRequestsCount || 0}`);
+  console.log(`  Discovery Errors:                      ${scoutMetrics.discoveryErrorsCount || 0}`);
+  console.log(`  Subscription Failures:                 ${scoutMetrics.subscriptionFailuresCount || 0}`);
+  console.log(`  Route Generation Latency:              ${scoutMetrics.routeGenerationTimeMs} ms`);
+
+  console.log('\n--- REAL VERIFIED COVERAGE & ROUTE LIBRARY BREAKDOWN ---');
+  console.log(`  Total Stored Routes:                   ${scoutMetrics.totalRoutesInLibrary}`);
   console.log(`  - Structurally Verified Routes:        ${scoutMetrics.verifiedRoutesCount}`);
   console.log(`  - Live READY Routes:                   ${scoutMetrics.readyRoutesCount}`);
   console.log(`  - Stale Routes:                        ${scoutMetrics.staleRoutesCount}`);
@@ -221,9 +230,32 @@ async function main() {
   console.log(`  - 3-Leg Cycles:                        ${scoutMetrics.threeLegRoutesCount}`);
   console.log(`  - Intra-DEX Cycles:                    ${scoutMetrics.intraDexRoutesCount}`);
   console.log(`  - Inter-DEX Cycles:                    ${scoutMetrics.interDexRoutesCount}`);
-  console.log(`  Route Generation Latency:              ${scoutMetrics.routeGenerationTimeMs} ms`);
-  console.log(`  Target 1 Milestone (>= 100 routes):    ${scoutMetrics.totalRoutesInLibrary >= 100 ? 'ACHIEVED' : 'IN_PROGRESS'} (${scoutMetrics.totalRoutesInLibrary}/100)`);
-  console.log(`  Target 2 Milestone (>= 250 routes):    ${scoutMetrics.totalRoutesInLibrary >= 250 ? 'ACHIEVED' : 'IN_PROGRESS'} (${scoutMetrics.totalRoutesInLibrary}/250)`);
+
+  const poolRegistryRef = scanner.getPoolRegistry();
+  const allKnownPools = poolRegistryRef.getAllPools();
+  const orcaVerified = allKnownPools.filter(p => p.dex === 'ORCA_WHIRLPOOL' && p.verificationStatus === 'VERIFIED_DIRECT').length;
+  const orcaUnverified = allKnownPools.filter(p => p.dex === 'ORCA_WHIRLPOOL' && p.verificationStatus !== 'VERIFIED_DIRECT').length;
+  const rayAmmVerified = allKnownPools.filter(p => p.dex === 'RAYDIUM_AMM' && p.verificationStatus === 'VERIFIED_DIRECT').length;
+  const rayAmmUnverified = allKnownPools.filter(p => p.dex === 'RAYDIUM_AMM' && p.verificationStatus !== 'VERIFIED_DIRECT').length;
+  const rayClmmVerified = allKnownPools.filter(p => p.dex === 'RAYDIUM_CLMM' && p.verificationStatus === 'VERIFIED_DIRECT').length;
+  const rayClmmUnverified = allKnownPools.filter(p => p.dex === 'RAYDIUM_CLMM' && p.verificationStatus !== 'VERIFIED_DIRECT').length;
+
+  console.log('\n--- POOL VERIFICATION BY DEX BREAKDOWN ---');
+  console.log(`  Verified Pools by DEX:`);
+  console.log(`  - Orca Whirlpool:                      ${orcaVerified}`);
+  console.log(`  - Raydium AMM V4:                      ${rayAmmVerified}`);
+  console.log(`  - Raydium CLMM:                        ${rayClmmVerified}`);
+  console.log(`  Unverified Pools by DEX:`);
+  console.log(`  - Orca Whirlpool:                      ${orcaUnverified}`);
+  console.log(`  - Raydium AMM V4:                      ${rayAmmUnverified}`);
+  console.log(`  - Raydium CLMM:                        ${rayClmmUnverified}`);
+
+  console.log('\n--- 90-DAY MASTER ROADMAP MILESTONES ---');
+  console.log(`  Target 1 Milestone (>= 100 verified routes): ${scoutMetrics.verifiedRoutesCount >= 100 ? 'ACHIEVED' : 'IN_PROGRESS'} (${scoutMetrics.verifiedRoutesCount}/100)`);
+  console.log(`  Target 2 Milestone (>= 250 verified routes): ${scoutMetrics.verifiedRoutesCount >= 250 ? 'ACHIEVED' : 'IN_PROGRESS'} (${scoutMetrics.verifiedRoutesCount}/250)`);
+  if (scoutMetrics.verifiedRoutesCount < 250) {
+    console.log(`  Target 2 Blocker Analysis:                   Raydium AMM V4 OpenOrders real-time streaming & CLMM adapter are scheduled for subsequent roadmap phases (Roadmap Phase 3). Real verified coverage reflects active Orca Whirlpool cycles.`);
+  }
 
   console.log('\n--- PHASE 1.4 LIVE INTERVAL VALIDATION MONITORING (120s) ---');
   console.log('| Interval | Stored | VERIFIED | READY | STALE | BLOCKED | DirectPools | QuoteValid | PeakREADY | R->S | S->R | Drops | PersistErr |');

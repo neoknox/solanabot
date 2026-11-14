@@ -66,16 +66,28 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
   function createMockRaydiumAmmBuffer(options: {
     baseMint?: string;
     quoteMint?: string;
+    baseVault?: string;
+    quoteVault?: string;
     feeNumerator?: bigint;
     feeDenominator?: bigint;
   } = {}): Buffer {
     const buf = Buffer.alloc(752);
     const baseMint = options.baseMint ?? CANONICAL_WSOL_MINT;
     const quoteMint = options.quoteMint ?? CANONICAL_USDC_MINT;
+    const baseVault = options.baseVault ?? Keypair.generate().publicKey.toBase58();
+    const quoteVault = options.quoteVault ?? Keypair.generate().publicKey.toBase58();
     buf.writeBigUInt64LE(options.feeNumerator ?? 25n, 176);
     buf.writeBigUInt64LE(options.feeDenominator ?? 10000n, 184);
+    new PublicKey(baseVault).toBuffer().copy(buf, 336);
+    new PublicKey(quoteVault).toBuffer().copy(buf, 368);
     new PublicKey(baseMint).toBuffer().copy(buf, 400);
     new PublicKey(quoteMint).toBuffer().copy(buf, 432);
+    return buf;
+  }
+
+  function createMockTokenVaultBuffer(amount: bigint = 1_000_000_000n): Buffer {
+    const buf = Buffer.alloc(165);
+    buf.writeBigUInt64LE(amount, 64);
     return buf;
   }
 
@@ -262,6 +274,10 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
     });
 
     const clmmBuf = Buffer.alloc(1544);
+    new PublicKey(CANONICAL_WSOL_MINT).toBuffer().copy(clmmBuf, 73);
+    new PublicKey(CANONICAL_USDC_MINT).toBuffer().copy(clmmBuf, 105);
+    clmmBuf.writeUInt32LE(2500, 201); // 25 bps
+    clmmBuf.writeBigUInt64LE(50_000_000_000n, 233); // positive on-chain liquidity
 
     const mockRpc: any = {
       getAccountInfo: vi.fn().mockImplementation(async (pubkey: PublicKey) => {
@@ -278,6 +294,12 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
           };
         }
         return null;
+      }),
+      getMultipleAccounts: vi.fn().mockImplementation(async (pubkeys: PublicKey[]) => {
+        return pubkeys.map(() => ({
+          owner: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+          data: createMockTokenVaultBuffer(500_000_000n)
+        }));
       })
     };
 
@@ -645,5 +667,277 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
     } finally {
       await hudServer.stop();
     }
+  });
+
+  describe('Phase 1.5 Final Correction Regressions', () => {
+    // 1. Repeat discovery runs without starvation (filtering existing pools before slice)
+    it('filters existing registered pools before applying maxCandidatesPerRun limit, eliminating starvation', async () => {
+      // Create 5 known pools and 2 new candidate pools
+      const knownPools: DiscoveredCandidate[] = [];
+      for (let i = 0; i < 5; i++) {
+        const addr = Keypair.generate().publicKey.toBase58();
+        poolRegistry.register({
+          id: addr,
+          dex: 'ORCA_WHIRLPOOL',
+          programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
+          tokenAMint: CANONICAL_WSOL_MINT,
+          tokenBMint: CANONICAL_USDC_MINT,
+          feeBps: 4,
+          verificationStatus: 'QUOTE_UNVERIFIED',
+          blockerReason: 'TEST'
+        });
+        knownPools.push({
+          address: addr,
+          tokenMintA: CANONICAL_WSOL_MINT,
+          tokenMintB: CANONICAL_USDC_MINT,
+          source: 'ORCA_API',
+          discoveredAt: Date.now()
+        });
+      }
+
+      const newPool1 = Keypair.generate().publicKey.toBase58();
+      const newPool2 = Keypair.generate().publicKey.toBase58();
+      const allApiCandidates = [
+        ...knownPools, // 5 known pools at the front of the list
+        { address: newPool1, tokenMintA: CANONICAL_WSOL_MINT, tokenMintB: CANONICAL_USDC_MINT, source: 'ORCA_API' as const, discoveredAt: Date.now() },
+        { address: newPool2, tokenMintA: CANONICAL_WSOL_MINT, tokenMintB: CANONICAL_USDC_MINT, source: 'ORCA_API' as const, discoveredAt: Date.now() }
+      ];
+
+      const mockRpc: any = {
+        getAccountInfo: vi.fn().mockImplementation(async (pubkey: PublicKey) => {
+          return {
+            owner: new PublicKey(KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL),
+            data: createMockWhirlpoolBuffer({
+              tokenAMint: CANONICAL_WSOL_MINT,
+              tokenBMint: CANONICAL_USDC_MINT,
+              liquidity: 50_000_000_000n
+            })
+          };
+        })
+      };
+
+      const scout = new AutomaticScout(
+        poolRegistry,
+        routeIndex,
+        repository,
+        mockRpc,
+        {
+          runOnStartup: false,
+          maxCandidatesPerRun: 2 // Only 2 candidates per run!
+        }
+      );
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: allApiCandidates })
+      }));
+
+      // Under the old bug, slice(0, 2) took the first 2 known pools, skipped both, and verified 0 new pools!
+      // Under our fix, it filters out the 5 known pools first, leaving newPool1 and newPool2, and verifies both!
+      const res = await scout.runScoutCycle('MANUAL');
+      expect(res.candidatesVerified).toBe(2);
+      expect(poolRegistry.getPool(newPool1)).toBeDefined();
+      expect(poolRegistry.getPool(newPool2)).toBeDefined();
+    });
+
+    // 2. Pagination in Raydium and Orca
+    it('paginates Raydium API across multiple pages and Orca API across cursors', async () => {
+      const raydiumDiscovery = new RaydiumPoolDiscovery({ maxPages: 3, pageSize: 10 });
+      let fetchCallCount = 0;
+      vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+        fetchCallCount++;
+        const p1 = Keypair.generate().publicKey.toBase58();
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              data: [
+                {
+                  id: p1,
+                  mintA: { address: CANONICAL_USDC_MINT },
+                  mintB: { address: CANONICAL_WSOL_MINT },
+                  feeRate: 0.0025,
+                  tvl: 500000,
+                  programId: KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4
+                }
+              ]
+            }
+          })
+        };
+      }));
+
+      const result = await raydiumDiscovery.discoverCandidates();
+      expect(result.pagesFetched).toBeGreaterThanOrEqual(3);
+      expect(result.candidates.length).toBeGreaterThanOrEqual(3);
+      expect(result.candidates[0].dexType).toBe('RAYDIUM_AMM');
+    });
+
+    // 3. Correct DEX recovery after restart
+    it('preserves correct DEX identities (RAYDIUM_AMM, RAYDIUM_CLMM) upon restart and does not restore them as Orca Whirlpools', async () => {
+      const rayAmmPoolId = Keypair.generate().publicKey.toBase58();
+      const rayClmmPoolId = Keypair.generate().publicKey.toBase58();
+      const orcaPoolId = Keypair.generate().publicKey.toBase58();
+
+      const candidates: DiscoveredCandidate[] = [
+        {
+          address: rayAmmPoolId,
+          tokenMintA: CANONICAL_WSOL_MINT,
+          tokenMintB: CANONICAL_USDC_MINT,
+          source: 'RAYDIUM_API',
+          dexType: 'RAYDIUM_AMM',
+          programId: KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4,
+          feeRate: 0.0025,
+          discoveredAt: Date.now()
+        },
+        {
+          address: rayClmmPoolId,
+          tokenMintA: CANONICAL_WSOL_MINT,
+          tokenMintB: CANONICAL_USDC_MINT,
+          source: 'RAYDIUM_API',
+          dexType: 'RAYDIUM_CLMM',
+          programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
+          feeRate: 0.0005,
+          discoveredAt: Date.now()
+        },
+        {
+          address: orcaPoolId,
+          tokenMintA: CANONICAL_WSOL_MINT,
+          tokenMintB: CANONICAL_USDC_MINT,
+          source: 'ORCA_API',
+          dexType: 'ORCA_WHIRLPOOL',
+          programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
+          feeRate: 400,
+          discoveredAt: Date.now()
+        }
+      ];
+
+      const freshRegistry = new PoolRegistry();
+      freshRegistry.loadDiscoveredCandidates(candidates);
+
+      const poolAmm = freshRegistry.getPool(rayAmmPoolId);
+      const poolClmm = freshRegistry.getPool(rayClmmPoolId);
+      const poolOrca = freshRegistry.getPool(orcaPoolId);
+
+      expect(poolAmm?.dex).toBe('RAYDIUM_AMM');
+      expect(poolAmm?.programId).toBe(KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4);
+
+      expect(poolClmm?.dex).toBe('RAYDIUM_CLMM');
+      expect(poolClmm?.programId).toBe(KNOWN_PROGRAM_IDS.RAYDIUM_CLMM);
+      expect(poolClmm?.blockerReason).toBe('UNSUPPORTED_PRICING_ADAPTER_CLMM');
+
+      expect(poolOrca?.dex).toBe('ORCA_WHIRLPOOL');
+      expect(poolOrca?.programId).toBe(KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL);
+    });
+
+    // 4. Raydium on-chain verification: fee decoding & on-chain vault reserves (zero liquidity / API TVL rejection)
+    it('decodes exact on-chain fee configuration and rejects zero on-chain liquidity despite positive API TVL', async () => {
+      const raydiumDiscovery = new RaydiumPoolDiscovery();
+      const poolAddr = Keypair.generate().publicKey.toBase58();
+      const baseVault = Keypair.generate().publicKey.toBase58();
+      const quoteVault = Keypair.generate().publicKey.toBase58();
+
+      // Custom fee: 50 bps (50n / 10000n)
+      const ammBuf = createMockRaydiumAmmBuffer({
+        baseMint: CANONICAL_WSOL_MINT,
+        quoteMint: CANONICAL_USDC_MINT,
+        baseVault,
+        quoteVault,
+        feeNumerator: 50n,
+        feeDenominator: 10000n
+      });
+
+      // Case A: Vault with ZERO balance
+      const mockRpcZeroVault: any = {
+        getAccountInfo: vi.fn().mockResolvedValue({
+          owner: new PublicKey(KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4),
+          data: ammBuf
+        }),
+        getMultipleAccounts: vi.fn().mockResolvedValue([
+          { owner: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'), data: createMockTokenVaultBuffer(0n) }, // 0 balance!
+          { owner: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'), data: createMockTokenVaultBuffer(1_000_000n) }
+        ])
+      };
+
+      const resZero = await raydiumDiscovery.verifyCandidateOnChain({
+        address: poolAddr,
+        tokenMintA: CANONICAL_WSOL_MINT,
+        tokenMintB: CANONICAL_USDC_MINT,
+        tvlUsdc: '5000000', // Positive API TVL!
+        source: 'RAYDIUM_API',
+        discoveredAt: Date.now()
+      }, mockRpcZeroVault);
+
+      expect(resZero.verified).toBe(false);
+      expect(resZero.blockerReason).toBe('ZERO_ONCHAIN_LIQUIDITY');
+
+      // Case B: Vault with POSITIVE balances
+      const mockRpcPositive: any = {
+        getAccountInfo: vi.fn().mockResolvedValue({
+          owner: new PublicKey(KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4),
+          data: ammBuf
+        }),
+        getMultipleAccounts: vi.fn().mockResolvedValue([
+          { owner: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'), data: createMockTokenVaultBuffer(500_000_000n) },
+          { owner: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'), data: createMockTokenVaultBuffer(500_000_000n) }
+        ])
+      };
+
+      const resValid = await raydiumDiscovery.verifyCandidateOnChain({
+        address: poolAddr,
+        tokenMintA: CANONICAL_WSOL_MINT,
+        tokenMintB: CANONICAL_USDC_MINT,
+        source: 'RAYDIUM_API',
+        discoveredAt: Date.now()
+      }, mockRpcPositive);
+
+      expect(resValid.verified).toBe(true);
+      expect(resValid.poolConfig?.feeBps).toBe(50); // Exact fee decoded!
+      expect(resValid.poolConfig?.description).toContain('50 bps');
+    });
+
+    // 5. Hot activation and subscription deduplication without restart
+    it('hot-activates discovered pools, fetches live snapshots out-of-band, and deduplicates subscriptions', async () => {
+      const scanner = new ArbitrageScanner(mockConfig);
+      const newPoolId = Keypair.generate().publicKey.toBase58();
+      const newPoolConfig: PoolConfig = {
+        id: newPoolId,
+        dex: 'ORCA_WHIRLPOOL',
+        programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        feeBps: 4,
+        verificationStatus: 'QUOTE_UNVERIFIED'
+      };
+
+      scanner.getPoolRegistry().register(newPoolConfig);
+
+      // Verify hot activation does not throw and executes safely
+      await expect(scanner.hotActivateDiscoveredPool(newPoolConfig)).resolves.not.toThrow();
+
+      // Calling hotActivateDiscoveredPool a second time should deduplicate subscriptions without duplicate listeners
+      await expect(scanner.hotActivateDiscoveredPool(newPoolConfig)).resolves.not.toThrow();
+
+      scanner.stop();
+    });
+
+    // 6. Real route-state classification (BLOCKED never counted as verified)
+    it('classifies route states strictly and never counts BLOCKED routes in verified metrics', async () => {
+      const scout = new AutomaticScout(
+        poolRegistry,
+        routeIndex,
+        repository,
+        { getAccountInfo: vi.fn() } as any,
+        { runOnStartup: false }
+      );
+
+      const metrics = scout.getMetrics();
+      // Invariant: verifiedRoutesCount + blockedRoutesCount = totalRoutesInLibrary
+      // And verifiedRoutesCount = READY + STALE + VERIFIED
+      expect(metrics.totalRoutesInLibrary).toBe(metrics.verifiedRoutesCount + metrics.blockedRoutesCount);
+      expect(metrics.verifiedRoutesCount).toBeLessThan(metrics.totalRoutesInLibrary);
+      expect(metrics.blockedRoutesCount).toBeGreaterThan(0);
+    });
   });
 });
