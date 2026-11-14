@@ -12,7 +12,7 @@ import { PoolRegistry, PoolConfig } from './poolRegistry.js';
 import { RouteIndex } from './routeIndex.js';
 import { ArbitrageRepository } from '../storage/repository.js';
 import { SolanaRpcProvider } from '../providers/solanaRpc.js';
-import { ScoutRunRecord, ScoutMetricsSummary } from '../types/index.js';
+import { ScoutRunRecord, ScoutMetricsSummary, HotActivationOutcome } from '../types/index.js';
 
 export interface AutomaticScoutOptions {
   intervalMs?: number; // Daily by default (24 hours = 86,400,000 ms)
@@ -62,9 +62,12 @@ export class AutomaticScout {
   private discoveryErrorsCount = 0;
   private subscriptionFailuresCount = 0;
   private hotActivatedPoolsCount = 0;
+  private pendingActivationPoolsCount = 0;
+  private unsupportedPoolsCount = 0;
+  private failedActivationPoolsCount = 0;
   private newlyAddedRoutesCount = 0;
 
-  private onPoolActivated?: (pool: PoolConfig) => Promise<void> | void;
+  private onPoolActivated?: (pool: PoolConfig) => Promise<HotActivationOutcome | void> | HotActivationOutcome | void;
 
   constructor(
     poolRegistry: PoolRegistry,
@@ -72,7 +75,7 @@ export class AutomaticScout {
     repository: ArbitrageRepository,
     rpcProvider: SolanaRpcProvider,
     options: AutomaticScoutOptions = {},
-    onPoolActivated?: (pool: PoolConfig) => Promise<void> | void
+    onPoolActivated?: (pool: PoolConfig) => Promise<HotActivationOutcome | void> | HotActivationOutcome | void
   ) {
     this.poolRegistry = poolRegistry;
     this.routeIndex = routeIndex;
@@ -92,7 +95,7 @@ export class AutomaticScout {
     this.raydiumDiscovery = new RaydiumPoolDiscovery(this.options.raydiumOptions);
   }
 
-  public setOnPoolActivated(fn: (pool: PoolConfig) => Promise<void> | void): void {
+  public setOnPoolActivated(fn: (pool: PoolConfig) => Promise<HotActivationOutcome | void> | HotActivationOutcome | void): void {
     this.onPoolActivated = fn;
   }
 
@@ -314,9 +317,19 @@ export class AutomaticScout {
             // Step 4.4 & 4.5: Hot-activate WebSocket subscriptions and hydrate state via callback
             if (this.onPoolActivated) {
               try {
-                await this.onPoolActivated(res.poolConfig);
-                this.hotActivatedPoolsCount++;
+                const outcome = await this.onPoolActivated(res.poolConfig);
+                if (outcome === 'ACTIVATED') {
+                  this.hotActivatedPoolsCount++;
+                } else if (outcome === 'PENDING_DEPENDENCIES') {
+                  this.pendingActivationPoolsCount++;
+                } else if (outcome === 'UNSUPPORTED') {
+                  this.unsupportedPoolsCount++;
+                } else {
+                  this.failedActivationPoolsCount++;
+                  this.subscriptionFailuresCount++;
+                }
               } catch (activateErr) {
+                this.failedActivationPoolsCount++;
                 this.subscriptionFailuresCount++;
                 console.warn(`[AutomaticScout] Failed to hot-activate pool ${res.poolConfig.id}:`, activateErr);
               }
@@ -431,6 +444,9 @@ export class AutomaticScout {
       discoveryErrorsCount: this.discoveryErrorsCount,
       subscriptionFailuresCount: this.subscriptionFailuresCount,
       hotActivatedPoolsCount: this.hotActivatedPoolsCount,
+      pendingActivationPoolsCount: this.pendingActivationPoolsCount,
+      unsupportedPoolsCount: this.unsupportedPoolsCount,
+      failedActivationPoolsCount: this.failedActivationPoolsCount,
       newlyAddedRoutesCount: this.newlyAddedRoutesCount
     };
   }

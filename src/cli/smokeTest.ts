@@ -213,6 +213,9 @@ async function main() {
   console.log(`  - Verified Pools:                      ${scoutMetrics.totalVerifiedPools}`);
   console.log(`  - Rejected Pools:                      ${scoutMetrics.totalRejectedPools}`);
   console.log(`  Successfully Hot-Activated Pools:      ${scoutMetrics.hotActivatedPoolsCount || 0}`);
+  console.log(`  Pending Activation Pools:              ${scoutMetrics.pendingActivationPoolsCount || 0}`);
+  console.log(`  Unsupported Pools:                     ${scoutMetrics.unsupportedPoolsCount || 0}`);
+  console.log(`  Failed Activation Pools:               ${scoutMetrics.failedActivationPoolsCount || 0}`);
   console.log(`  Newly Added Routes:                    ${scoutMetrics.newlyAddedRoutesCount || 0}`);
   console.log(`  Scout Duration:                        ${scoutMetrics.scoutDurationMs || 0} ms`);
   console.log(`  Scout RPC Requests:                    ${scoutMetrics.scoutRpcRequestsCount || 0}`);

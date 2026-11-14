@@ -12,7 +12,8 @@ import {
   AuditMetrics,
   VerifiedPoolRecord,
   RouteSummaryStats,
-  ScoutMetricsSummary
+  ScoutMetricsSummary,
+  HotActivationOutcome
 } from '../types/index.js';
 import { AutomaticScout, ScoutCycleResult } from './automaticScout.js';
 import { SolanaRpcProvider } from '../providers/solanaRpc.js';
@@ -222,8 +223,8 @@ export class ArbitrageScanner {
         runOnStartup: true,
         persistenceFilePath: discoveredFile
       },
-      async (pool: PoolConfig) => {
-        await this.hotActivateDiscoveredPool(pool);
+      async (pool: PoolConfig): Promise<HotActivationOutcome> => {
+        return await this.hotActivateDiscoveredPool(pool);
       }
     );
 
@@ -1928,10 +1929,24 @@ export class ArbitrageScanner {
     return this.profitThresholdManager;
   }
 
-  public async hotActivateDiscoveredPool(pool: PoolConfig): Promise<void> {
-    if (!this.isRunning || !this.ws) return;
+  public async hotActivateDiscoveredPool(pool: PoolConfig): Promise<HotActivationOutcome> {
+    // 1. Raydium CLMM and unsupported pricing adapters remain disabled until separately approved
+    if (pool.dex === 'RAYDIUM_CLMM' || pool.blockerReason === 'UNSUPPORTED_PRICING_ADAPTER_CLMM') {
+      this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'UNSUPPORTED_PRICING_ADAPTER_CLMM');
+      this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+      return 'UNSUPPORTED';
+    }
 
-    // 1. Prevent duplicate subscriptions for the pool account
+    const adapter = dexRegistry.getAdapter(pool.dex);
+    if (!adapter) {
+      this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', `UNSUPPORTED_ADAPTER_${pool.dex}`);
+      this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+      return 'UNSUPPORTED';
+    }
+
+    if (!this.ws) return 'FAILED';
+
+    // 2. Prevent duplicate subscriptions for the pool account
     if (!this.subscribedAccounts.has(pool.id)) {
       this.subscribedAccounts.add(pool.id);
       this.ws.subscribeAccount(pool.id, (buf, slot, rxTime, monoTime) => {
@@ -1947,7 +1962,7 @@ export class ArbitrageScanner {
     }
 
     try {
-      // 2. Fetch initial live account state via RPC out-of-band
+      // 3. Fetch initial live account state via RPC out-of-band
       const poolPubkey = new PublicKey(pool.id);
       const rpcRes = await this.rpc.getMultipleAccountsAndContext([poolPubkey]);
       const snapshotSlot = rpcRes.slot;
@@ -1955,35 +1970,28 @@ export class ArbitrageScanner {
       if (!accountInfo) {
         this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'ACCOUNT_NOT_FOUND');
         this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
-        return;
+        return 'FAILED';
       }
 
-      const adapter = dexRegistry.getAdapter(pool.dex);
-      if (!adapter) {
-        this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', `UNSUPPORTED_ADAPTER_${pool.dex}`);
-        this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
-        return;
-      }
-
-      // 3. Decode and validate pool state
+      // 4. Decode and validate pool state
       if (pool.dex === 'ORCA_WHIRLPOOL') {
         const onChainOwner = accountInfo.owner ? accountInfo.owner.toBase58() : '';
         if (onChainOwner !== KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL) {
           this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'INVALID_PROGRAM_OWNER');
           this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
-          return;
+          return 'FAILED';
         }
         if (accountInfo.data.length < 653) {
           this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'INVALID_ACCOUNT_LAYOUT');
           this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
-          return;
+          return 'FAILED';
         }
 
         const decoded = adapter.decodePoolState(accountInfo.data, pool.id, snapshotSlot);
         if (!decoded) {
           this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'DECODE_FAILED');
           this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
-          return;
+          return 'FAILED';
         }
 
         const extra = (decoded.extraData || {}) as any;
@@ -1996,10 +2004,11 @@ export class ArbitrageScanner {
           this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
           decoded.receivedAt = Date.now();
           this.stateCache.setPoolState(decoded);
-          return;
+          return 'FAILED';
         }
 
-        // 4. Resolve required account dependencies (Tick Arrays)
+        // 5. Resolve required account dependencies (Tick Arrays)
+        let allSurroundingPresent = false;
         if (tickCurrent !== undefined) {
           if (!extra.tickArrays) extra.tickArrays = {};
           if (!extra.tickArraySlots) extra.tickArraySlots = {};
@@ -2056,7 +2065,7 @@ export class ArbitrageScanner {
 
           const now = Date.now();
           const ttl = 30000;
-          const allSurroundingPresent = surroundingStarts.every(idx => {
+          allSurroundingPresent = surroundingStarts.every(idx => {
             const arr = extra.tickArrays[idx];
             const t = extra.tickArrayReceivedAt[idx];
             const s = extra.tickArraySlots[idx];
@@ -2075,18 +2084,43 @@ export class ArbitrageScanner {
 
         decoded.receivedAt = Date.now();
         this.stateCache.setPoolState(decoded);
+
+        if (allSurroundingPresent) {
+          this.evaluateAffectedRoutes(pool.id, performance.now());
+          return 'ACTIVATED';
+        } else {
+          return 'PENDING_DEPENDENCIES';
+        }
       } else if (pool.dex === 'RAYDIUM_AMM') {
+        const onChainOwner = accountInfo.owner ? accountInfo.owner.toBase58() : '';
+        if (onChainOwner !== KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4) {
+          this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'INVALID_PROGRAM_OWNER');
+          this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+          return 'FAILED';
+        }
+        if (accountInfo.data.length < 752) {
+          this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'INVALID_ACCOUNT_LAYOUT');
+          this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+          return 'FAILED';
+        }
+
         const decoded = adapter.decodePoolState(accountInfo.data, pool.id, snapshotSlot);
         if (!decoded) {
           this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'DECODE_FAILED');
           this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
-          return;
+          return 'FAILED';
         }
 
         const extra = (decoded.extraData || {}) as any;
         const vaultA = extra?.baseVault;
         const vaultB = extra?.quoteVault;
         const openOrders = extra?.openOrders;
+
+        if (!vaultA || !vaultB) {
+          this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'MISSING_VAULT_METADATA');
+          this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+          return 'FAILED';
+        }
 
         if (vaultA && !this.subscribedAccounts.has(vaultA)) {
           this.subscribedAccounts.add(vaultA);
@@ -2119,6 +2153,7 @@ export class ArbitrageScanner {
         }
 
         // Hydrate vault balances
+        let vaultsHydrated = false;
         if (vaultA && vaultB) {
           try {
             const vRes = await this.rpc.getMultipleAccountsAndContext([new PublicKey(vaultA), new PublicKey(vaultB)]);
@@ -2133,10 +2168,14 @@ export class ArbitrageScanner {
               extra.vaultBSlot = vSlot;
               extra.vaultBReceivedAt = Date.now();
             }
+            if (decoded.reserveA !== undefined && decoded.reserveB !== undefined && decoded.reserveA > 0n && decoded.reserveB > 0n) {
+              vaultsHydrated = true;
+            }
           } catch {}
         }
 
         // Hydrate and subscribe OpenOrders
+        let openOrdersHydrated = false;
         if (openOrders) {
           const ooPubkeyStr = openOrders;
           if (!this.subscribedAccounts.has(ooPubkeyStr)) {
@@ -2178,8 +2217,7 @@ export class ArbitrageScanner {
                 extra.verifiedAt = Date.now();
                 delete extra.unverifiedReason;
 
-                this.poolRegistry.updatePoolVerification(pool.id, 'VERIFIED_DIRECT');
-                this.routeIndex.updatePoolStatus(pool.id, 'VERIFIED_DIRECT');
+                openOrdersHydrated = true;
               }
             }
           } catch {}
@@ -2187,18 +2225,28 @@ export class ArbitrageScanner {
 
         decoded.receivedAt = Date.now();
         this.stateCache.setPoolState(decoded);
+
+        if (vaultsHydrated && openOrdersHydrated) {
+          this.poolRegistry.updatePoolVerification(pool.id, 'VERIFIED_DIRECT');
+          this.routeIndex.updatePoolStatus(pool.id, 'VERIFIED_DIRECT');
+          this.evaluateAffectedRoutes(pool.id, performance.now());
+          return 'ACTIVATED';
+        } else {
+          this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', !vaultsHydrated ? 'UNHYDRATED_VAULTS' : 'RAYDIUM_AMM_V4_ADAPTER_PENDING');
+          this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+          return 'PENDING_DEPENDENCIES';
+        }
       } else {
         const decoded = adapter.decodePoolState(accountInfo.data, pool.id, snapshotSlot);
         if (decoded) {
           decoded.receivedAt = Date.now();
           this.stateCache.setPoolState(decoded);
         }
+        return 'UNSUPPORTED';
       }
-
-      // 5. Evaluate fresh quotes on routes affected by this newly activated pool
-      this.evaluateAffectedRoutes(pool.id, performance.now());
     } catch (err: any) {
       console.warn(`[hotActivateDiscoveredPool] Error activating pool ${pool.id}:`, err);
+      return 'FAILED';
     }
   }
 

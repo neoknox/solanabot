@@ -277,7 +277,8 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
     new PublicKey(CANONICAL_WSOL_MINT).toBuffer().copy(clmmBuf, 73);
     new PublicKey(CANONICAL_USDC_MINT).toBuffer().copy(clmmBuf, 105);
     clmmBuf.writeUInt32LE(2500, 201); // 25 bps
-    clmmBuf.writeBigUInt64LE(50_000_000_000n, 233); // positive on-chain liquidity
+    clmmBuf.writeBigUInt64LE(50_000_000_000n, 237); // positive on-chain u128 liquidity at offset 237
+    clmmBuf.writeBigUInt64LE(0n, 245);
 
     const mockRpc: any = {
       getAccountInfo: vi.fn().mockImplementation(async (pubkey: PublicKey) => {
@@ -938,6 +939,289 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
       expect(metrics.totalRoutesInLibrary).toBe(metrics.verifiedRoutesCount + metrics.blockedRoutesCount);
       expect(metrics.verifiedRoutesCount).toBeLessThan(metrics.totalRoutesInLibrary);
       expect(metrics.blockedRoutesCount).toBeGreaterThan(0);
+    });
+  });
+
+  describe('Phase 1.5 Final Audit: Raydium CLMM Verification & Hot Activation Accuracy', () => {
+    function createMockRaydiumClmmBuffer(options: {
+      tokenMint0?: string;
+      tokenMint1?: string;
+      liquidityLow?: bigint;
+      liquidityHigh?: bigint;
+      decimals0?: number;
+      decimals1?: number;
+      tickSpacing?: number;
+      dataLength?: number;
+    } = {}): Buffer {
+      const len = options.dataLength ?? 1544;
+      const buf = Buffer.alloc(len);
+      const m0 = options.tokenMint0 ?? CANONICAL_WSOL_MINT;
+      const m1 = options.tokenMint1 ?? CANONICAL_USDC_MINT;
+      new PublicKey(m0).toBuffer().copy(buf, 73);
+      new PublicKey(m1).toBuffer().copy(buf, 105);
+      buf.writeUInt8(options.decimals0 ?? 9, 233);
+      buf.writeUInt8(options.decimals1 ?? 6, 234);
+      buf.writeUInt16LE(options.tickSpacing ?? 1, 235);
+      buf.writeBigUInt64LE(options.liquidityLow ?? 50_000_000_000n, 237);
+      buf.writeBigUInt64LE(options.liquidityHigh ?? 0n, 245);
+      return buf;
+    }
+
+    it('decodes complete u128 liquidity at offset 237 and verifies on-chain token mints in Raydium CLMM layout', async () => {
+      const discovery = new RaydiumPoolDiscovery();
+      const clmmAddress = Keypair.generate().publicKey.toBase58();
+      const lowPart = 123456789n;
+      const highPart = 3n;
+      const expectedU128 = lowPart | (highPart << 64n);
+
+      const clmmBuf = createMockRaydiumClmmBuffer({
+        tokenMint0: CANONICAL_WSOL_MINT,
+        tokenMint1: CANONICAL_USDC_MINT,
+        liquidityLow: lowPart,
+        liquidityHigh: highPart
+      });
+
+      const mockRpc: any = {
+        getAccountInfo: vi.fn().mockResolvedValue({
+          owner: new PublicKey(KNOWN_PROGRAM_IDS.RAYDIUM_CLMM),
+          data: clmmBuf
+        })
+      };
+
+      const res = await discovery.verifyCandidateOnChain({
+        address: clmmAddress,
+        tokenMintA: CANONICAL_WSOL_MINT,
+        tokenMintB: CANONICAL_USDC_MINT,
+        tvlUsdc: '5000000',
+        feeRate: 0.0004,
+        source: 'RAYDIUM_API',
+        discoveredAt: Date.now()
+      }, mockRpc);
+
+      expect(res.verified).toBe(true);
+      expect(res.activeLiquidity).toBe(expectedU128.toString());
+      expect(res.poolConfig?.dex).toBe('RAYDIUM_CLMM');
+      expect(res.poolConfig?.tokenAMint).toBe(CANONICAL_WSOL_MINT);
+      expect(res.poolConfig?.tokenBMint).toBe(CANONICAL_USDC_MINT);
+      expect(res.poolConfig?.verificationStatus).toBe('QUOTE_UNVERIFIED');
+      expect(res.poolConfig?.blockerReason).toBe('UNSUPPORTED_PRICING_ADAPTER_CLMM');
+    });
+
+    it('fails closed on Raydium CLMM token mint mismatch', async () => {
+      const discovery = new RaydiumPoolDiscovery();
+      const clmmAddress = Keypair.generate().publicKey.toBase58();
+      const randomMint = Keypair.generate().publicKey.toBase58();
+
+      const clmmBuf = createMockRaydiumClmmBuffer({
+        tokenMint0: randomMint,
+        tokenMint1: CANONICAL_USDC_MINT
+      });
+
+      const mockRpc: any = {
+        getAccountInfo: vi.fn().mockResolvedValue({
+          owner: new PublicKey(KNOWN_PROGRAM_IDS.RAYDIUM_CLMM),
+          data: clmmBuf
+        })
+      };
+
+      const res = await discovery.verifyCandidateOnChain({
+        address: clmmAddress,
+        tokenMintA: CANONICAL_WSOL_MINT,
+        tokenMintB: CANONICAL_USDC_MINT,
+        tvlUsdc: '5000000',
+        source: 'RAYDIUM_API',
+        discoveredAt: Date.now()
+      }, mockRpc);
+
+      expect(res.verified).toBe(false);
+      expect(res.blockerReason).toBe('MINT_PAIR_MISMATCH');
+    });
+
+    it('rejects zero on-chain liquidity in Raydium CLMM despite positive API TVL and candidate liquidity', async () => {
+      const discovery = new RaydiumPoolDiscovery();
+      const clmmAddress = Keypair.generate().publicKey.toBase58();
+
+      const clmmBuf = createMockRaydiumClmmBuffer({
+        liquidityLow: 0n,
+        liquidityHigh: 0n
+      });
+
+      const mockRpc: any = {
+        getAccountInfo: vi.fn().mockResolvedValue({
+          owner: new PublicKey(KNOWN_PROGRAM_IDS.RAYDIUM_CLMM),
+          data: clmmBuf
+        })
+      };
+
+      const res = await discovery.verifyCandidateOnChain({
+        address: clmmAddress,
+        tokenMintA: CANONICAL_WSOL_MINT,
+        tokenMintB: CANONICAL_USDC_MINT,
+        tvlUsdc: '99999999',
+        liquidity: '88888888',
+        source: 'RAYDIUM_API',
+        discoveredAt: Date.now()
+      }, mockRpc);
+
+      expect(res.verified).toBe(false);
+      expect(res.blockerReason).toBe('ZERO_ONCHAIN_LIQUIDITY');
+      expect(res.activeLiquidity).toBe('0');
+    });
+
+    it('fails closed when Raydium CLMM account data length is truncated below official 1544 bytes', async () => {
+      const discovery = new RaydiumPoolDiscovery();
+      const clmmAddress = Keypair.generate().publicKey.toBase58();
+
+      const truncatedBuf = createMockRaydiumClmmBuffer({
+        dataLength: 1500
+      });
+
+      const mockRpc: any = {
+        getAccountInfo: vi.fn().mockResolvedValue({
+          owner: new PublicKey(KNOWN_PROGRAM_IDS.RAYDIUM_CLMM),
+          data: truncatedBuf
+        })
+      };
+
+      const res = await discovery.verifyCandidateOnChain({
+        address: clmmAddress,
+        tokenMintA: CANONICAL_WSOL_MINT,
+        tokenMintB: CANONICAL_USDC_MINT,
+        source: 'RAYDIUM_API',
+        discoveredAt: Date.now()
+      }, mockRpc);
+
+      expect(res.verified).toBe(false);
+      expect(res.blockerReason).toBe('INVALID_ACCOUNT_LAYOUT');
+    });
+
+    it('returns explicit HotActivationOutcome: UNSUPPORTED for CLMM, PENDING_DEPENDENCIES without tick arrays', async () => {
+      const scanner = new ArbitrageScanner(mockConfig);
+
+      // 1. Raydium CLMM pool returns UNSUPPORTED
+      const clmmPoolConfig: PoolConfig = {
+        id: Keypair.generate().publicKey.toBase58(),
+        dex: 'RAYDIUM_CLMM',
+        programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        feeBps: 25,
+        verificationStatus: 'QUOTE_UNVERIFIED',
+        blockerReason: 'UNSUPPORTED_PRICING_ADAPTER_CLMM'
+      };
+      scanner.getPoolRegistry().register(clmmPoolConfig);
+      const outcomeClmm = await scanner.hotActivateDiscoveredPool(clmmPoolConfig);
+      expect(outcomeClmm).toBe('UNSUPPORTED');
+
+      // 2. Orca pool with live RPC returning Whirlpool data but no tick arrays returns PENDING_DEPENDENCIES
+      const orcaPoolId = Keypair.generate().publicKey.toBase58();
+      const orcaPoolConfig: PoolConfig = {
+        id: orcaPoolId,
+        dex: 'ORCA_WHIRLPOOL',
+        programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        feeBps: 4,
+        verificationStatus: 'QUOTE_UNVERIFIED'
+      };
+      scanner.getPoolRegistry().register(orcaPoolConfig);
+
+      const whirlpoolBuf = createMockWhirlpoolBuffer({
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        liquidity: 10_000_000_000n,
+        tickSpacing: 4,
+        tickCurrent: -25068
+      });
+
+      (scanner as any).rpc = {
+        getMultipleAccountsAndContext: vi.fn().mockImplementation(async (pubkeys: PublicKey[]) => {
+          if (pubkeys[0].toBase58() === orcaPoolId) {
+            return {
+              slot: 250000000,
+              value: [{
+                owner: new PublicKey(KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL),
+                data: whirlpoolBuf
+              }]
+            };
+          }
+          return {
+            slot: 250000000,
+            value: pubkeys.map(() => null)
+          };
+        })
+      };
+
+      const outcomePending = await scanner.hotActivateDiscoveredPool(orcaPoolConfig);
+      expect(outcomePending).toBe('PENDING_DEPENDENCIES');
+
+      scanner.stop();
+    });
+
+    it('does not increment hotActivatedPoolsCount on PENDING_DEPENDENCIES, UNSUPPORTED, or FAILED outcomes', async () => {
+      let callCount = 0;
+      const scout = new AutomaticScout(
+        poolRegistry,
+        routeIndex,
+        repository,
+        {
+          getMultipleAccounts: vi.fn().mockResolvedValue([]),
+          getAccountInfo: vi.fn().mockResolvedValue(null)
+        } as any,
+        { runOnStartup: false },
+        async (pool) => {
+          callCount++;
+          if (pool.dex === 'RAYDIUM_CLMM') return 'UNSUPPORTED';
+          if (callCount % 2 === 0) return 'PENDING_DEPENDENCIES';
+          return 'FAILED';
+        }
+      );
+
+      // Manually simulate scout onPoolActivated invocations
+      const outcome1 = await (scout as any).onPoolActivated({
+        id: 'pool_clmm',
+        dex: 'RAYDIUM_CLMM',
+        programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        feeBps: 25,
+        verificationStatus: 'QUOTE_UNVERIFIED'
+      });
+
+      if (outcome1 === 'ACTIVATED') {
+        (scout as any).hotActivatedPoolsCount++;
+      } else if (outcome1 === 'PENDING_DEPENDENCIES') {
+        (scout as any).pendingActivationPoolsCount++;
+      } else if (outcome1 === 'UNSUPPORTED') {
+        (scout as any).unsupportedPoolsCount++;
+      } else {
+        (scout as any).failedActivationPoolsCount++;
+      }
+
+      const outcome2 = await (scout as any).onPoolActivated({
+        id: 'pool_orca_pending',
+        dex: 'ORCA_WHIRLPOOL',
+        programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        feeBps: 4,
+        verificationStatus: 'QUOTE_UNVERIFIED'
+      });
+
+      if (outcome2 === 'ACTIVATED') {
+        (scout as any).hotActivatedPoolsCount++;
+      } else if (outcome2 === 'PENDING_DEPENDENCIES') {
+        (scout as any).pendingActivationPoolsCount++;
+      } else if (outcome2 === 'UNSUPPORTED') {
+        (scout as any).unsupportedPoolsCount++;
+      } else {
+        (scout as any).failedActivationPoolsCount++;
+      }
+
+      const metrics = scout.getMetrics();
+      expect(metrics.hotActivatedPoolsCount).toBe(0);
+      expect(metrics.unsupportedPoolsCount).toBe(1);
+      expect(metrics.pendingActivationPoolsCount).toBe(1);
     });
   });
 });

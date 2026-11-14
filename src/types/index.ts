@@ -440,6 +440,8 @@ export interface ScoutRunRecord {
   durationMs: number;
 }
 
+export type HotActivationOutcome = 'ACTIVATED' | 'PENDING_DEPENDENCIES' | 'FAILED' | 'UNSUPPORTED';
+
 export interface ScoutMetricsSummary {
   lastScoutRunTimestamp: number | null;
   nextScheduledScoutRun: number | null;
@@ -465,6 +467,9 @@ export interface ScoutMetricsSummary {
   discoveryErrorsCount?: number;
   subscriptionFailuresCount?: number;
   hotActivatedPoolsCount?: number;
+  pendingActivationPoolsCount?: number;
+  unsupportedPoolsCount?: number;
+  failedActivationPoolsCount?: number;
   newlyAddedRoutesCount?: number;
   totalStructurallyVerifiedPools?: number;
   unverifiedPools?: number;

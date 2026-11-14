@@ -743,17 +743,58 @@ export class RaydiumPoolDiscovery {
 
       // CLMM
       if (onChainOwner === KNOWN_PROGRAM_IDS.RAYDIUM_CLMM) {
-        if (dataLength < 1540) {
+        // Official Raydium CLMM PoolState binary layout requires at least 1544 bytes
+        if (dataLength < 1544) {
           return { address: candidate.address, verified: false, onChainOwner, dataLength, blockerReason: 'INVALID_ACCOUNT_LAYOUT' };
         }
 
-        // Positive on-chain liquidity verification in CLMM layout (offset 233, 8-16 bytes)
+        // Independently verify on-chain token mint identities from binary layout
+        // Offset 73: token_mint_0 (32 bytes), Offset 105: token_mint_1 (32 bytes)
+        const tokenMint0 = new PublicKey(accountInfo.data.subarray(73, 105)).toBase58();
+        const tokenMint1 = new PublicKey(accountInfo.data.subarray(105, 137)).toBase58();
+
+        const mintsMatch =
+          (tokenMint0 === candidate.tokenMintA && tokenMint1 === candidate.tokenMintB) ||
+          (tokenMint0 === candidate.tokenMintB && tokenMint1 === candidate.tokenMintA);
+
+        if (!mintsMatch) {
+          return {
+            address: candidate.address,
+            verified: false,
+            onChainOwner,
+            dataLength,
+            blockerReason: 'MINT_PAIR_MISMATCH'
+          };
+        }
+
+        if (!ALLOWLISTED_MINTS.has(tokenMint0) || !ALLOWLISTED_MINTS.has(tokenMint1) || tokenMint0 === tokenMint1) {
+          return {
+            address: candidate.address,
+            verified: false,
+            onChainOwner,
+            dataLength,
+            blockerReason: 'UNSUPPORTED_MINT'
+          };
+        }
+
+        // Decode complete u128 liquidity field at official offset (237: low 64 bits at 237, high 64 bits at 245)
         let clmmLiquidity = 0n;
         try {
-          clmmLiquidity = accountInfo.data.readBigUInt64LE(233);
-        } catch {}
+          const low = accountInfo.data.readBigUInt64LE(237);
+          const high = accountInfo.data.readBigUInt64LE(245);
+          clmmLiquidity = low | (high << 64n);
+        } catch (decodeErr: any) {
+          return {
+            address: candidate.address,
+            verified: false,
+            onChainOwner,
+            dataLength,
+            blockerReason: `LIQUIDITY_DECODE_FAILED: ${decodeErr.message}`
+          };
+        }
 
-        if (clmmLiquidity <= 0n && (!candidate.liquidity || BigInt(candidate.liquidity) <= 0n)) {
+        // Positive on-chain liquidity verification: Never use API liquidity as proof of on-chain verification
+        if (clmmLiquidity <= 0n) {
           return {
             address: candidate.address,
             verified: false,
@@ -769,8 +810,8 @@ export class RaydiumPoolDiscovery {
           id: candidate.address,
           dex: 'RAYDIUM_CLMM',
           programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
-          tokenAMint: candidate.tokenMintA,
-          tokenBMint: candidate.tokenMintB,
+          tokenAMint: tokenMint0,
+          tokenBMint: tokenMint1,
           feeBps: candidate.feeRate ? Math.round(candidate.feeRate * 10000) : 25,
           initialLiquidityUsd: candidateTvl > 0 ? candidateTvl : undefined,
           description: `Raydium CLMM (Discovered)`,
@@ -784,7 +825,7 @@ export class RaydiumPoolDiscovery {
           poolConfig,
           onChainOwner,
           dataLength,
-          activeLiquidity: clmmLiquidity > 0n ? clmmLiquidity.toString() : (candidate.liquidity || candidate.tvlUsdc || '1')
+          activeLiquidity: clmmLiquidity.toString()
         };
       }
 
