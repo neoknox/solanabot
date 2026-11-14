@@ -36,6 +36,20 @@ Build a persistent and expanding network of technically verified Solana arbitrag
 
 ---
 
+## FUTURE TWO-LEG / THREE-LEG ATOMIC SELECTION POLICY
+**Approved direction, documentation only. Not permission to implement live execution.**
+
+- Support **both directed two-leg and three-leg USDC round-trip arbitrage routes**. Scan and evaluate both continuously when technically VERIFIED and currently READY. Neither route type is excluded or automatically preferred solely by leg count.
+- **Rank all fresh, qualified opportunities together by conservative absolute net USDC profit** at the selected viable trade size, after DEX swap fees, price impact/slippage allowances, Solana network and priority fees, optional tips if applicable, and other modeled execution costs. Do not rank using gross profit or percentage ROI alone.
+- Maintain a **rolling Top 10 shortlist** of currently valid, profitable opportunities within the existing Sniper architecture. Re-rank on meaningful market changes. Top 10 means **up to 10 candidates eligible for future execution assessment**, not 10 mandatory trades or a promise of 10 simultaneous transactions.
+- **Tie-breaker:** prefer a two-leg route if conservative net profit and execution safety/feasibility are otherwise equivalent. A three-leg route with higher validated conservative net profit may rank above a two-leg route. Account for added compute, account footprint, failure risk and liquidity constraints.
+- Revalidate current account states, quotes, fees, output floors, route feasibility and available capital immediately before any future submission. Reject stale, blocked, unprofitable or otherwise unsafe candidates. Never allocate the same capital to overlapping opportunities; preserve the initial **1,000 USDC shared capital** rule. Future concurrent execution limits require separate authorization; initial live rollout should default to one active transaction at a time.
+- **Atomic execution invariant for future live trading:** all legs of a selected two-leg or three-leg arbitrage cycle must be instructions within **one Solana transaction**. Never submit legs as separate sequential transactions. If any instruction fails, transaction state changes revert together; blockchain transaction fees can still be charged.
+- Implement adequate per-leg minimum-output guards and a final USDC profitability constraint for future transactions, subject to verified Solana program semantics, simulation and execution safety review.
+- **Phase boundary:** the current 90-day roadmap remains strictly **read-only shadow scanning**. Phase 4 may implement the deterministic rolling Top 10 *shadow shortlist*. Phase 5 may prepare reusable account/instruction blueprints. Atomic transaction construction/simulation belongs exclusively to separately authorized **POST-ROADMAP FUTURE PHASE 2**; signing and real submission belong only to separately authorized **POST-ROADMAP FUTURE PHASE 3**. This policy does not enable wallets, signing, broadcasting, real trades or any unapproved phase.
+
+---
+
 ## SUCCESS METRICS
 - **First milestone:** 100 technically verified directed route definitions.
 - **Second:** 250 verified route definitions.
