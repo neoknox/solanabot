@@ -343,6 +343,8 @@ export type AccountDependencyRole =
   | 'PROGRAM_ID'
   | 'FEE_OWNER';
 
+export type DependencyAddressType = 'RESOLVED_PUBKEY' | 'UNRESOLVED_DESCRIPTOR';
+
 export interface StaticAccountDependency {
   pubkey: string;
   role: AccountDependencyRole | string;
@@ -351,7 +353,10 @@ export interface StaticAccountDependency {
 }
 
 export interface DynamicAccountDependency {
-  pubkey: string;
+  addressType: DependencyAddressType;
+  pubkey?: string;                     // Actual base58 Solana public key if resolved
+  descriptor?: string;                 // Descriptive identifier if unresolved dynamic dependency
+  isResolved: boolean;                 // True only if exact account address is determined
   role: AccountDependencyRole | string;
   type: 'TICK_ARRAY' | 'VAULT_RESERVE' | 'OPEN_ORDERS' | 'POOL_STATE';
   refreshIntervalMs?: number;
@@ -411,5 +416,9 @@ export interface RouteSummaryStats {
   threeLegCount: number;
   intraDexCount: number;
   interDexCount: number;
-  verifiedPoolCount: number;
+  verifiedDirectPoolCount: number;
+  unverifiedPoolCount: number;
+  totalStoredPoolCount: number;
+  persistenceErrorsCount: number;
+  verifiedPoolCount?: number;          // Backward compatibility alias for verifiedDirectPoolCount
 }

@@ -129,7 +129,7 @@ async function main() {
   console.log('\n--- PHASE 1.4 PERMANENT ROUTE LIBRARY BENCHMARK ---');
   const routeLibStats = scanner.getRouteLibrarySummary();
   console.log(`  Total Persistent Routes in SQLite:     ${routeLibStats.totalRoutes}`);
-  console.log(`  - Verified Routes:                     ${routeLibStats.verifiedCount}`);
+  console.log(`  - Structurally Verified Routes:        ${routeLibStats.verifiedCount}`);
   console.log(`  - Live READY Routes:                   ${routeLibStats.readyCount}`);
   console.log(`  - Stale Routes:                        ${routeLibStats.staleCount}`);
   console.log(`  - Blocked Routes:                      ${routeLibStats.blockedCount}`);
@@ -137,7 +137,11 @@ async function main() {
   console.log(`  - 3-Leg Cycles:                        ${routeLibStats.threeLegCount}`);
   console.log(`  - Intra-DEX Routes:                    ${routeLibStats.intraDexCount}`);
   console.log(`  - Inter-DEX Routes:                    ${routeLibStats.interDexCount}`);
-  console.log(`  Verified Pools Stored:                 ${routeLibStats.verifiedPoolCount}`);
+  console.log(`  Pool Storage Breakdown:`);
+  console.log(`  - Total Stored Pools:                  ${routeLibStats.totalStoredPoolCount}`);
+  console.log(`  - VERIFIED_DIRECT Pools:               ${routeLibStats.verifiedDirectPoolCount}`);
+  console.log(`  - QUOTE_UNVERIFIED Pools:              ${routeLibStats.unverifiedPoolCount}`);
+  console.log(`  Persistence Errors Count:              ${routeLibStats.persistenceErrorsCount}`);
 
   console.log('\n--- RUNTIME POOL VERIFICATION STATUS ---');
   const poolReg = scanner.getPoolRegistry();

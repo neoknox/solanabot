@@ -230,7 +230,9 @@ export class RouteIndex {
 
       if (!seenDynamic.has(leg.poolId)) {
         dynamicDeps.push({
+          addressType: 'RESOLVED_PUBKEY',
           pubkey: leg.poolId,
+          isResolved: true,
           role: 'POOL_ACCOUNT',
           type: 'POOL_STATE',
           refreshIntervalMs: 400
@@ -239,36 +241,42 @@ export class RouteIndex {
       }
 
       if (pool.dex === 'ORCA_WHIRLPOOL') {
-        const tickKey = `${leg.poolId}:tick_arrays`;
-        if (!seenDynamic.has(tickKey)) {
+        const tickDesc = `${leg.poolId}:ORCA_TICK_ARRAYS_DYNAMIC`;
+        if (!seenDynamic.has(tickDesc)) {
           dynamicDeps.push({
-            pubkey: tickKey,
+            addressType: 'UNRESOLVED_DESCRIPTOR',
+            descriptor: 'ORCA_TICK_ARRAYS_DYNAMIC',
+            isResolved: false,
             role: 'TICK_ARRAY',
             type: 'TICK_ARRAY',
             refreshIntervalMs: 400
           });
-          seenDynamic.add(tickKey);
+          seenDynamic.add(tickDesc);
         }
       } else if (pool.dex === 'RAYDIUM_AMM') {
-        const vaultKey = `${leg.poolId}:vaults`;
-        if (!seenDynamic.has(vaultKey)) {
+        const vaultDesc = `${leg.poolId}:RAYDIUM_VAULT_RESERVES_DYNAMIC`;
+        if (!seenDynamic.has(vaultDesc)) {
           dynamicDeps.push({
-            pubkey: vaultKey,
+            addressType: 'UNRESOLVED_DESCRIPTOR',
+            descriptor: 'RAYDIUM_VAULT_RESERVES_DYNAMIC',
+            isResolved: false,
             role: 'TOKEN_VAULT_A',
             type: 'VAULT_RESERVE',
             refreshIntervalMs: 400
           });
-          seenDynamic.add(vaultKey);
+          seenDynamic.add(vaultDesc);
         }
-        const openOrdersKey = `${leg.poolId}:open_orders`;
-        if (!seenDynamic.has(openOrdersKey)) {
+        const openOrdersDesc = `${leg.poolId}:RAYDIUM_OPEN_ORDERS_DYNAMIC`;
+        if (!seenDynamic.has(openOrdersDesc)) {
           dynamicDeps.push({
-            pubkey: openOrdersKey,
+            addressType: 'UNRESOLVED_DESCRIPTOR',
+            descriptor: 'RAYDIUM_OPEN_ORDERS_DYNAMIC',
+            isResolved: false,
             role: 'OPEN_ORDERS',
             type: 'OPEN_ORDERS',
             refreshIntervalMs: 400
           });
-          seenDynamic.add(openOrdersKey);
+          seenDynamic.add(openOrdersDesc);
         }
       }
     }
@@ -335,6 +343,10 @@ export class RouteIndex {
           const leg2 = { poolId: poolB.id, dex: poolB.dex, inputMint: tokenA, outputMint: CANONICAL_USDC_MINT };
           const deps = this.buildDependenciesForLegs([leg1, leg2]);
 
+          const routeLastVerified = isDirectToDirect
+            ? Math.min(poolA.lastVerifiedAt || 0, poolB.lastVerifiedAt || 0)
+            : 0;
+
           const route: IndexedDirectedRoute = {
             routeId: `${poolA.id}->${poolB.id}`,
             cycleType: '2_LEG',
@@ -356,7 +368,7 @@ export class RouteIndex {
             staticDependencies: deps.staticDependencies,
             dynamicDependencies: deps.dynamicDependencies,
             protocolAdapterVersion: '1.4.0',
-            lastVerifiedAt: Date.now(),
+            lastVerifiedAt: routeLastVerified,
             isUnprofitablePreserved: true
           };
 
@@ -408,6 +420,10 @@ export class RouteIndex {
             const leg3 = { poolId: p3.id, dex: p3.dex, inputMint: pattern.tokenB, outputMint: CANONICAL_USDC_MINT };
             const deps = this.buildDependenciesForLegs([leg1, leg2, leg3]);
 
+            const routeLastVerified = isDirectToDirect
+              ? Math.min(p1.lastVerifiedAt || 0, p2.lastVerifiedAt || 0, p3.lastVerifiedAt || 0)
+              : 0;
+
             const route: IndexedDirectedRoute = {
               routeId: `${p1.id}->${p2.id}->${p3.id}`,
               cycleType: '3_LEG',
@@ -432,7 +448,7 @@ export class RouteIndex {
               staticDependencies: deps.staticDependencies,
               dynamicDependencies: deps.dynamicDependencies,
               protocolAdapterVersion: '1.4.0',
-              lastVerifiedAt: Date.now(),
+              lastVerifiedAt: routeLastVerified,
               isUnprofitablePreserved: true
             };
 
@@ -529,38 +545,195 @@ export class RouteIndex {
     return this.allRoutes.filter(r => r.state === 'STALE').length;
   }
 
-  public setRouteReady(routeId: string, quoteStats?: { expectedNetUSDC: string; timestamp: number }): void {
+  public setRouteReady(routeId: string, quoteStats?: { expectedNetUSDC: string; timestamp: number }): boolean {
     const route = this.routeById.get(routeId);
-    if (!route) return;
+    if (!route || !route.isDirectToDirect || route.state === 'BLOCKED') {
+      return false;
+    }
 
     route.state = 'READY';
     if (quoteStats) {
       route.lastQuoteExpectedNetUSDC = quoteStats.expectedNetUSDC;
       route.lastQuoteTimestamp = quoteStats.timestamp;
     }
+    return true;
   }
 
-  public setRouteStale(routeId: string, reason?: string): void {
+  public setRouteStale(routeId: string, reason?: string): boolean {
     const route = this.routeById.get(routeId);
-    if (!route) return;
+    if (!route || !route.isDirectToDirect || route.state === 'BLOCKED') {
+      return false;
+    }
 
     // Transitory freshness loss: transitions READY or VERIFIED -> STALE.
     // Crucial: do not mark structurally valid routes as BLOCKED!
-    if (route.state === 'READY' || route.state === 'VERIFIED') {
-      route.state = 'STALE';
-      if (reason) {
-        route.verificationDetails = reason;
-      }
+    route.state = 'STALE';
+    if (reason) {
+      route.verificationDetails = reason;
     }
+    return true;
   }
 
-  public restoreRouteIfFresh(routeId: string): void {
+  /**
+   * Restores a STALE route to READY only after validating that all dependency pool states
+   * exist, have healthy feed status, are within slot age limits, and satisfy slot gap constraints.
+   */
+  public validateAndRestoreRoute(
+    routeId: string,
+    getPoolState: (poolId: string) => { receivedAt?: number; slot?: number; feedHealth?: string } | undefined,
+    maxSlotAgeMs: number = 5000,
+    maxSlotGap: number = 20,
+    currentSlot?: number
+  ): boolean {
     const route = this.routeById.get(routeId);
-    if (!route) return;
-
-    if (route.state === 'STALE' && route.isDirectToDirect) {
-      route.state = 'READY';
+    if (!route || !route.isDirectToDirect || route.state === 'BLOCKED') {
+      return false;
     }
+
+    const now = Date.now();
+    let minSlot = Infinity;
+    let maxSlot = -Infinity;
+
+    for (const leg of route.legs) {
+      const poolState = getPoolState(leg.poolId);
+      if (!poolState) {
+        route.state = 'STALE';
+        route.verificationDetails = `MISSING_DEPENDENCY_STATE:${leg.poolId}`;
+        return false;
+      }
+
+      if (poolState.feedHealth && poolState.feedHealth !== 'HEALTHY') {
+        route.state = 'STALE';
+        route.verificationDetails = `UNHEALTHY_FEED:${leg.poolId}`;
+        return false;
+      }
+
+      if (poolState.receivedAt && (now - poolState.receivedAt > maxSlotAgeMs)) {
+        route.state = 'STALE';
+        route.verificationDetails = `EXPIRED_DEPENDENCY_STATE:${leg.poolId}`;
+        return false;
+      }
+
+      if (poolState.slot !== undefined) {
+        if (currentSlot !== undefined && poolState.slot > currentSlot + 10) {
+          route.state = 'STALE';
+          route.verificationDetails = `FUTURE_SLOT:${leg.poolId}`;
+          return false;
+        }
+        if (poolState.slot < minSlot) minSlot = poolState.slot;
+        if (poolState.slot > maxSlot) maxSlot = poolState.slot;
+      }
+    }
+
+    if (maxSlot !== -Infinity && minSlot !== Infinity && (maxSlot - minSlot > maxSlotGap)) {
+      route.state = 'STALE';
+      route.verificationDetails = 'SLOT_GAP_EXCEEDED';
+      return false;
+    }
+
+    // Dependencies verified fresh -> restore to READY
+    route.state = 'READY';
+    return true;
+  }
+
+  /**
+   * Reconciles saved routes from SQLite into the active RouteIndex.
+   * Saved routes must pass current pool and adapter verification before becoming eligible for live quoting.
+   */
+  public reconcilePersistentRoutes(savedRoutes: PermanentRouteRecord[]): { recovered: number; blocked: number; updated: number } {
+    let recovered = 0;
+    let blocked = 0;
+    let updated = 0;
+
+    for (const saved of savedRoutes) {
+      // 1. Verify every pool exists in current PoolRegistry configs
+      const poolsExist = saved.orderedPoolIds.every(id => this.poolConfigs.has(id));
+      if (!poolsExist) {
+        blocked++;
+        continue;
+      }
+
+      // 2. Verify all pools are VERIFIED_DIRECT
+      const allDirect = saved.orderedPoolIds.every(id => {
+        const pool = this.poolConfigs.get(id);
+        return pool && this.isPoolVerifiedDirect(pool);
+      });
+
+      // Saved routes never start as READY upon restart; they start as VERIFIED or BLOCKED
+      const targetState: RouteState = allDirect ? 'VERIFIED' : 'BLOCKED';
+
+      const existing = this.routeById.get(saved.routeId);
+      if (existing) {
+        existing.state = targetState;
+        existing.isDirectToDirect = allDirect;
+        existing.isUnprofitablePreserved = saved.isUnprofitablePreserved !== false;
+        existing.lastQuoteExpectedNetUSDC = saved.lastQuoteExpectedNetUSDC;
+        existing.lastQuoteTimestamp = saved.lastQuoteTimestamp;
+        if (saved.lastVerifiedAt) existing.lastVerifiedAt = saved.lastVerifiedAt;
+        updated++;
+      } else {
+        // Reconstruct from saved record
+        const legs: RouteLegInfo[] = [];
+        for (let i = 0; i < saved.orderedPoolIds.length; i++) {
+          const poolId = saved.orderedPoolIds[i];
+          const pool = this.poolConfigs.get(poolId)!;
+          const inputMint = saved.orderedTokens[i];
+          const outputMint = saved.orderedTokens[i + 1] || saved.orderedTokens[0];
+          legs.push({ poolId, dex: pool.dex, inputMint, outputMint });
+        }
+
+        const poolA = this.poolConfigs.get(legs[0].poolId)!;
+        const poolB = this.poolConfigs.get(legs[1].poolId)!;
+        const poolC = legs[2] ? this.poolConfigs.get(legs[2].poolId) : undefined;
+
+        let priority = 0;
+        if (allDirect) priority += (saved.cycleType === '3_LEG' ? 800 : 1000);
+        if (saved.isIntraDex) priority += (saved.cycleType === '3_LEG' ? 150 : 200);
+
+        const newRoute: IndexedDirectedRoute = {
+          routeId: saved.routeId,
+          cycleType: saved.cycleType,
+          isIntraDex: saved.isIntraDex,
+          isDirectToDirect: allDirect,
+          priorityScore: priority,
+          legs,
+          poolIds: [...saved.orderedPoolIds],
+          poolAId: poolA.id,
+          poolBId: poolB.id,
+          poolCId: poolC?.id,
+          dexA: poolA.dex,
+          dexB: poolB.dex,
+          dexC: poolC?.dex,
+          inputMint: legs[0].inputMint,
+          intermediateMint: legs[0].outputMint,
+          tokenBMint: legs[2] ? legs[1].outputMint : undefined,
+          outputMint: legs[legs.length - 1].outputMint,
+          estimatedAccounts: saved.estimatedAccounts,
+          estimatedComputeUnits: saved.estimatedComputeUnits,
+          state: targetState,
+          staticDependencies: saved.staticDependencies,
+          dynamicDependencies: saved.dynamicDependencies,
+          protocolAdapterVersion: saved.protocolAdapterVersion || '1.4.0',
+          lastVerifiedAt: saved.lastVerifiedAt || 0,
+          isUnprofitablePreserved: saved.isUnprofitablePreserved !== false,
+          lastQuoteExpectedNetUSDC: saved.lastQuoteExpectedNetUSDC,
+          lastQuoteTimestamp: saved.lastQuoteTimestamp,
+          verificationDetails: saved.verificationDetails
+        };
+
+        this.allRoutes.push(newRoute);
+        this.routeById.set(newRoute.routeId, newRoute);
+        for (const pid of saved.orderedPoolIds) {
+          this.mapPoolToRoute(pid, newRoute);
+        }
+
+        if (allDirect) recovered++;
+        else blocked++;
+      }
+    }
+
+    this.allRoutes.sort((a, b) => b.priorityScore - a.priorityScore);
+    return { recovered, blocked, updated };
   }
 
   public toPermanentRecord(route: IndexedDirectedRoute): PermanentRouteRecord {
@@ -590,7 +763,7 @@ export class RouteIndex {
       lastQuoteExpectedNetUSDC: route.lastQuoteExpectedNetUSDC,
       lastQuoteTimestamp: route.lastQuoteTimestamp,
       verificationDetails: route.verificationDetails,
-      lastVerifiedAt: route.lastVerifiedAt || Date.now(),
+      lastVerifiedAt: route.lastVerifiedAt || 0,
       createdAt: Date.now(),
       updatedAt: Date.now()
     };

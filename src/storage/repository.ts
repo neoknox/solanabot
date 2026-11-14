@@ -89,8 +89,26 @@ export class ArbitrageRepository {
   private batchInsertTransaction: Database.Transaction<(items: ArbitrageCandidate[]) => void>;
   private batchUpsertRoutesTx: Database.Transaction<(items: PermanentRouteRecord[]) => void>;
   private batchUpsertPoolsTx: Database.Transaction<(items: VerifiedPoolRecord[]) => void>;
+  private batchUpdateReadinessTx: Database.Transaction<(items: Array<{
+    routeId: string;
+    state: RouteState;
+    details?: string;
+    lastQuoteExpectedNetUSDC?: string;
+    lastQuoteTimestamp?: number;
+    updatedAt: number;
+  }>) => void>;
   private candidateQueue: ArbitrageCandidate[] = [];
+  private routeReadinessQueue = new Map<string, {
+    routeId: string;
+    state: RouteState;
+    details?: string;
+    lastQuoteExpectedNetUSDC?: string;
+    lastQuoteTimestamp?: number;
+    updatedAt: number;
+  }>();
   private flushTimer: NodeJS.Timeout | null = null;
+  private persistenceErrorsCount = 0;
+  private lastPersistenceError?: { operation: string; error: string; timestamp: number };
 
   constructor(config: AppConfig, customDb?: Database.Database) {
     this.config = config;
@@ -206,6 +224,19 @@ export class ArbitrageRepository {
       }
     });
 
+    this.batchUpdateReadinessTx = this.db.transaction((items) => {
+      for (const item of items) {
+        this.updateRouteReadinessStmt.run(
+          item.state,
+          item.lastQuoteExpectedNetUSDC ?? null,
+          item.lastQuoteTimestamp ?? null,
+          item.details ?? null,
+          item.updatedAt,
+          item.routeId
+        );
+      }
+    });
+
     // Background flush timer to keep SQLite writes off the quote hot path
     this.flushTimer = setInterval(() => {
       this.flushSync();
@@ -256,7 +287,24 @@ export class ArbitrageRepository {
         candidate.slotGap,
         candidate.timestamp
       );
-    } catch {}
+    } catch (err) {
+      this.recordPersistenceError('executeInsertCandidate', err);
+    }
+  }
+
+  public getPersistenceErrorsCount(): number {
+    return this.persistenceErrorsCount;
+  }
+
+  public getLastPersistenceError(): { operation: string; error: string; timestamp: number } | undefined {
+    return this.lastPersistenceError;
+  }
+
+  public recordPersistenceError(operation: string, err: any): void {
+    this.persistenceErrorsCount++;
+    const msg = err instanceof Error ? err.message : String(err);
+    this.lastPersistenceError = { operation, error: msg, timestamp: Date.now() };
+    this.logProviderEvent('ArbitrageRepository', 'PERSISTENCE_ERROR', undefined, undefined, `${operation}: ${msg}`);
   }
 
   private executeUpsertRoute(route: PermanentRouteRecord): void {
@@ -279,11 +327,14 @@ export class ArbitrageRepository {
         route.lastQuoteExpectedNetUSDC ?? null,
         route.lastQuoteTimestamp ?? null,
         route.verificationDetails ?? null,
-        route.lastVerifiedAt || now,
+        route.lastVerifiedAt || 0,
         route.createdAt || now,
         route.updatedAt || now
       );
-    } catch {}
+    } catch (err) {
+      this.recordPersistenceError('executeUpsertRoute', err);
+      throw err;
+    }
   }
 
   private executeUpsertPool(pool: VerifiedPoolRecord): void {
@@ -300,38 +351,54 @@ export class ArbitrageRepository {
         pool.blockerReason ?? null,
         pool.initialLiquidityUsd ?? 0,
         pool.accountLayoutSize ?? 0,
-        pool.lastVerifiedAt || now,
+        pool.lastVerifiedAt || 0,
         pool.createdAt || now
       );
-    } catch {}
+    } catch (err) {
+      this.recordPersistenceError('executeUpsertPool', err);
+      throw err;
+    }
   }
 
-  public saveRoute(route: PermanentRouteRecord): void {
-    this.executeUpsertRoute(route);
+  public saveRoute(route: PermanentRouteRecord): boolean {
+    try {
+      this.executeUpsertRoute(route);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
-  public upsertRoutes(routes: PermanentRouteRecord[]): void {
-    if (routes.length === 0) return;
+  public upsertRoutes(routes: PermanentRouteRecord[]): boolean {
+    if (routes.length === 0) return true;
     try {
       this.batchUpsertRoutesTx(routes);
-    } catch {
+      return true;
+    } catch (err) {
+      this.recordPersistenceError('batchUpsertRoutes', err);
       for (const route of routes) {
-        this.executeUpsertRoute(route);
+        try {
+          this.executeUpsertRoute(route);
+        } catch {}
       }
+      return false;
     }
   }
 
   public getRoute(routeId: string): PermanentRouteRecord | null {
+    this.flushSync();
     const row = this.selectRouteStmt.get(routeId) as Record<string, unknown> | undefined;
     return row ? rowToRouteRecord(row) : null;
   }
 
   public getAllRoutes(): PermanentRouteRecord[] {
+    this.flushSync();
     const rows = this.selectAllRoutesStmt.all() as Array<Record<string, unknown>>;
     return rows.map(rowToRouteRecord);
   }
 
   public getRoutesByState(state: RouteState): PermanentRouteRecord[] {
+    this.flushSync();
     const rows = this.selectRoutesByStateStmt.all(state) as Array<Record<string, unknown>>;
     return rows.map(rowToRouteRecord);
   }
@@ -339,7 +406,9 @@ export class ArbitrageRepository {
   public updateRouteState(routeId: string, state: RouteState, details?: string): void {
     try {
       this.updateRouteStateStmt.run(state, details ?? null, Date.now(), routeId);
-    } catch {}
+    } catch (err) {
+      this.recordPersistenceError('updateRouteState', err);
+    }
   }
 
   public updateRouteReadiness(
@@ -349,35 +418,50 @@ export class ArbitrageRepository {
     quoteStats?: { expectedNetUSDC: string; timestamp: number }
   ): void {
     const state: RouteState = isReady ? 'READY' : 'STALE';
-    try {
-      this.updateRouteReadinessStmt.run(
-        state,
-        quoteStats?.expectedNetUSDC ?? null,
-        quoteStats?.timestamp ?? null,
-        details ?? null,
-        Date.now(),
-        routeId
-      );
-    } catch {}
+    // Non-blocking in-memory queue with key coalescing to keep writes off the quoting hot path
+    this.routeReadinessQueue.set(routeId, {
+      routeId,
+      state,
+      details,
+      lastQuoteExpectedNetUSDC: quoteStats?.expectedNetUSDC,
+      lastQuoteTimestamp: quoteStats?.timestamp,
+      updatedAt: Date.now()
+    });
   }
 
   public deleteRoute(routeId: string): boolean {
-    const result = this.db.prepare('DELETE FROM routes WHERE route_id = ?').run(routeId);
-    return result.changes > 0;
+    this.flushSync();
+    try {
+      const result = this.db.prepare('DELETE FROM routes WHERE route_id = ?').run(routeId);
+      return result.changes > 0;
+    } catch (err) {
+      this.recordPersistenceError('deleteRoute', err);
+      return false;
+    }
   }
 
-  public saveVerifiedPool(pool: VerifiedPoolRecord): void {
-    this.executeUpsertPool(pool);
+  public saveVerifiedPool(pool: VerifiedPoolRecord): boolean {
+    try {
+      this.executeUpsertPool(pool);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
-  public upsertVerifiedPools(pools: VerifiedPoolRecord[]): void {
-    if (pools.length === 0) return;
+  public upsertVerifiedPools(pools: VerifiedPoolRecord[]): boolean {
+    if (pools.length === 0) return true;
     try {
       this.batchUpsertPoolsTx(pools);
-    } catch {
+      return true;
+    } catch (err) {
+      this.recordPersistenceError('batchUpsertPools', err);
       for (const pool of pools) {
-        this.executeUpsertPool(pool);
+        try {
+          this.executeUpsertPool(pool);
+        } catch {}
       }
+      return false;
     }
   }
 
@@ -392,8 +476,15 @@ export class ArbitrageRepository {
   }
 
   public getRouteSummaryStats(): RouteSummaryStats {
+    this.flushSync();
     const rows = this.selectAllRoutesStmt.all() as Array<Record<string, unknown>>;
-    const poolRows = this.selectAllPoolsStmt.all() as Array<Record<string, unknown>>;
+    const poolStatsRow = this.db.prepare(`
+      SELECT 
+        COUNT(*) as totalPools,
+        SUM(CASE WHEN verification_status = 'VERIFIED_DIRECT' THEN 1 ELSE 0 END) as verifiedDirectCount,
+        SUM(CASE WHEN verification_status != 'VERIFIED_DIRECT' THEN 1 ELSE 0 END) as unverifiedCount
+      FROM verified_pools
+    `).get() as { totalPools: number; verifiedDirectCount: number | null; unverifiedCount: number | null };
 
     let discoveredCount = 0;
     let verifiedCount = 0;
@@ -422,6 +513,10 @@ export class ArbitrageRepository {
       else interDexCount++;
     }
 
+    const verifiedDirect = poolStatsRow?.verifiedDirectCount || 0;
+    const unverified = poolStatsRow?.unverifiedCount || 0;
+    const totalPools = poolStatsRow?.totalPools || 0;
+
     return {
       totalRoutes: rows.length,
       discoveredCount,
@@ -434,7 +529,11 @@ export class ArbitrageRepository {
       threeLegCount,
       intraDexCount,
       interDexCount,
-      verifiedPoolCount: poolRows.length
+      verifiedDirectPoolCount: verifiedDirect,
+      unverifiedPoolCount: unverified,
+      totalStoredPoolCount: totalPools,
+      persistenceErrorsCount: this.persistenceErrorsCount,
+      verifiedPoolCount: verifiedDirect
     };
   }
 
@@ -457,11 +556,24 @@ export class ArbitrageRepository {
   }
 
   public flushSync(): void {
-    if (this.candidateQueue.length === 0) return;
-    const batch = this.candidateQueue.splice(0, this.candidateQueue.length);
-    try {
-      this.batchInsertTransaction(batch);
-    } catch {}
+    if (this.candidateQueue.length > 0) {
+      const batch = this.candidateQueue.splice(0, this.candidateQueue.length);
+      try {
+        this.batchInsertTransaction(batch);
+      } catch (err) {
+        this.recordPersistenceError('flushCandidates', err);
+      }
+    }
+
+    if (this.routeReadinessQueue.size > 0) {
+      const updates = Array.from(this.routeReadinessQueue.values());
+      this.routeReadinessQueue.clear();
+      try {
+        this.batchUpdateReadinessTx(updates);
+      } catch (err) {
+        this.recordPersistenceError('flushRouteReadiness', err);
+      }
+    }
   }
 
   public logProviderEvent(

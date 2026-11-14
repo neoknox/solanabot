@@ -1,4 +1,4 @@
-import { DexType, PoolState } from '../types/index.js';
+import { DexType, PoolState, VerifiedPoolRecord } from '../types/index.js';
 import type { DiscoveredCandidate } from './poolDiscovery.js';
 import {
   CANONICAL_WSOL_MINT,
@@ -20,6 +20,7 @@ export interface PoolConfig {
   description?: string;
   verificationStatus?: VerificationStatus;
   blockerReason?: string;
+  lastVerifiedAt?: number;
 }
 
 export class PoolRegistry {
@@ -41,7 +42,8 @@ export class PoolRegistry {
       initialLiquidityUsd: 15000000,
       description: 'Raydium AMM V4 Main SOL/USDC Pool',
       verificationStatus: 'QUOTE_UNVERIFIED',
-      blockerReason: 'PENDING_RUNTIME_VERIFICATION'
+      blockerReason: 'PENDING_RUNTIME_VERIFICATION',
+      lastVerifiedAt: 0
     });
 
     // 2. Orca Whirlpool (0.04% / 4 bps primary SOL/USDC Whirlpool, verified on-chain)
@@ -54,7 +56,8 @@ export class PoolRegistry {
       feeBps: 4,
       initialLiquidityUsd: 32000000,
       description: 'Orca Whirlpool 0.04% SOL/USDC',
-      verificationStatus: 'VERIFIED_DIRECT'
+      verificationStatus: 'VERIFIED_DIRECT',
+      lastVerifiedAt: 1700000000000
     });
 
     // 3. Orca Whirlpool Secondary (FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q, verified on-chain 2 bps)
@@ -68,7 +71,8 @@ export class PoolRegistry {
       feeBps: 2,
       initialLiquidityUsd: 1200000,
       description: 'Orca Whirlpool 0.02% SOL/USDC (Intra-DEX tier)',
-      verificationStatus: 'VERIFIED_DIRECT'
+      verificationStatus: 'VERIFIED_DIRECT',
+      lastVerifiedAt: 1700000000000
     });
 
     // 4. Meteora DLMM (Primary dynamic bin pool - marked QUOTE_UNVERIFIED without bin-array streaming)
@@ -82,7 +86,8 @@ export class PoolRegistry {
       initialLiquidityUsd: 500000,
       description: 'Meteora DLMM Dynamic Bin SOL/USDC (QUOTE_UNVERIFIED: pending bin-array streaming)',
       verificationStatus: 'QUOTE_UNVERIFIED',
-      blockerReason: 'MISSING_BIN_ARRAYS'
+      blockerReason: 'MISSING_BIN_ARRAYS',
+      lastVerifiedAt: 0
     });
 
     // 5. Orca Whirlpool USDC/USDT 0.01% (verified on-chain, 653-byte layout)
@@ -95,7 +100,8 @@ export class PoolRegistry {
       feeBps: 1,
       initialLiquidityUsd: 25000000,
       description: 'Orca Whirlpool 0.01% USDC/USDT Stable Pair',
-      verificationStatus: 'VERIFIED_DIRECT'
+      verificationStatus: 'VERIFIED_DIRECT',
+      lastVerifiedAt: 1700000000000
     });
 
     // 6. Raydium AMM V4 WSOL/USDT (dynamic runtime verification)
@@ -109,7 +115,8 @@ export class PoolRegistry {
       initialLiquidityUsd: 8500000,
       description: 'Raydium AMM V4 Main SOL/USDT Pool',
       verificationStatus: 'QUOTE_UNVERIFIED',
-      blockerReason: 'PENDING_RUNTIME_VERIFICATION'
+      blockerReason: 'PENDING_RUNTIME_VERIFICATION',
+      lastVerifiedAt: 0
     });
 
     // 7. Raydium CLMM (Concentrated Liquidity, verified on-chain)
@@ -123,7 +130,8 @@ export class PoolRegistry {
       initialLiquidityUsd: 4000000,
       description: 'Raydium CLMM SOL/USDC',
       verificationStatus: 'QUOTE_UNVERIFIED',
-      blockerReason: 'PENDING_ORDERBOOK_STREAMING'
+      blockerReason: 'PENDING_ORDERBOOK_STREAMING',
+      lastVerifiedAt: 0
     });
 
     // 8. Phoenix Market (Orderbook DEX on Solana, verified on-chain)
@@ -137,7 +145,8 @@ export class PoolRegistry {
       initialLiquidityUsd: 8000000,
       description: 'Phoenix Orderbook SOL/USDC Market',
       verificationStatus: 'QUOTE_UNVERIFIED',
-      blockerReason: 'PENDING_ORDERBOOK_STREAMING'
+      blockerReason: 'PENDING_ORDERBOOK_STREAMING',
+      lastVerifiedAt: 0
     });
   }
 
@@ -167,7 +176,8 @@ export class PoolRegistry {
         feeBps: candidate.feeRate ? Math.max(1, Math.round(candidate.feeRate / 100)) : 1,
         description: `Orca Whirlpool (Discovered) ${candidate.feeRate ? Math.round(candidate.feeRate / 100) : 1} bps`,
         verificationStatus: 'QUOTE_UNVERIFIED',
-        blockerReason: 'PENDING_ONCHAIN_REVALIDATION'
+        blockerReason: 'PENDING_ONCHAIN_REVALIDATION',
+        lastVerifiedAt: 0
       });
       addedCount++;
     }
@@ -186,12 +196,47 @@ export class PoolRegistry {
     return Array.from(this.pools.values()).filter(p => p.dex === dex);
   }
 
-  public updatePoolVerification(id: string, status: VerificationStatus, blockerReason?: string): void {
+  public updatePoolVerification(id: string, status: VerificationStatus, blockerReason?: string, lastVerifiedAt?: number): void {
     const pool = this.pools.get(id);
     if (pool) {
       pool.verificationStatus = status;
       pool.blockerReason = blockerReason;
+      if (lastVerifiedAt !== undefined) {
+        pool.lastVerifiedAt = lastVerifiedAt;
+      } else if (status === 'VERIFIED_DIRECT' && !pool.lastVerifiedAt) {
+        pool.lastVerifiedAt = Date.now();
+      } else if (status === 'QUOTE_UNVERIFIED') {
+        pool.lastVerifiedAt = 0;
+      }
     }
+  }
+
+  public loadPersistedPools(persisted: VerifiedPoolRecord[]): number {
+    let count = 0;
+    for (const record of persisted) {
+      const existing = this.pools.get(record.poolId);
+      if (existing) {
+        existing.verificationStatus = record.verificationStatus;
+        existing.blockerReason = record.blockerReason;
+        existing.lastVerifiedAt = record.lastVerifiedAt;
+        count++;
+      } else {
+        this.register({
+          id: record.poolId,
+          dex: record.dex,
+          programId: record.programId,
+          tokenAMint: record.tokenAMint,
+          tokenBMint: record.tokenBMint,
+          feeBps: record.feeBps,
+          initialLiquidityUsd: record.initialLiquidityUsd,
+          verificationStatus: record.verificationStatus,
+          blockerReason: record.blockerReason,
+          lastVerifiedAt: record.lastVerifiedAt
+        });
+        count++;
+      }
+    }
+    return count;
   }
 
   public isPoolVerified(id: string): boolean {

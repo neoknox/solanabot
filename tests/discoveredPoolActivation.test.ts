@@ -24,7 +24,7 @@ describe('Phase 1.3: Discovered Pool Activation & Safety Suite', () => {
 
   beforeEach(() => {
     if (fs.existsSync(testDir)) {
-      fs.rmSync(testDir, { recursive: true, force: true });
+      try { fs.rmSync(testDir, { recursive: true, force: true }); } catch {}
     }
     fs.mkdirSync(testDir, { recursive: true });
     vi.restoreAllMocks();
@@ -32,7 +32,7 @@ describe('Phase 1.3: Discovered Pool Activation & Safety Suite', () => {
 
   afterEach(() => {
     if (fs.existsSync(testDir)) {
-      fs.rmSync(testDir, { recursive: true, force: true });
+      try { fs.rmSync(testDir, { recursive: true, force: true }); } catch {}
     }
   });
 
@@ -131,7 +131,10 @@ describe('Phase 1.3: Discovered Pool Activation & Safety Suite', () => {
     };
     saveDiscoveredCandidates([candidate], testDiscoveryFile);
 
-    const config = loadConfig({ DISCOVERED_POOLS_FILE: testDiscoveryFile });
+    const config = loadConfig({
+      DISCOVERED_POOLS_FILE: testDiscoveryFile,
+      DB_PATH: path.join(testDir, 'scanner1.db')
+    });
     const scanner = new ArbitrageScanner(config);
     const registry = scanner.getPoolRegistry();
 
@@ -148,6 +151,7 @@ describe('Phase 1.3: Discovered Pool Activation & Safety Suite', () => {
     expect(registry.getPool('Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE')?.verificationStatus).toBe('VERIFIED_DIRECT');
     expect(registry.getPool('FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q')?.verificationStatus).toBe('VERIFIED_DIRECT');
     expect(registry.getPool('4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4')?.verificationStatus).toBe('VERIFIED_DIRECT');
+    scanner.stop();
   });
 
   // 3. Exact Mint Pair Matching
@@ -323,7 +327,10 @@ describe('Phase 1.3: Discovered Pool Activation & Safety Suite', () => {
     };
     saveDiscoveredCandidates([candidate], testDiscoveryFile);
 
-    const config = loadConfig({ DISCOVERED_POOLS_FILE: testDiscoveryFile });
+    const config = loadConfig({
+      DISCOVERED_POOLS_FILE: testDiscoveryFile,
+      DB_PATH: path.join(testDir, 'scanner1.db')
+    });
 
     const poolBuf = createMockWhirlpoolBuffer({
       tickSpacing: 4,
@@ -378,23 +385,32 @@ describe('Phase 1.3: Discovered Pool Activation & Safety Suite', () => {
 
     // Incomplete tick array sequence still fails closed (remains QUOTE_UNVERIFIED)
     expect(registry.getPool(discoveredAddr)?.verificationStatus).toBe('QUOTE_UNVERIFIED');
+    scanner.stop();
   });
 
   // 9. Existing Route Preservation & Non-blocking Startup
   it('preserves existing routes intact and handles missing or corrupt persistence files without hanging', () => {
     // A) Missing file: scanner initializes cleanly with 8 default pools
     const missingFile = path.join(testDir, 'missing_pools.json');
-    const configMissing = loadConfig({ DISCOVERED_POOLS_FILE: missingFile });
+    const configMissing = loadConfig({
+      DISCOVERED_POOLS_FILE: missingFile,
+      DB_PATH: path.join(testDir, 'scanner_missing.db')
+    });
     const scannerMissing = new ArbitrageScanner(configMissing);
     expect(scannerMissing.getPoolRegistry().getAllPools().length).toBe(8);
     expect(scannerMissing.getRouteIndex().getRouteCount()).toBe(42);
+    scannerMissing.stop();
 
     // B) Corrupt file: scanner initializes cleanly with warning and default pools intact
     const corruptFile = path.join(testDir, 'corrupt_pools.json');
     fs.writeFileSync(corruptFile, '{ "invalid_json": true, malformed }', 'utf-8');
-    const configCorrupt = loadConfig({ DISCOVERED_POOLS_FILE: corruptFile });
+    const configCorrupt = loadConfig({
+      DISCOVERED_POOLS_FILE: corruptFile,
+      DB_PATH: path.join(testDir, 'scanner_corrupt.db')
+    });
     const scannerCorrupt = new ArbitrageScanner(configCorrupt);
     expect(scannerCorrupt.getPoolRegistry().getAllPools().length).toBe(8);
     expect(scannerCorrupt.getRouteIndex().getRouteCount()).toBe(42);
+    scannerCorrupt.stop();
   });
 });
