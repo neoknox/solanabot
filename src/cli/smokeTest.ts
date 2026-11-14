@@ -126,6 +126,19 @@ async function main() {
   console.log(`  HUD Connection Status:                 ${hudInfo ? `ONLINE (${hudInfo.url})` : 'STANDBY'}`);
   console.log(`  Authoritative Profit Hurdle:           ${thresholdManager.getFormattedThreshold()}`);
 
+  console.log('\n--- PHASE 1.4 PERMANENT ROUTE LIBRARY BENCHMARK ---');
+  const routeLibStats = scanner.getRouteLibrarySummary();
+  console.log(`  Total Persistent Routes in SQLite:     ${routeLibStats.totalRoutes}`);
+  console.log(`  - Verified Routes:                     ${routeLibStats.verifiedCount}`);
+  console.log(`  - Live READY Routes:                   ${routeLibStats.readyCount}`);
+  console.log(`  - Stale Routes:                        ${routeLibStats.staleCount}`);
+  console.log(`  - Blocked Routes:                      ${routeLibStats.blockedCount}`);
+  console.log(`  - 2-Leg Cycles:                        ${routeLibStats.twoLegCount}`);
+  console.log(`  - 3-Leg Cycles:                        ${routeLibStats.threeLegCount}`);
+  console.log(`  - Intra-DEX Routes:                    ${routeLibStats.intraDexCount}`);
+  console.log(`  - Inter-DEX Routes:                    ${routeLibStats.interDexCount}`);
+  console.log(`  Verified Pools Stored:                 ${routeLibStats.verifiedPoolCount}`);
+
   console.log('\n--- RUNTIME POOL VERIFICATION STATUS ---');
   const poolReg = scanner.getPoolRegistry();
   for (const pool of poolReg.getAllPools()) {

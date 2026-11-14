@@ -97,6 +97,43 @@ export function initDatabase(config: AppConfig): Database.Database {
       average_competition_score REAL DEFAULT 0,
       timestamp INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS routes (
+      route_id TEXT PRIMARY KEY,
+      cycle_type TEXT NOT NULL,
+      is_intra_dex INTEGER NOT NULL,
+      ordered_pool_ids TEXT NOT NULL,
+      ordered_dex_programs TEXT NOT NULL,
+      ordered_tokens TEXT NOT NULL,
+      static_dependencies_json TEXT NOT NULL,
+      dynamic_dependencies_json TEXT NOT NULL,
+      protocol_adapter_version TEXT NOT NULL,
+      estimated_accounts INTEGER NOT NULL,
+      estimated_compute_units INTEGER NOT NULL,
+      state TEXT NOT NULL,
+      is_unprofitable_preserved INTEGER NOT NULL DEFAULT 1,
+      last_quote_expected_net_usdc TEXT,
+      last_quote_timestamp INTEGER,
+      verification_details TEXT,
+      last_verified_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS verified_pools (
+      pool_id TEXT PRIMARY KEY,
+      dex TEXT NOT NULL,
+      program_id TEXT NOT NULL,
+      token_a_mint TEXT NOT NULL,
+      token_b_mint TEXT NOT NULL,
+      fee_bps INTEGER NOT NULL,
+      verification_status TEXT NOT NULL,
+      blocker_reason TEXT,
+      initial_liquidity_usd REAL DEFAULT 0,
+      account_layout_size INTEGER DEFAULT 0,
+      last_verified_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
   `);
 
   // Safe incremental column migration if table already existed from earlier phases
@@ -130,6 +167,11 @@ export function initDatabase(config: AppConfig): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_candidates_timestamp ON candidates(timestamp);
     CREATE INDEX IF NOT EXISTS idx_candidates_quality ON candidates(quality_label);
     CREATE INDEX IF NOT EXISTS idx_events_timestamp ON provider_events(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_routes_state ON routes(state);
+    CREATE INDEX IF NOT EXISTS idx_routes_cycle_type ON routes(cycle_type);
+    CREATE INDEX IF NOT EXISTS idx_routes_updated_at ON routes(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_verified_pools_dex ON verified_pools(dex);
+    CREATE INDEX IF NOT EXISTS idx_verified_pools_status ON verified_pools(verification_status);
   `);
 
   return db;

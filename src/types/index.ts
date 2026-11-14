@@ -318,3 +318,98 @@ export interface AuditMetrics {
   raydiumReconfirmationAttempts?: number;
   raydiumReconfirmationSuccesses?: number;
 }
+
+/**
+ * 90-Day Master Roadmap Phase 1: Permanent Route Library Types
+ */
+export type RouteState =
+  | 'DISCOVERED'
+  | 'VERIFIED'
+  | 'READY'
+  | 'STALE'
+  | 'BLOCKED'
+  | 'EXECUTION_PREPARED'
+  | 'SIMULATION_VERIFIED'; // Reserved for Phase 2, never assigned in this roadmap
+
+export type AccountDependencyRole =
+  | 'POOL_ACCOUNT'
+  | 'MINT_A'
+  | 'MINT_B'
+  | 'TOKEN_VAULT_A'
+  | 'TOKEN_VAULT_B'
+  | 'TICK_ARRAY'
+  | 'OPEN_ORDERS'
+  | 'AMM_AUTHORITY'
+  | 'PROGRAM_ID'
+  | 'FEE_OWNER';
+
+export interface StaticAccountDependency {
+  pubkey: string;
+  role: AccountDependencyRole | string;
+  isWritable: boolean;
+  isSigner: boolean;
+}
+
+export interface DynamicAccountDependency {
+  pubkey: string;
+  role: AccountDependencyRole | string;
+  type: 'TICK_ARRAY' | 'VAULT_RESERVE' | 'OPEN_ORDERS' | 'POOL_STATE';
+  refreshIntervalMs?: number;
+}
+
+export interface RouteDependencySpec {
+  staticAccounts: StaticAccountDependency[];
+  dynamicAccounts: DynamicAccountDependency[];
+}
+
+export interface PermanentRouteRecord {
+  routeId: string;
+  cycleType: CycleType;
+  isIntraDex: boolean;
+  orderedPoolIds: string[];
+  orderedDexPrograms: string[];
+  orderedTokens: string[];
+  staticDependencies: StaticAccountDependency[];
+  dynamicDependencies: DynamicAccountDependency[];
+  protocolAdapterVersion: string;
+  estimatedAccounts: number;
+  estimatedComputeUnits: number;
+  state: RouteState;
+  isUnprofitablePreserved: boolean;
+  lastQuoteExpectedNetUSDC?: string;
+  lastQuoteTimestamp?: number;
+  verificationDetails?: string;
+  lastVerifiedAt: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface VerifiedPoolRecord {
+  poolId: string;
+  dex: DexType;
+  programId: string;
+  tokenAMint: string;
+  tokenBMint: string;
+  feeBps: number;
+  verificationStatus: 'VERIFIED_DIRECT' | 'QUOTE_UNVERIFIED';
+  blockerReason?: string;
+  initialLiquidityUsd?: number;
+  accountLayoutSize?: number;
+  lastVerifiedAt: number;
+  createdAt: number;
+}
+
+export interface RouteSummaryStats {
+  totalRoutes: number;
+  discoveredCount: number;
+  verifiedCount: number;
+  readyCount: number;
+  staleCount: number;
+  blockedCount: number;
+  executionPreparedCount: number;
+  twoLegCount: number;
+  threeLegCount: number;
+  intraDexCount: number;
+  interDexCount: number;
+  verifiedPoolCount: number;
+}

@@ -1,10 +1,18 @@
 import { PoolConfig, VerificationStatus } from './poolRegistry.js';
-import { DexType, CycleType } from '../types/index.js';
+import {
+  DexType,
+  CycleType,
+  RouteState,
+  StaticAccountDependency,
+  DynamicAccountDependency,
+  PermanentRouteRecord
+} from '../types/index.js';
 import {
   CANONICAL_WSOL_MINT,
   CANONICAL_USDC_MINT,
   CANONICAL_USDT_MINT,
-  ALLOWLISTED_MINTS
+  ALLOWLISTED_MINTS,
+  KNOWN_PROGRAM_IDS
 } from '../config/index.js';
 
 export interface RouteLegInfo {
@@ -40,6 +48,17 @@ export interface IndexedDirectedRoute {
   // Solana Transaction limits validation
   estimatedAccounts: number;
   estimatedComputeUnits: number;
+
+  // Phase 1.4 Permanent Route Library additions
+  state: RouteState;
+  staticDependencies: StaticAccountDependency[];
+  dynamicDependencies: DynamicAccountDependency[];
+  protocolAdapterVersion: string;
+  lastVerifiedAt: number;
+  isUnprofitablePreserved: boolean;
+  lastQuoteExpectedNetUSDC?: string;
+  lastQuoteTimestamp?: number;
+  verificationDetails?: string;
 }
 
 export class RouteIndex {
@@ -48,6 +67,9 @@ export class RouteIndex {
 
   // Pool ID -> Directed Routes where this pool is involved
   private poolToRoutes = new Map<string, IndexedDirectedRoute[]>();
+
+  // Route ID -> Directed Route for O(1) lookup
+  private routeById = new Map<string, IndexedDirectedRoute>();
 
   // All indexed directed routes sorted by priority
   private allRoutes: IndexedDirectedRoute[] = [];
@@ -62,6 +84,7 @@ export class RouteIndex {
   public rebuild(pools: PoolConfig[]): void {
     this.tokenToPools.clear();
     this.poolToRoutes.clear();
+    this.routeById.clear();
     this.allRoutes = [];
     this.poolConfigs.clear();
     this.buildIndices(pools);
@@ -81,6 +104,11 @@ export class RouteIndex {
       });
 
       route.isDirectToDirect = isDirect;
+      if (!isDirect) {
+        route.state = 'BLOCKED';
+      } else if (route.state === 'BLOCKED') {
+        route.state = 'VERIFIED';
+      }
 
       let priority = 0;
       if (route.isDirectToDirect) priority += (route.cycleType === '3_LEG' ? 800 : 1000);
@@ -148,6 +176,106 @@ export class RouteIndex {
     }
   }
 
+  private buildDependenciesForLegs(legs: RouteLegInfo[]): {
+    staticDependencies: StaticAccountDependency[];
+    dynamicDependencies: DynamicAccountDependency[];
+  } {
+    const staticDeps: StaticAccountDependency[] = [];
+    const dynamicDeps: DynamicAccountDependency[] = [];
+    const seenStatic = new Set<string>();
+    const seenDynamic = new Set<string>();
+
+    for (const leg of legs) {
+      const pool = this.poolConfigs.get(leg.poolId);
+      if (!pool) continue;
+
+      if (!seenStatic.has(leg.poolId)) {
+        staticDeps.push({
+          pubkey: leg.poolId,
+          role: 'POOL_ACCOUNT',
+          isWritable: true,
+          isSigner: false
+        });
+        seenStatic.add(leg.poolId);
+      }
+
+      if (!seenStatic.has(pool.programId)) {
+        staticDeps.push({
+          pubkey: pool.programId,
+          role: 'PROGRAM_ID',
+          isWritable: false,
+          isSigner: false
+        });
+        seenStatic.add(pool.programId);
+      }
+
+      if (!seenStatic.has(leg.inputMint)) {
+        staticDeps.push({
+          pubkey: leg.inputMint,
+          role: 'MINT_A',
+          isWritable: false,
+          isSigner: false
+        });
+        seenStatic.add(leg.inputMint);
+      }
+      if (!seenStatic.has(leg.outputMint)) {
+        staticDeps.push({
+          pubkey: leg.outputMint,
+          role: 'MINT_B',
+          isWritable: false,
+          isSigner: false
+        });
+        seenStatic.add(leg.outputMint);
+      }
+
+      if (!seenDynamic.has(leg.poolId)) {
+        dynamicDeps.push({
+          pubkey: leg.poolId,
+          role: 'POOL_ACCOUNT',
+          type: 'POOL_STATE',
+          refreshIntervalMs: 400
+        });
+        seenDynamic.add(leg.poolId);
+      }
+
+      if (pool.dex === 'ORCA_WHIRLPOOL') {
+        const tickKey = `${leg.poolId}:tick_arrays`;
+        if (!seenDynamic.has(tickKey)) {
+          dynamicDeps.push({
+            pubkey: tickKey,
+            role: 'TICK_ARRAY',
+            type: 'TICK_ARRAY',
+            refreshIntervalMs: 400
+          });
+          seenDynamic.add(tickKey);
+        }
+      } else if (pool.dex === 'RAYDIUM_AMM') {
+        const vaultKey = `${leg.poolId}:vaults`;
+        if (!seenDynamic.has(vaultKey)) {
+          dynamicDeps.push({
+            pubkey: vaultKey,
+            role: 'TOKEN_VAULT_A',
+            type: 'VAULT_RESERVE',
+            refreshIntervalMs: 400
+          });
+          seenDynamic.add(vaultKey);
+        }
+        const openOrdersKey = `${leg.poolId}:open_orders`;
+        if (!seenDynamic.has(openOrdersKey)) {
+          dynamicDeps.push({
+            pubkey: openOrdersKey,
+            role: 'OPEN_ORDERS',
+            type: 'OPEN_ORDERS',
+            refreshIntervalMs: 400
+          });
+          seenDynamic.add(openOrdersKey);
+        }
+      }
+    }
+
+    return { staticDependencies: staticDeps, dynamicDependencies: dynamicDeps };
+  }
+
   private buildIndices(pools: PoolConfig[]): void {
     for (const p of pools) {
       this.poolConfigs.set(p.id, { ...p });
@@ -203,16 +331,17 @@ export class RouteIndex {
           // Fail closed if transaction limits exceeded
           if (estAccounts > 64 || estCU > 1400000) continue;
 
+          const leg1 = { poolId: poolA.id, dex: poolA.dex, inputMint: CANONICAL_USDC_MINT, outputMint: tokenA };
+          const leg2 = { poolId: poolB.id, dex: poolB.dex, inputMint: tokenA, outputMint: CANONICAL_USDC_MINT };
+          const deps = this.buildDependenciesForLegs([leg1, leg2]);
+
           const route: IndexedDirectedRoute = {
             routeId: `${poolA.id}->${poolB.id}`,
             cycleType: '2_LEG',
             isIntraDex,
             isDirectToDirect,
             priorityScore: priority,
-            legs: [
-              { poolId: poolA.id, dex: poolA.dex, inputMint: CANONICAL_USDC_MINT, outputMint: tokenA },
-              { poolId: poolB.id, dex: poolB.dex, inputMint: tokenA, outputMint: CANONICAL_USDC_MINT }
-            ],
+            legs: [leg1, leg2],
             poolIds: [poolA.id, poolB.id],
             poolAId: poolA.id,
             poolBId: poolB.id,
@@ -222,10 +351,17 @@ export class RouteIndex {
             intermediateMint: tokenA,
             outputMint: CANONICAL_USDC_MINT,
             estimatedAccounts: estAccounts,
-            estimatedComputeUnits: estCU
+            estimatedComputeUnits: estCU,
+            state: isDirectToDirect ? 'VERIFIED' : 'BLOCKED',
+            staticDependencies: deps.staticDependencies,
+            dynamicDependencies: deps.dynamicDependencies,
+            protocolAdapterVersion: '1.4.0',
+            lastVerifiedAt: Date.now(),
+            isUnprofitablePreserved: true
           };
 
           this.allRoutes.push(route);
+          this.routeById.set(route.routeId, route);
           this.mapPoolToRoute(poolA.id, route);
           this.mapPoolToRoute(poolB.id, route);
         }
@@ -267,17 +403,18 @@ export class RouteIndex {
             // Fail closed if transaction limits exceeded
             if (estAccounts > 64 || estCU > 1400000) continue;
 
+            const leg1 = { poolId: p1.id, dex: p1.dex, inputMint: CANONICAL_USDC_MINT, outputMint: pattern.tokenA };
+            const leg2 = { poolId: p2.id, dex: p2.dex, inputMint: pattern.tokenA, outputMint: pattern.tokenB };
+            const leg3 = { poolId: p3.id, dex: p3.dex, inputMint: pattern.tokenB, outputMint: CANONICAL_USDC_MINT };
+            const deps = this.buildDependenciesForLegs([leg1, leg2, leg3]);
+
             const route: IndexedDirectedRoute = {
               routeId: `${p1.id}->${p2.id}->${p3.id}`,
               cycleType: '3_LEG',
               isIntraDex,
               isDirectToDirect,
               priorityScore: priority,
-              legs: [
-                { poolId: p1.id, dex: p1.dex, inputMint: CANONICAL_USDC_MINT, outputMint: pattern.tokenA },
-                { poolId: p2.id, dex: p2.dex, inputMint: pattern.tokenA, outputMint: pattern.tokenB },
-                { poolId: p3.id, dex: p3.dex, inputMint: pattern.tokenB, outputMint: CANONICAL_USDC_MINT }
-              ],
+              legs: [leg1, leg2, leg3],
               poolIds: [p1.id, p2.id, p3.id],
               poolAId: p1.id,
               poolBId: p2.id,
@@ -290,10 +427,17 @@ export class RouteIndex {
               tokenBMint: pattern.tokenB,
               outputMint: CANONICAL_USDC_MINT,
               estimatedAccounts: estAccounts,
-              estimatedComputeUnits: estCU
+              estimatedComputeUnits: estCU,
+              state: isDirectToDirect ? 'VERIFIED' : 'BLOCKED',
+              staticDependencies: deps.staticDependencies,
+              dynamicDependencies: deps.dynamicDependencies,
+              protocolAdapterVersion: '1.4.0',
+              lastVerifiedAt: Date.now(),
+              isUnprofitablePreserved: true
             };
 
             this.allRoutes.push(route);
+            this.routeById.set(route.routeId, route);
             this.mapPoolToRoute(p1.id, route);
             this.mapPoolToRoute(p2.id, route);
             this.mapPoolToRoute(p3.id, route);
@@ -359,5 +503,100 @@ export class RouteIndex {
 
   public getBlockedRouteCount(): number {
     return this.allRoutes.filter(r => !r.isDirectToDirect).length;
+  }
+
+  public getRouteById(routeId: string): IndexedDirectedRoute | undefined {
+    return this.routeById.get(routeId);
+  }
+
+  public getReadyRoutes(): IndexedDirectedRoute[] {
+    return this.allRoutes.filter(r => r.state === 'READY');
+  }
+
+  public getReadyRouteCount(): number {
+    return this.allRoutes.filter(r => r.state === 'READY').length;
+  }
+
+  public getVerifiedRoutes(): IndexedDirectedRoute[] {
+    return this.allRoutes.filter(r => r.state === 'VERIFIED' || r.state === 'READY' || r.state === 'STALE');
+  }
+
+  public getVerifiedRouteCount(): number {
+    return this.allRoutes.filter(r => r.state === 'VERIFIED' || r.state === 'READY' || r.state === 'STALE').length;
+  }
+
+  public getStaleRouteCount(): number {
+    return this.allRoutes.filter(r => r.state === 'STALE').length;
+  }
+
+  public setRouteReady(routeId: string, quoteStats?: { expectedNetUSDC: string; timestamp: number }): void {
+    const route = this.routeById.get(routeId);
+    if (!route) return;
+
+    route.state = 'READY';
+    if (quoteStats) {
+      route.lastQuoteExpectedNetUSDC = quoteStats.expectedNetUSDC;
+      route.lastQuoteTimestamp = quoteStats.timestamp;
+    }
+  }
+
+  public setRouteStale(routeId: string, reason?: string): void {
+    const route = this.routeById.get(routeId);
+    if (!route) return;
+
+    // Transitory freshness loss: transitions READY or VERIFIED -> STALE.
+    // Crucial: do not mark structurally valid routes as BLOCKED!
+    if (route.state === 'READY' || route.state === 'VERIFIED') {
+      route.state = 'STALE';
+      if (reason) {
+        route.verificationDetails = reason;
+      }
+    }
+  }
+
+  public restoreRouteIfFresh(routeId: string): void {
+    const route = this.routeById.get(routeId);
+    if (!route) return;
+
+    if (route.state === 'STALE' && route.isDirectToDirect) {
+      route.state = 'READY';
+    }
+  }
+
+  public toPermanentRecord(route: IndexedDirectedRoute): PermanentRouteRecord {
+    const orderedDexPrograms = route.legs.map(l => {
+      const cfg = this.poolConfigs.get(l.poolId);
+      return cfg?.programId || '';
+    });
+    const orderedTokens = [
+      route.legs[0].inputMint,
+      ...route.legs.map(l => l.outputMint)
+    ];
+
+    return {
+      routeId: route.routeId,
+      cycleType: route.cycleType,
+      isIntraDex: route.isIntraDex,
+      orderedPoolIds: [...route.poolIds],
+      orderedDexPrograms,
+      orderedTokens,
+      staticDependencies: [...route.staticDependencies],
+      dynamicDependencies: [...route.dynamicDependencies],
+      protocolAdapterVersion: route.protocolAdapterVersion || '1.4.0',
+      estimatedAccounts: route.estimatedAccounts,
+      estimatedComputeUnits: route.estimatedComputeUnits,
+      state: route.state,
+      isUnprofitablePreserved: route.isUnprofitablePreserved !== false,
+      lastQuoteExpectedNetUSDC: route.lastQuoteExpectedNetUSDC,
+      lastQuoteTimestamp: route.lastQuoteTimestamp,
+      verificationDetails: route.verificationDetails,
+      lastVerifiedAt: route.lastVerifiedAt || Date.now(),
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+  }
+
+  public getAllPermanentRecords(): PermanentRouteRecord[] {
+    return this.allRoutes.map(r => this.toPermanentRecord(r));
   }
 }

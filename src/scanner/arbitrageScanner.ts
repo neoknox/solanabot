@@ -9,7 +9,9 @@ import {
   RejectionReasonCode,
   SurvivalStatus,
   CostBreakdown,
-  AuditMetrics
+  AuditMetrics,
+  VerifiedPoolRecord,
+  RouteSummaryStats
 } from '../types/index.js';
 import { SolanaRpcProvider } from '../providers/solanaRpc.js';
 import { SolanaWsProvider } from '../providers/solanaWs.js';
@@ -153,9 +155,16 @@ export class ArbitrageScanner {
     this.eventQueue = new BoundedEventQueue(config.MAX_EVENT_QUEUE_CAPACITY || 2000);
     this.latencyTracker = new LatencyTracker();
 
+    // Phase 1.4: Sync verified pools and routes into persistent SQLite library
+    this.syncRouteLibraryToStorage();
+
     // Setup WS disconnect/reconnect hooks
     this.ws.onDisconnect(() => {
       this.stateCache.invalidateAll('DISCONNECTED');
+      const readyRoutes = this.routeIndex.getReadyRoutes();
+      for (const r of readyRoutes) {
+        this.routeIndex.setRouteStale(r.routeId, 'WS_DISCONNECTED');
+      }
       this.repository.logProviderEvent(
         'SolanaWs',
         'DISCONNECTED',
@@ -1004,6 +1013,7 @@ export class ArbitrageScanner {
           this.auditMetrics.rejectedRoutes++;
           this.rejectionBreakdown[failCode] = (this.rejectionBreakdown[failCode] || 0) + 1;
           this.auditMetrics.quoteValidationFailures++;
+          this.routeIndex.setRouteStale(route.routeId, failCode);
           return;
         }
       }
@@ -1113,6 +1123,16 @@ export class ArbitrageScanner {
       topAlternatives: sizerResult.topAlternatives,
       stateVersion
     });
+
+    // Phase 1.4: Update route readiness in permanent library index
+    this.routeIndex.setRouteReady(route.routeId, {
+      expectedNetUSDC: candidate.expectedNetUSDC,
+      timestamp: candidate.timestamp
+    });
+
+    if (candidate.rejectionReasons.includes('STALE_QUOTE') || candidate.rejectionReasons.includes('SLOT_MISMATCH')) {
+      this.routeIndex.setRouteStale(route.routeId, candidate.rejectionReasons.join(', '));
+    }
 
     // Simulated Capital Management: Bound total simultaneous active reservations against VIRTUAL_CAPITAL_USDC
     if (candidate.status === 'QUALIFIED_SHADOW') {
@@ -1664,7 +1684,13 @@ export class ArbitrageScanner {
       intermediateMint: CANONICAL_WSOL_MINT,
       outputMint: CANONICAL_USDC_MINT,
       estimatedAccounts: 30,
-      estimatedComputeUnits: 150000
+      estimatedComputeUnits: 150000,
+      state: 'VERIFIED',
+      staticDependencies: [],
+      dynamicDependencies: [],
+      protocolAdapterVersion: '1.4.0',
+      lastVerifiedAt: Date.now(),
+      isUnprofitablePreserved: true
     };
     this.evaluateIndexedRoute(route);
   }
@@ -1734,6 +1760,34 @@ export class ArbitrageScanner {
 
   public getRepository(): ArbitrageRepository {
     return this.repository;
+  }
+
+  public getRouteLibrarySummary(): RouteSummaryStats {
+    return this.repository.getRouteSummaryStats();
+  }
+
+  private syncRouteLibraryToStorage(): void {
+    try {
+      const pools = this.poolRegistry.getAllPools();
+      const verifiedPoolRecords: VerifiedPoolRecord[] = pools.map(p => ({
+        poolId: p.id,
+        dex: p.dex,
+        programId: p.programId,
+        tokenAMint: p.tokenAMint,
+        tokenBMint: p.tokenBMint,
+        feeBps: p.feeBps,
+        verificationStatus: p.verificationStatus || 'QUOTE_UNVERIFIED',
+        blockerReason: p.blockerReason,
+        initialLiquidityUsd: p.initialLiquidityUsd || 0,
+        accountLayoutSize: 0,
+        lastVerifiedAt: Date.now(),
+        createdAt: Date.now()
+      }));
+      this.repository.upsertVerifiedPools(verifiedPoolRecords);
+
+      const permanentRoutes = this.routeIndex.getAllPermanentRecords();
+      this.repository.upsertRoutes(permanentRoutes);
+    } catch {}
   }
 
   public getCompetitorAnalyzer(): CompetitorAnalyzer {

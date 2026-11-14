@@ -1,7 +1,17 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import { AppConfig } from '../config/index.js';
-import { ArbitrageCandidate, AuditMetrics, CompetitorActivityMetrics } from '../types/index.js';
+import {
+  ArbitrageCandidate,
+  AuditMetrics,
+  CompetitorActivityMetrics,
+  PermanentRouteRecord,
+  VerifiedPoolRecord,
+  RouteState,
+  RouteSummaryStats,
+  CycleType,
+  DexType
+} from '../types/index.js';
 import { initDatabase } from './db.js';
 
 export interface StorageSummaryStats {
@@ -17,6 +27,49 @@ export interface StorageSummaryStats {
   totalProviderEvents: number;
   oldestRecordTimestamp?: number;
   newestRecordTimestamp?: number;
+  totalStoredRoutes?: number;
+  readyRoutes?: number;
+}
+
+function rowToRouteRecord(row: Record<string, unknown>): PermanentRouteRecord {
+  return {
+    routeId: String(row.route_id),
+    cycleType: row.cycle_type as CycleType,
+    isIntraDex: Boolean(row.is_intra_dex),
+    orderedPoolIds: JSON.parse(String(row.ordered_pool_ids)),
+    orderedDexPrograms: JSON.parse(String(row.ordered_dex_programs)),
+    orderedTokens: JSON.parse(String(row.ordered_tokens)),
+    staticDependencies: JSON.parse(String(row.static_dependencies_json)),
+    dynamicDependencies: JSON.parse(String(row.dynamic_dependencies_json)),
+    protocolAdapterVersion: String(row.protocol_adapter_version),
+    estimatedAccounts: Number(row.estimated_accounts),
+    estimatedComputeUnits: Number(row.estimated_compute_units),
+    state: row.state as RouteState,
+    isUnprofitablePreserved: Boolean(row.is_unprofitable_preserved),
+    lastQuoteExpectedNetUSDC: row.last_quote_expected_net_usdc ? String(row.last_quote_expected_net_usdc) : undefined,
+    lastQuoteTimestamp: row.last_quote_timestamp ? Number(row.last_quote_timestamp) : undefined,
+    verificationDetails: row.verification_details ? String(row.verification_details) : undefined,
+    lastVerifiedAt: Number(row.last_verified_at),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at)
+  };
+}
+
+function rowToPoolRecord(row: Record<string, unknown>): VerifiedPoolRecord {
+  return {
+    poolId: String(row.pool_id),
+    dex: row.dex as DexType,
+    programId: String(row.program_id),
+    tokenAMint: String(row.token_a_mint),
+    tokenBMint: String(row.token_b_mint),
+    feeBps: Number(row.fee_bps),
+    verificationStatus: row.verification_status as 'VERIFIED_DIRECT' | 'QUOTE_UNVERIFIED',
+    blockerReason: row.blocker_reason ? String(row.blocker_reason) : undefined,
+    initialLiquidityUsd: row.initial_liquidity_usd ? Number(row.initial_liquidity_usd) : undefined,
+    accountLayoutSize: row.account_layout_size ? Number(row.account_layout_size) : undefined,
+    lastVerifiedAt: Number(row.last_verified_at),
+    createdAt: Number(row.created_at)
+  };
 }
 
 export class ArbitrageRepository {
@@ -24,7 +77,18 @@ export class ArbitrageRepository {
   private db: Database.Database;
   private insertCandidateStmt: Database.Statement;
   private insertEventStmt: Database.Statement;
+  private upsertRouteStmt: Database.Statement;
+  private selectRouteStmt: Database.Statement;
+  private selectAllRoutesStmt: Database.Statement;
+  private selectRoutesByStateStmt: Database.Statement;
+  private updateRouteStateStmt: Database.Statement;
+  private updateRouteReadinessStmt: Database.Statement;
+  private upsertPoolStmt: Database.Statement;
+  private selectPoolStmt: Database.Statement;
+  private selectAllPoolsStmt: Database.Statement;
   private batchInsertTransaction: Database.Transaction<(items: ArbitrageCandidate[]) => void>;
+  private batchUpsertRoutesTx: Database.Transaction<(items: PermanentRouteRecord[]) => void>;
+  private batchUpsertPoolsTx: Database.Transaction<(items: VerifiedPoolRecord[]) => void>;
   private candidateQueue: ArbitrageCandidate[] = [];
   private flushTimer: NodeJS.Timeout | null = null;
 
@@ -55,9 +119,90 @@ export class ArbitrageRepository {
       VALUES (?, ?, ?, ?, ?, ?)
     `);
 
+    this.upsertRouteStmt = this.db.prepare(`
+      INSERT INTO routes (
+        route_id, cycle_type, is_intra_dex, ordered_pool_ids, ordered_dex_programs,
+        ordered_tokens, static_dependencies_json, dynamic_dependencies_json,
+        protocol_adapter_version, estimated_accounts, estimated_compute_units,
+        state, is_unprofitable_preserved, last_quote_expected_net_usdc,
+        last_quote_timestamp, verification_details, last_verified_at, created_at, updated_at
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      )
+      ON CONFLICT(route_id) DO UPDATE SET
+        cycle_type = excluded.cycle_type,
+        is_intra_dex = excluded.is_intra_dex,
+        ordered_pool_ids = excluded.ordered_pool_ids,
+        ordered_dex_programs = excluded.ordered_dex_programs,
+        ordered_tokens = excluded.ordered_tokens,
+        static_dependencies_json = excluded.static_dependencies_json,
+        dynamic_dependencies_json = excluded.dynamic_dependencies_json,
+        protocol_adapter_version = excluded.protocol_adapter_version,
+        estimated_accounts = excluded.estimated_accounts,
+        estimated_compute_units = excluded.estimated_compute_units,
+        state = excluded.state,
+        is_unprofitable_preserved = 1,
+        last_quote_expected_net_usdc = COALESCE(excluded.last_quote_expected_net_usdc, routes.last_quote_expected_net_usdc),
+        last_quote_timestamp = COALESCE(excluded.last_quote_timestamp, routes.last_quote_timestamp),
+        verification_details = COALESCE(excluded.verification_details, routes.verification_details),
+        last_verified_at = excluded.last_verified_at,
+        updated_at = excluded.updated_at
+    `);
+
+    this.selectRouteStmt = this.db.prepare(`SELECT * FROM routes WHERE route_id = ?`);
+    this.selectAllRoutesStmt = this.db.prepare(`SELECT * FROM routes ORDER BY updated_at DESC`);
+    this.selectRoutesByStateStmt = this.db.prepare(`SELECT * FROM routes WHERE state = ? ORDER BY updated_at DESC`);
+    this.updateRouteStateStmt = this.db.prepare(`
+      UPDATE routes SET state = ?, verification_details = COALESCE(?, verification_details), updated_at = ?
+      WHERE route_id = ?
+    `);
+    this.updateRouteReadinessStmt = this.db.prepare(`
+      UPDATE routes SET 
+        state = ?,
+        last_quote_expected_net_usdc = COALESCE(?, last_quote_expected_net_usdc),
+        last_quote_timestamp = COALESCE(?, last_quote_timestamp),
+        verification_details = COALESCE(?, verification_details),
+        updated_at = ?
+      WHERE route_id = ?
+    `);
+
+    this.upsertPoolStmt = this.db.prepare(`
+      INSERT INTO verified_pools (
+        pool_id, dex, program_id, token_a_mint, token_b_mint, fee_bps,
+        verification_status, blocker_reason, initial_liquidity_usd,
+        account_layout_size, last_verified_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(pool_id) DO UPDATE SET
+        dex = excluded.dex,
+        program_id = excluded.program_id,
+        token_a_mint = excluded.token_a_mint,
+        token_b_mint = excluded.token_b_mint,
+        fee_bps = excluded.fee_bps,
+        verification_status = excluded.verification_status,
+        blocker_reason = excluded.blocker_reason,
+        initial_liquidity_usd = excluded.initial_liquidity_usd,
+        account_layout_size = excluded.account_layout_size,
+        last_verified_at = excluded.last_verified_at
+    `);
+
+    this.selectPoolStmt = this.db.prepare(`SELECT * FROM verified_pools WHERE pool_id = ?`);
+    this.selectAllPoolsStmt = this.db.prepare(`SELECT * FROM verified_pools ORDER BY created_at DESC`);
+
     this.batchInsertTransaction = this.db.transaction((items: ArbitrageCandidate[]) => {
       for (const candidate of items) {
         this.executeInsertCandidate(candidate);
+      }
+    });
+
+    this.batchUpsertRoutesTx = this.db.transaction((items: PermanentRouteRecord[]) => {
+      for (const item of items) {
+        this.executeUpsertRoute(item);
+      }
+    });
+
+    this.batchUpsertPoolsTx = this.db.transaction((items: VerifiedPoolRecord[]) => {
+      for (const item of items) {
+        this.executeUpsertPool(item);
       }
     });
 
@@ -112,6 +257,185 @@ export class ArbitrageRepository {
         candidate.timestamp
       );
     } catch {}
+  }
+
+  private executeUpsertRoute(route: PermanentRouteRecord): void {
+    const now = Date.now();
+    try {
+      this.upsertRouteStmt.run(
+        route.routeId,
+        route.cycleType,
+        route.isIntraDex ? 1 : 0,
+        JSON.stringify(route.orderedPoolIds),
+        JSON.stringify(route.orderedDexPrograms),
+        JSON.stringify(route.orderedTokens),
+        JSON.stringify(route.staticDependencies),
+        JSON.stringify(route.dynamicDependencies),
+        route.protocolAdapterVersion,
+        route.estimatedAccounts,
+        route.estimatedComputeUnits,
+        route.state,
+        route.isUnprofitablePreserved !== false ? 1 : 1,
+        route.lastQuoteExpectedNetUSDC ?? null,
+        route.lastQuoteTimestamp ?? null,
+        route.verificationDetails ?? null,
+        route.lastVerifiedAt || now,
+        route.createdAt || now,
+        route.updatedAt || now
+      );
+    } catch {}
+  }
+
+  private executeUpsertPool(pool: VerifiedPoolRecord): void {
+    const now = Date.now();
+    try {
+      this.upsertPoolStmt.run(
+        pool.poolId,
+        pool.dex,
+        pool.programId,
+        pool.tokenAMint,
+        pool.tokenBMint,
+        pool.feeBps,
+        pool.verificationStatus,
+        pool.blockerReason ?? null,
+        pool.initialLiquidityUsd ?? 0,
+        pool.accountLayoutSize ?? 0,
+        pool.lastVerifiedAt || now,
+        pool.createdAt || now
+      );
+    } catch {}
+  }
+
+  public saveRoute(route: PermanentRouteRecord): void {
+    this.executeUpsertRoute(route);
+  }
+
+  public upsertRoutes(routes: PermanentRouteRecord[]): void {
+    if (routes.length === 0) return;
+    try {
+      this.batchUpsertRoutesTx(routes);
+    } catch {
+      for (const route of routes) {
+        this.executeUpsertRoute(route);
+      }
+    }
+  }
+
+  public getRoute(routeId: string): PermanentRouteRecord | null {
+    const row = this.selectRouteStmt.get(routeId) as Record<string, unknown> | undefined;
+    return row ? rowToRouteRecord(row) : null;
+  }
+
+  public getAllRoutes(): PermanentRouteRecord[] {
+    const rows = this.selectAllRoutesStmt.all() as Array<Record<string, unknown>>;
+    return rows.map(rowToRouteRecord);
+  }
+
+  public getRoutesByState(state: RouteState): PermanentRouteRecord[] {
+    const rows = this.selectRoutesByStateStmt.all(state) as Array<Record<string, unknown>>;
+    return rows.map(rowToRouteRecord);
+  }
+
+  public updateRouteState(routeId: string, state: RouteState, details?: string): void {
+    try {
+      this.updateRouteStateStmt.run(state, details ?? null, Date.now(), routeId);
+    } catch {}
+  }
+
+  public updateRouteReadiness(
+    routeId: string,
+    isReady: boolean,
+    details?: string,
+    quoteStats?: { expectedNetUSDC: string; timestamp: number }
+  ): void {
+    const state: RouteState = isReady ? 'READY' : 'STALE';
+    try {
+      this.updateRouteReadinessStmt.run(
+        state,
+        quoteStats?.expectedNetUSDC ?? null,
+        quoteStats?.timestamp ?? null,
+        details ?? null,
+        Date.now(),
+        routeId
+      );
+    } catch {}
+  }
+
+  public deleteRoute(routeId: string): boolean {
+    const result = this.db.prepare('DELETE FROM routes WHERE route_id = ?').run(routeId);
+    return result.changes > 0;
+  }
+
+  public saveVerifiedPool(pool: VerifiedPoolRecord): void {
+    this.executeUpsertPool(pool);
+  }
+
+  public upsertVerifiedPools(pools: VerifiedPoolRecord[]): void {
+    if (pools.length === 0) return;
+    try {
+      this.batchUpsertPoolsTx(pools);
+    } catch {
+      for (const pool of pools) {
+        this.executeUpsertPool(pool);
+      }
+    }
+  }
+
+  public getVerifiedPool(poolId: string): VerifiedPoolRecord | null {
+    const row = this.selectPoolStmt.get(poolId) as Record<string, unknown> | undefined;
+    return row ? rowToPoolRecord(row) : null;
+  }
+
+  public getAllVerifiedPools(): VerifiedPoolRecord[] {
+    const rows = this.selectAllPoolsStmt.all() as Array<Record<string, unknown>>;
+    return rows.map(rowToPoolRecord);
+  }
+
+  public getRouteSummaryStats(): RouteSummaryStats {
+    const rows = this.selectAllRoutesStmt.all() as Array<Record<string, unknown>>;
+    const poolRows = this.selectAllPoolsStmt.all() as Array<Record<string, unknown>>;
+
+    let discoveredCount = 0;
+    let verifiedCount = 0;
+    let readyCount = 0;
+    let staleCount = 0;
+    let blockedCount = 0;
+    let executionPreparedCount = 0;
+    let twoLegCount = 0;
+    let threeLegCount = 0;
+    let intraDexCount = 0;
+    let interDexCount = 0;
+
+    for (const r of rows) {
+      const state = r.state as RouteState;
+      if (state === 'DISCOVERED') discoveredCount++;
+      else if (state === 'VERIFIED') verifiedCount++;
+      else if (state === 'READY') readyCount++;
+      else if (state === 'STALE') staleCount++;
+      else if (state === 'BLOCKED') blockedCount++;
+      else if (state === 'EXECUTION_PREPARED') executionPreparedCount++;
+
+      if (r.cycle_type === '2_LEG') twoLegCount++;
+      else if (r.cycle_type === '3_LEG') threeLegCount++;
+
+      if (r.is_intra_dex) intraDexCount++;
+      else interDexCount++;
+    }
+
+    return {
+      totalRoutes: rows.length,
+      discoveredCount,
+      verifiedCount,
+      readyCount,
+      staleCount,
+      blockedCount,
+      executionPreparedCount,
+      twoLegCount,
+      threeLegCount,
+      intraDexCount,
+      interDexCount,
+      verifiedPoolCount: poolRows.length
+    };
   }
 
   public saveCandidate(candidate: ArbitrageCandidate): void {
@@ -331,6 +655,13 @@ export class ArbitrageRepository {
 
     const totalTheoreticalProfitUSDC = Number(profitRow?.totalProfit || 0);
 
+    const routeCounts = this.db.prepare(`
+      SELECT 
+        COUNT(*) as totalRoutes,
+        SUM(CASE WHEN state = 'READY' THEN 1 ELSE 0 END) as readyRoutes
+      FROM routes
+    `).get() as { totalRoutes: number; readyRoutes: number | null };
+
     return {
       totalSignals: totalCandidates,
       qualifiedCount: qualifiedShadowCount,
@@ -343,7 +674,9 @@ export class ArbitrageRepository {
       totalTheoreticalProfitUSDC,
       totalProviderEvents: eventCountRow?.count || 0,
       oldestRecordTimestamp: timeExtremes?.oldest ?? undefined,
-      newestRecordTimestamp: timeExtremes?.newest ?? undefined
+      newestRecordTimestamp: timeExtremes?.newest ?? undefined,
+      totalStoredRoutes: routeCounts?.totalRoutes || 0,
+      readyRoutes: routeCounts?.readyRoutes || 0
     };
   }
 

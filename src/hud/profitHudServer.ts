@@ -309,7 +309,8 @@ export class ProfitHudServer {
         qualifiedCount: health ? health.qualifiedCount : 0,
         rejectedCount: health ? health.rejectedCount : 0,
         activeAllocatedCapitalUSDC: tracker ? tracker.getActiveAllocatedCapital() : 0,
-        activeShadowSignalsCount: qualifiedActiveShadow.length
+        activeShadowSignalsCount: qualifiedActiveShadow.length,
+        routeLibrary: this.scanner ? this.scanner.getRouteLibrarySummary() : null
       };
 
       res.writeHead(200, {
