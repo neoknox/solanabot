@@ -151,7 +151,7 @@ export class ProfitHudServer {
     return true;
   }
 
-  private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+  private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const parsedUrl = new URL(req.url || '/', `http://${this.host}:${this.boundPort || this.port}`);
     const pathname = parsedUrl.pathname;
     const method = req.method?.toUpperCase();
@@ -310,7 +310,8 @@ export class ProfitHudServer {
         rejectedCount: health ? health.rejectedCount : 0,
         activeAllocatedCapitalUSDC: tracker ? tracker.getActiveAllocatedCapital() : 0,
         activeShadowSignalsCount: qualifiedActiveShadow.length,
-        routeLibrary: this.scanner ? this.scanner.getRouteLibrarySummary() : null
+        routeLibrary: this.scanner ? this.scanner.getRouteLibrarySummary() : null,
+        scout: this.scanner ? this.scanner.getScoutMetrics() : null
       };
 
       res.writeHead(200, {
@@ -321,7 +322,57 @@ export class ProfitHudServer {
       return;
     }
 
-    // 4. GET / (Minimal localhost HTML control page)
+    // 4. POST /api/scout/trigger (Manual Scout discovery trigger)
+    if (pathname === '/api/scout/trigger' && method === 'POST') {
+      if (!this.isValidOriginAndHost(req)) {
+        res.writeHead(403, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': defaultOrigin
+        });
+        res.end(JSON.stringify({
+          success: false,
+          error: 'Forbidden: State-changing requests restricted strictly to 127.0.0.1 / localhost Origin and Host'
+        }));
+        return;
+      }
+
+      if (!this.scanner) {
+        res.writeHead(503, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': corsOrigin
+        });
+        res.end(JSON.stringify({
+          success: false,
+          error: 'Scanner not connected'
+        }));
+        return;
+      }
+
+      try {
+        const result = await this.scanner.triggerScoutDiscovery('MANUAL');
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': corsOrigin
+        });
+        res.end(JSON.stringify({
+          success: true,
+          result,
+          metrics: this.scanner.getScoutMetrics()
+        }));
+      } catch (err: any) {
+        res.writeHead(500, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': corsOrigin
+        });
+        res.end(JSON.stringify({
+          success: false,
+          error: err.message || String(err)
+        }));
+      }
+      return;
+    }
+
+    // 5. GET / (Minimal localhost HTML control page)
     if (pathname === '/' && method === 'GET') {
       const html = this.renderHtmlDashboard();
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -533,6 +584,25 @@ export class ProfitHudServer {
       border: 1px solid rgba(218, 54, 51, 0.4);
       color: #f85149;
     }
+    .btn-scout {
+      background-color: #238636;
+      color: #ffffff;
+      border: 1px solid rgba(240, 246, 252, 0.1);
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background-color 0.2s;
+    }
+    .btn-scout:hover {
+      background-color: #2ea043;
+    }
+    .btn-scout:disabled {
+      background-color: #30363d;
+      color: #8b949e;
+      cursor: not-allowed;
+    }
     .info-footer {
       font-size: 12px;
       color: #8b949e;
@@ -584,6 +654,46 @@ export class ProfitHudServer {
           <div class="telemetry-value" id="telemetryThreshold">$${currentUSDC} USDC</div>
         </div>
       </div>
+    </div>
+
+    <!-- Automatic Scout & Route Expansion Card -->
+    <div class="card" id="scoutCard">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <div class="card-title" style="margin-bottom: 0;">Automatic Scout & Route Expansion</div>
+        <button id="btnTriggerScout" class="btn-scout">Trigger Scout Discovery</button>
+      </div>
+      <div class="card-desc">
+        Daily bounded discovery across Orca Whirlpool & Raydium protocol sources. Hot-activates new routes without restart.
+      </div>
+      <div class="telemetry-grid">
+        <div class="telemetry-item">
+          <div class="telemetry-label">Scout Status</div>
+          <div class="telemetry-value">
+            <span id="scoutStatusBadge" class="status-badge status-standby">IDLE</span>
+          </div>
+        </div>
+        <div class="telemetry-item">
+          <div class="telemetry-label">Last Scout Run</div>
+          <div class="telemetry-value" id="scoutLastRun">NEVER</div>
+        </div>
+        <div class="telemetry-item">
+          <div class="telemetry-label">Discovered Pools</div>
+          <div class="telemetry-value" id="scoutDiscoveredPools">0 (0 verified, 0 rejected)</div>
+        </div>
+        <div class="telemetry-item">
+          <div class="telemetry-label">Route Library</div>
+          <div class="telemetry-value" id="scoutRouteLibrary">0 total</div>
+        </div>
+        <div class="telemetry-item">
+          <div class="telemetry-label">Route States</div>
+          <div class="telemetry-value" id="scoutRouteStates" style="font-size: 13px;">0 VERIFIED &bull; 0 READY &bull; 0 BLOCKED</div>
+        </div>
+        <div class="telemetry-item">
+          <div class="telemetry-label">Route Topologies</div>
+          <div class="telemetry-value" id="scoutRouteTopologies" style="font-size: 13px;">0 (2-leg) &bull; 0 (3-leg)</div>
+        </div>
+      </div>
+      <div id="scoutAlert" class="alert" style="margin-top: 14px;"></div>
     </div>
 
     <!-- Threshold Setting Card -->
@@ -640,6 +750,15 @@ export class ProfitHudServer {
       const telemetryCapital = document.getElementById('telemetryCapital');
       const telemetryThreshold = document.getElementById('telemetryThreshold');
 
+      const scoutStatus = document.getElementById('scoutStatusBadge');
+      const scoutLastRun = document.getElementById('scoutLastRun');
+      const scoutDiscovered = document.getElementById('scoutDiscoveredPools');
+      const scoutLibrary = document.getElementById('scoutRouteLibrary');
+      const scoutStates = document.getElementById('scoutRouteStates');
+      const scoutTopologies = document.getElementById('scoutRouteTopologies');
+      const btnTriggerScout = document.getElementById('btnTriggerScout');
+      const scoutAlert = document.getElementById('scoutAlert');
+
       let activeConfirmed = parseFloat(slider.value);
       let isUpdating = false;
       let isDragging = false;
@@ -686,6 +805,41 @@ export class ProfitHudServer {
 
           // Confirmed Threshold
           telemetryThreshold.textContent = data.formatted || ('$' + Number(data.thresholdUSDC).toFixed(2) + ' USDC');
+
+          // Scout Telemetry
+          if (data.scout && scoutStatus) {
+            const sc = data.scout;
+            if (sc.scoutStatus === 'RUNNING') {
+              scoutStatus.textContent = 'RUNNING';
+              scoutStatus.className = 'status-badge status-standby';
+            } else if (sc.scoutStatus === 'ERROR') {
+              scoutStatus.textContent = 'ERROR';
+              scoutStatus.className = 'status-badge status-offline';
+            } else {
+              scoutStatus.textContent = 'IDLE';
+              scoutStatus.className = 'status-badge status-online';
+            }
+
+            scoutLastRun.textContent = sc.lastScoutRunTimestamp
+              ? new Date(sc.lastScoutRunTimestamp).toLocaleTimeString()
+              : 'NEVER';
+
+            scoutDiscovered.textContent = (sc.totalDiscoveredPools || 0) + ' (' +
+              (sc.totalVerifiedPools || 0) + ' verified, ' +
+              (sc.totalRejectedPools || 0) + ' rejected)';
+
+            scoutLibrary.textContent = (sc.totalRoutesInLibrary || 0) + ' total';
+
+            scoutStates.innerHTML = (sc.verifiedRoutesCount || 0) + ' VERIFIED &bull; ' +
+              (sc.readyRoutesCount || 0) + ' READY &bull; ' +
+              (sc.staleRoutesCount || 0) + ' STALE &bull; ' +
+              (sc.blockedRoutesCount || 0) + ' BLOCKED';
+
+            scoutTopologies.innerHTML = (sc.twoLegRoutesCount || 0) + ' (2-leg) &bull; ' +
+              (sc.threeLegRoutesCount || 0) + ' (3-leg) &bull; ' +
+              (sc.intraDexRoutesCount || 0) + ' intra &bull; ' +
+              (sc.interDexRoutesCount || 0) + ' inter';
+          }
 
           // Sync slider if not actively being adjusted by user
           if (!isUpdating && !isDragging && typeof data.thresholdUSDC === 'number') {
@@ -754,6 +908,44 @@ export class ProfitHudServer {
           isUpdating = false;
         }
       });
+
+      if (btnTriggerScout) {
+        btnTriggerScout.addEventListener('click', async function() {
+          btnTriggerScout.disabled = true;
+          btnTriggerScout.textContent = 'Discovering...';
+          if (scoutAlert) scoutAlert.style.display = 'none';
+
+          try {
+            const res = await fetch('/api/scout/trigger', { method: 'POST' });
+            const data = await res.json();
+            if (res.ok && data.success) {
+              const r = data.result;
+              if (scoutAlert) {
+                scoutAlert.textContent = 'Scout cycle completed: ' + r.candidatesFound + ' found, ' +
+                  r.candidatesVerified + ' verified, ' + r.routesGenerated + ' new routes generated (' + r.durationMs + 'ms).';
+                scoutAlert.className = 'alert alert-success';
+                scoutAlert.style.display = 'block';
+              }
+              fetchTelemetry();
+            } else {
+              if (scoutAlert) {
+                scoutAlert.textContent = 'Scout trigger failed: ' + (data.error || 'Unknown error');
+                scoutAlert.className = 'alert alert-error';
+                scoutAlert.style.display = 'block';
+              }
+            }
+          } catch (err) {
+            if (scoutAlert) {
+              scoutAlert.textContent = 'Error contacting Scout endpoint: ' + (err.message || String(err));
+              scoutAlert.className = 'alert alert-error';
+              scoutAlert.style.display = 'block';
+            }
+          } finally {
+            btnTriggerScout.disabled = false;
+            btnTriggerScout.textContent = 'Trigger Scout Discovery';
+          }
+        });
+      }
     })();
   </script>
 </body>

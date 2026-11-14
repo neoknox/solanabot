@@ -10,7 +10,9 @@ import {
   RouteState,
   RouteSummaryStats,
   CycleType,
-  DexType
+  DexType,
+  ScoutRunRecord,
+  ScoutMetricsSummary
 } from '../types/index.js';
 import { initDatabase } from './db.js';
 
@@ -86,6 +88,10 @@ export class ArbitrageRepository {
   private upsertPoolStmt: Database.Statement;
   private selectPoolStmt: Database.Statement;
   private selectAllPoolsStmt: Database.Statement;
+  private insertScoutRunStmt: Database.Statement;
+  private selectLastScoutRunStmt: Database.Statement;
+  private upsertScoutMetadataStmt: Database.Statement;
+  private selectScoutMetadataStmt: Database.Statement;
   private batchInsertTransaction: Database.Transaction<(items: ArbitrageCandidate[]) => void>;
   private batchUpsertRoutesTx: Database.Transaction<(items: PermanentRouteRecord[]) => void>;
   private batchUpsertPoolsTx: Database.Transaction<(items: VerifiedPoolRecord[]) => void>;
@@ -207,6 +213,28 @@ export class ArbitrageRepository {
 
     this.selectPoolStmt = this.db.prepare(`SELECT * FROM verified_pools WHERE pool_id = ?`);
     this.selectAllPoolsStmt = this.db.prepare(`SELECT * FROM verified_pools ORDER BY created_at DESC`);
+
+    this.insertScoutRunStmt = this.db.prepare(`
+      INSERT INTO scout_runs (
+        run_id, started_at, completed_at, status, candidates_found,
+        candidates_verified, candidates_rejected, new_pools_registered,
+        new_routes_generated, errors_json, duration_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    this.selectLastScoutRunStmt = this.db.prepare(`
+      SELECT * FROM scout_runs ORDER BY completed_at DESC LIMIT 1
+    `);
+
+    this.upsertScoutMetadataStmt = this.db.prepare(`
+      INSERT INTO scout_metadata (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `);
+
+    this.selectScoutMetadataStmt = this.db.prepare(`
+      SELECT value FROM scout_metadata WHERE key = ?
+    `);
 
     this.batchInsertTransaction = this.db.transaction((items: ArbitrageCandidate[]) => {
       for (const candidate of items) {
@@ -556,6 +584,71 @@ export class ArbitrageRepository {
       persistenceErrorsCount: this.persistenceErrorsCount,
       verifiedPoolCount: verifiedDirect
     };
+  }
+
+  public recordScoutRun(record: ScoutRunRecord): void {
+    try {
+      this.insertScoutRunStmt.run(
+        record.runId,
+        record.startedAt,
+        record.completedAt,
+        record.status,
+        record.candidatesFound,
+        record.candidatesVerified,
+        record.candidatesRejected,
+        record.newPoolsRegistered,
+        record.newRoutesGenerated,
+        JSON.stringify(record.errors),
+        record.durationMs
+      );
+      this.setScoutMetadata('LAST_SCOUT_EXECUTION', new Date(record.completedAt).toISOString());
+      this.setScoutMetadata('LAST_SCOUT_RESULT', record.status);
+      this.setScoutMetadata('LAST_SCOUT_TIMESTAMP', String(record.completedAt));
+      this.setScoutMetadata('LAST_SCOUT_DURATION_MS', String(record.durationMs));
+      this.setScoutMetadata('LAST_SCOUT_NEW_POOLS', String(record.newPoolsRegistered));
+      this.setScoutMetadata('LAST_SCOUT_NEW_ROUTES', String(record.newRoutesGenerated));
+    } catch (err) {
+      this.recordPersistenceError('recordScoutRun', err);
+    }
+  }
+
+  public getLastScoutRun(): ScoutRunRecord | null {
+    try {
+      const row = this.selectLastScoutRunStmt.get() as Record<string, unknown> | undefined;
+      if (!row) return null;
+      return {
+        runId: String(row.run_id),
+        startedAt: Number(row.started_at),
+        completedAt: Number(row.completed_at),
+        status: row.status as 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'RATE_LIMITED',
+        candidatesFound: Number(row.candidates_found),
+        candidatesVerified: Number(row.candidates_verified),
+        candidatesRejected: Number(row.candidates_rejected),
+        newPoolsRegistered: Number(row.new_pools_registered),
+        newRoutesGenerated: Number(row.new_routes_generated),
+        errors: JSON.parse(String(row.errors_json || '[]')),
+        durationMs: Number(row.duration_ms)
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  public setScoutMetadata(key: string, value: string): void {
+    try {
+      this.upsertScoutMetadataStmt.run(key, value, Date.now());
+    } catch (err) {
+      this.recordPersistenceError('setScoutMetadata', err);
+    }
+  }
+
+  public getScoutMetadata(key: string): string | null {
+    try {
+      const row = this.selectScoutMetadataStmt.get(key) as { value: string } | undefined;
+      return row ? row.value : null;
+    } catch {
+      return null;
+    }
   }
 
   public saveCandidate(candidate: ArbitrageCandidate): void {

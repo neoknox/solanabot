@@ -9,6 +9,7 @@
     "test:watch": "vitest",
     "scanner": "tsx src/cli/index.ts",
     "scanner:smoke": "tsx src/cli/smokeTest.ts",
+    "smoke": "tsx src/cli/smokeTest.ts",
     "discover:pools": "tsx src/cli/discoverPools.ts",
     "hud": "tsx src/cli/hud.ts",
     "report": "tsx src/cli/report.ts",

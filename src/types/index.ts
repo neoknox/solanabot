@@ -422,3 +422,57 @@ export interface RouteSummaryStats {
   persistenceErrorsCount: number;
   verifiedPoolCount?: number;          // Backward compatibility alias for verifiedDirectPoolCount
 }
+
+/**
+ * Phase 1.5: Automatic Scout Types
+ */
+export interface ScoutRunRecord {
+  runId: string;
+  startedAt: number;
+  completedAt: number;
+  status: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'RATE_LIMITED';
+  candidatesFound: number;
+  candidatesVerified: number;
+  candidatesRejected: number;
+  newPoolsRegistered: number;
+  newRoutesGenerated: number;
+  errors: string[];
+  durationMs: number;
+}
+
+export interface ScoutMetricsSummary {
+  lastScoutRunTimestamp: number | null;
+  nextScheduledScoutRun: number | null;
+  scoutStatus: 'IDLE' | 'RUNNING' | 'ERROR';
+  totalDiscoveredPools: number;
+  totalVerifiedPools: number;
+  totalRejectedPools: number;
+  totalRoutesInLibrary: number;
+  verifiedRoutesCount: number;
+  readyRoutesCount: number;
+  staleRoutesCount: number;
+  blockedRoutesCount: number;
+  twoLegRoutesCount: number;
+  threeLegRoutesCount: number;
+  intraDexRoutesCount: number;
+  interDexRoutesCount: number;
+  routeGenerationTimeMs: number;
+  lastScoutError: string | null;
+
+  // Compatibility fields
+  totalStructurallyVerifiedPools?: number;
+  unverifiedPools?: number;
+  storedDirectedRoutes?: number;
+  structurallyVerifiedRoutes?: number;
+  liveReadyRoutes?: number;
+  staleRoutes?: number;
+  blockedRoutes?: number;
+  newPoolsDiscoveredToday?: number;
+  newVerifiedRoutesAddedToday?: number;
+  lastScoutExecution?: string | null;
+  lastScoutResult?: string;
+  discoveryApiFailures?: number;
+  wsSubscriptionsCount?: number;
+  queueDrops?: number;
+  persistenceErrors?: number;
+}

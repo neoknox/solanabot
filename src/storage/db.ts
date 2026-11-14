@@ -134,6 +134,26 @@ export function initDatabase(config: AppConfig): Database.Database {
       last_verified_at INTEGER NOT NULL,
       created_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS scout_runs (
+      run_id TEXT PRIMARY KEY,
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      candidates_found INTEGER NOT NULL,
+      candidates_verified INTEGER NOT NULL,
+      candidates_rejected INTEGER NOT NULL,
+      new_pools_registered INTEGER NOT NULL,
+      new_routes_generated INTEGER NOT NULL,
+      errors_json TEXT,
+      duration_ms INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS scout_metadata (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
   `);
 
   // Safe incremental column migration if table already existed from earlier phases

@@ -17,12 +17,14 @@ export interface DiscoveredCandidate {
   address: string;
   tokenMintA: string;
   tokenMintB: string;
-  tickSpacing: number;
-  feeRate: number;
+  tickSpacing?: number;
+  feeRate?: number;
   tvlUsdc?: string;
   liquidity?: string;
-  source: 'ORCA_API';
+  source: 'ORCA_API' | 'RAYDIUM_API';
   discoveredAt: number;
+  dexType?: 'ORCA_WHIRLPOOL' | 'RAYDIUM_AMM' | 'RAYDIUM_CLMM';
+  programId?: string;
 }
 
 export interface VerificationResult {
@@ -65,8 +67,8 @@ export class OrcaPoolDiscovery {
 
   constructor(options: OrcaDiscoveryOptions = {}) {
     this.apiBaseUrl = options.apiBaseUrl || 'https://api.orca.so/v2/solana/pools';
-    this.pageSize = Math.min(options.pageSize || 10, 10); // Maximum 10 results per page
-    this.maxPages = Math.min(options.maxPages || 3, 3);   // Maximum 3 pages per run
+    this.pageSize = Math.min(options.pageSize || 50, 100);
+    this.maxPages = Math.min(options.maxPages || 5, 20);
     this.timeoutMs = options.timeoutMs || 10000;          // 10 seconds timeout
     this.maxRetries = options.maxRetries !== undefined ? options.maxRetries : 1; // Maximum 1 retry
     this.adapter = new OrcaWhirlpoolAdapter();
@@ -100,14 +102,14 @@ export class OrcaPoolDiscovery {
         try {
           let url = `${this.apiBaseUrl}?limit=${this.pageSize}`;
           if (cursor) {
-            url += `&cursor=${encodeURIComponent(cursor)}`;
+            url += `&after=${encodeURIComponent(cursor)}&cursor=${encodeURIComponent(cursor)}`;
           }
 
           const response = await fetch(url, {
             signal: controller.signal,
             headers: {
               'Accept': 'application/json',
-              'User-Agent': 'SolanaArbitrageBot-Phase1.3/Discovery'
+              'User-Agent': 'SolanaArbitrageBot-Phase1.5/Discovery'
             }
           });
 
@@ -443,6 +445,305 @@ export class OrcaPoolDiscovery {
   }
 }
 
+export interface RaydiumDiscoveryOptions {
+  apiBaseUrl?: string;
+  pageSize?: number;
+  timeoutMs?: number;
+  maxRetries?: number;
+}
+
+export class RaydiumPoolDiscovery {
+  private apiBaseUrl: string;
+  private pageSize: number;
+  private timeoutMs: number;
+  private maxRetries: number;
+
+  constructor(options: RaydiumDiscoveryOptions = {}) {
+    this.apiBaseUrl = options.apiBaseUrl || 'https://api-v3.raydium.io/pools/info/mint';
+    this.pageSize = Math.min(options.pageSize || 10, 50);
+    this.timeoutMs = options.timeoutMs || 10000;
+    this.maxRetries = options.maxRetries !== undefined ? options.maxRetries : 1;
+  }
+
+  public async discoverCandidates(): Promise<{
+    candidates: DiscoveredCandidate[];
+    pagesFetched: number;
+    apiStatus: 'SUCCESS' | 'RATE_LIMITED' | 'FAILED' | 'TIMEOUT';
+    errors: string[];
+  }> {
+    const candidates: DiscoveredCandidate[] = [];
+    const seen = new Set<string>();
+    const errors: string[] = [];
+    let pagesFetched = 0;
+    let apiStatus: 'SUCCESS' | 'RATE_LIMITED' | 'FAILED' | 'TIMEOUT' = 'SUCCESS';
+
+    const pairs = [
+      { mint1: CANONICAL_USDC_MINT, mint2: CANONICAL_WSOL_MINT },
+      { mint1: CANONICAL_USDC_MINT, mint2: CANONICAL_USDT_MINT },
+      { mint1: CANONICAL_WSOL_MINT, mint2: CANONICAL_USDT_MINT }
+    ];
+
+    for (const pair of pairs) {
+      let pairSuccess = false;
+      let retriesLeft = this.maxRetries;
+
+      while (!pairSuccess && retriesLeft >= 0) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
+
+        try {
+          const url = `${this.apiBaseUrl}?mint1=${pair.mint1}&mint2=${pair.mint2}&poolType=all&poolSortField=default&sortType=desc&pageSize=${this.pageSize}&page=1`;
+          const response = await fetch(url, {
+            signal: controller.signal,
+            headers: {
+              'Accept': 'application/json',
+              'User-Agent': 'SolanaArbitrageBot-Phase1.5/RaydiumDiscovery'
+            }
+          });
+
+          if (response.status === 429) {
+            console.warn('[RAYDIUM_DISCOVERY] Received 429 Rate Limited response from Raydium API. Halting cleanly.');
+            apiStatus = 'RATE_LIMITED';
+            errors.push('HTTP_429_RATE_LIMITED');
+            return { candidates, pagesFetched, apiStatus, errors };
+          }
+
+          if (!response.ok) {
+            throw new Error(`HTTP_${response.status}_${response.statusText}`);
+          }
+
+          const json: any = await response.json();
+          pagesFetched++;
+          pairSuccess = true;
+
+          const poolList: any[] = json?.data?.data || (Array.isArray(json?.data) ? json.data : []);
+          for (const item of poolList) {
+            const address = item.id;
+            if (!address || seen.has(address)) continue;
+
+            const mintA = item.mintA?.address;
+            const mintB = item.mintB?.address;
+            if (mintA && mintB && ALLOWLISTED_MINTS.has(mintA) && ALLOWLISTED_MINTS.has(mintB) && mintA !== mintB) {
+              seen.add(address);
+              candidates.push({
+                address,
+                tokenMintA: mintA,
+                tokenMintB: mintB,
+                feeRate: item.feeRate || 0,
+                tvlUsdc: item.tvl?.toString(),
+                source: 'RAYDIUM_API',
+                programId: item.programId,
+                discoveredAt: Date.now()
+              });
+            }
+          }
+        } catch (err: any) {
+          retriesLeft--;
+          if (err.name === 'AbortError') {
+            console.warn(`[RAYDIUM_DISCOVERY] Pair ${pair.mint1}/${pair.mint2} request timed out.`);
+            if (retriesLeft < 0) {
+              errors.push(`RAYDIUM_${pair.mint1}_TIMEOUT`);
+            }
+          } else {
+            console.warn(`[RAYDIUM_DISCOVERY] Pair ${pair.mint1}/${pair.mint2} request failed: ${err.message}`);
+            if (retriesLeft < 0) {
+              errors.push(`RAYDIUM_${pair.mint1}_FAILED: ${err.message}`);
+            }
+          }
+        } finally {
+          clearTimeout(timeoutId);
+        }
+      }
+    }
+
+    if (errors.length > 0 && candidates.length === 0) {
+      apiStatus = 'FAILED';
+    }
+
+    return { candidates, pagesFetched, apiStatus, errors };
+  }
+
+  public async verifyCandidateOnChain(
+    candidate: DiscoveredCandidate,
+    rpcProvider: SolanaRpcProvider
+  ): Promise<VerificationResult> {
+    if (!candidate || typeof candidate !== 'object') {
+      return { address: 'unknown', verified: false, blockerReason: 'MALFORMED_CANDIDATE' };
+    }
+
+    if (!candidate.address || typeof candidate.address !== 'string' ||
+        !candidate.tokenMintA || typeof candidate.tokenMintA !== 'string' ||
+        !candidate.tokenMintB || typeof candidate.tokenMintB !== 'string') {
+      return { address: candidate.address || 'unknown', verified: false, blockerReason: 'MALFORMED_CANDIDATE' };
+    }
+
+    let pubkey: PublicKey;
+    try {
+      pubkey = new PublicKey(candidate.address);
+      new PublicKey(candidate.tokenMintA);
+      new PublicKey(candidate.tokenMintB);
+    } catch {
+      return { address: candidate.address, verified: false, blockerReason: 'MALFORMED_CANDIDATE' };
+    }
+
+    if (!ALLOWLISTED_MINTS.has(candidate.tokenMintA) || !ALLOWLISTED_MINTS.has(candidate.tokenMintB) || candidate.tokenMintA === candidate.tokenMintB) {
+      return { address: candidate.address, verified: false, blockerReason: 'UNSUPPORTED_TOKEN_MINTS' };
+    }
+
+    try {
+      const accountInfo = await rpcProvider.getAccountInfo(pubkey);
+      if (!accountInfo) {
+        return { address: candidate.address, verified: false, blockerReason: 'ACCOUNT_NOT_FOUND' };
+      }
+
+      const onChainOwner = accountInfo.owner.toBase58();
+      const dataLength = accountInfo.data.length;
+
+      // AMM V4
+      if (onChainOwner === KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4) {
+        if (dataLength < 752) {
+          return { address: candidate.address, verified: false, onChainOwner, dataLength, blockerReason: 'INVALID_ACCOUNT_LAYOUT' };
+        }
+
+        const baseMint = new PublicKey(accountInfo.data.subarray(400, 432)).toBase58();
+        const quoteMint = new PublicKey(accountInfo.data.subarray(432, 464)).toBase58();
+
+        const mintsMatch =
+          (baseMint === candidate.tokenMintA && quoteMint === candidate.tokenMintB) ||
+          (baseMint === candidate.tokenMintB && quoteMint === candidate.tokenMintA);
+
+        if (!mintsMatch) {
+          return { address: candidate.address, verified: false, onChainOwner, dataLength, blockerReason: 'MINT_PAIR_MISMATCH' };
+        }
+
+        const candidateTvl = parseFloat(candidate.tvlUsdc || '0');
+        const poolConfig: PoolConfig = {
+          id: candidate.address,
+          dex: 'RAYDIUM_AMM',
+          programId: KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4,
+          tokenAMint: baseMint,
+          tokenBMint: quoteMint,
+          feeBps: 25,
+          initialLiquidityUsd: candidateTvl > 0 ? candidateTvl : undefined,
+          description: `Raydium AMM V4 (Discovered)`,
+          verificationStatus: 'QUOTE_UNVERIFIED',
+          blockerReason: 'RAYDIUM_AMM_V4_ADAPTER_PENDING'
+        };
+
+        return {
+          address: candidate.address,
+          verified: true,
+          poolConfig,
+          onChainOwner,
+          dataLength,
+          activeLiquidity: candidate.tvlUsdc || '1'
+        };
+      }
+
+      // CLMM
+      if (onChainOwner === KNOWN_PROGRAM_IDS.RAYDIUM_CLMM) {
+        if (dataLength < 1540) {
+          return { address: candidate.address, verified: false, onChainOwner, dataLength, blockerReason: 'INVALID_ACCOUNT_LAYOUT' };
+        }
+
+        const candidateTvl = parseFloat(candidate.tvlUsdc || '0');
+        const poolConfig: PoolConfig = {
+          id: candidate.address,
+          dex: 'RAYDIUM_CLMM',
+          programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
+          tokenAMint: candidate.tokenMintA,
+          tokenBMint: candidate.tokenMintB,
+          feeBps: candidate.feeRate ? Math.round(candidate.feeRate * 10000) : 25,
+          initialLiquidityUsd: candidateTvl > 0 ? candidateTvl : undefined,
+          description: `Raydium CLMM (Discovered)`,
+          verificationStatus: 'QUOTE_UNVERIFIED',
+          blockerReason: 'UNSUPPORTED_PRICING_ADAPTER_CLMM'
+        };
+
+        return {
+          address: candidate.address,
+          verified: true,
+          poolConfig,
+          onChainOwner,
+          dataLength,
+          activeLiquidity: candidate.tvlUsdc || '1'
+        };
+      }
+
+      return {
+        address: candidate.address,
+        verified: false,
+        onChainOwner,
+        dataLength,
+        blockerReason: 'INVALID_PROGRAM_OWNER'
+      };
+    } catch (err: any) {
+      return {
+        address: candidate.address,
+        verified: false,
+        blockerReason: `RPC_VERIFICATION_ERROR: ${err.message}`
+      };
+    }
+  }
+
+  public async runDiscoveryAndVerification(
+    poolRegistry: PoolRegistry,
+    rpcProvider: SolanaRpcProvider,
+    persistenceFilePath?: string
+  ): Promise<DiscoveryReport> {
+    const startTime = Date.now();
+    const results: VerificationResult[] = [];
+    const report: DiscoveryReport = {
+      apiStatus: 'SUCCESS',
+      pagesFetched: 0,
+      candidatesFound: 0,
+      candidatesVerified: 0,
+      candidatesRejected: 0,
+      results,
+      errors: [],
+      durationMs: 0
+    };
+
+    try {
+      const discovery = await this.discoverCandidates();
+      report.apiStatus = discovery.apiStatus;
+      report.pagesFetched = discovery.pagesFetched;
+      report.candidatesFound = discovery.candidates.length;
+      report.errors = discovery.errors;
+
+      const verifiedCandidatesForPersistence: DiscoveredCandidate[] = [];
+
+      for (const candidate of discovery.candidates) {
+        if (poolRegistry.getPool(candidate.address)) {
+          continue;
+        }
+
+        const verification = await this.verifyCandidateOnChain(candidate, rpcProvider);
+        results.push(verification);
+
+        if (verification.verified && verification.poolConfig) {
+          report.candidatesVerified++;
+          poolRegistry.register(verification.poolConfig);
+          verifiedCandidatesForPersistence.push(candidate);
+        } else {
+          report.candidatesRejected++;
+        }
+      }
+
+      if (persistenceFilePath && verifiedCandidatesForPersistence.length > 0) {
+        saveDiscoveredCandidates(verifiedCandidatesForPersistence, persistenceFilePath);
+      }
+    } catch (err: any) {
+      report.apiStatus = 'FAILED';
+      report.errors.push(`RAYDIUM_DISCOVERY_PIPELINE_ERROR: ${err.message}`);
+    } finally {
+      report.durationMs = Date.now() - startTime;
+    }
+
+    return report;
+  }
+}
+
 export interface DiscoveredPoolsPayload {
   pools: DiscoveredCandidate[];
   updatedAt: string;
@@ -532,11 +833,13 @@ export function loadDiscoveredCandidates(
           address: item.address,
           tokenMintA: item.tokenMintA,
           tokenMintB: item.tokenMintB,
-          tickSpacing: Number(item.tickSpacing) || 0,
+          tickSpacing: item.tickSpacing !== undefined ? Number(item.tickSpacing) : undefined,
           feeRate: Number(item.feeRate) || 0,
           tvlUsdc: item.tvlUsdc?.toString(),
           liquidity: item.liquidity?.toString(),
-          source: 'ORCA_API',
+          source: item.source === 'RAYDIUM_API' ? 'RAYDIUM_API' : 'ORCA_API',
+          programId: item.programId,
+          dexType: item.dexType,
           discoveredAt: Number(item.discoveredAt) || Date.now()
         });
       }

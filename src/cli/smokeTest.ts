@@ -204,6 +204,27 @@ async function main() {
   console.log(`  - QUOTE_UNVERIFIED Pools:              ${routeLibStats.unverifiedPoolCount}`);
   console.log(`  Persistence Errors Count:              ${routeLibStats.persistenceErrorsCount}`);
 
+  console.log('\n--- PHASE 1.5 AUTOMATIC SCOUT EXPANSION BENCHMARK ---');
+  const scoutMetrics = scanner.getScoutMetrics();
+  console.log(`  Scout Engine Status:                   ${scoutMetrics.scoutStatus}`);
+  console.log(`  Last Scout Run Timestamp:              ${scoutMetrics.lastScoutRunTimestamp ? new Date(scoutMetrics.lastScoutRunTimestamp).toISOString() : 'NONE'}`);
+  console.log(`  Next Scheduled Scout Run:              ${scoutMetrics.nextScheduledScoutRun ? new Date(scoutMetrics.nextScheduledScoutRun).toISOString() : 'PENDING'}`);
+  console.log(`  Total Discovered Pools:                ${scoutMetrics.totalDiscoveredPools}`);
+  console.log(`  - Verified Pools:                      ${scoutMetrics.totalVerifiedPools}`);
+  console.log(`  - Rejected Pools:                      ${scoutMetrics.totalRejectedPools}`);
+  console.log(`  Total Routes in Expanded Library:      ${scoutMetrics.totalRoutesInLibrary}`);
+  console.log(`  - Structurally Verified Routes:        ${scoutMetrics.verifiedRoutesCount}`);
+  console.log(`  - Live READY Routes:                   ${scoutMetrics.readyRoutesCount}`);
+  console.log(`  - Stale Routes:                        ${scoutMetrics.staleRoutesCount}`);
+  console.log(`  - Blocked Routes:                      ${scoutMetrics.blockedRoutesCount}`);
+  console.log(`  - 2-Leg Cycles:                        ${scoutMetrics.twoLegRoutesCount}`);
+  console.log(`  - 3-Leg Cycles:                        ${scoutMetrics.threeLegRoutesCount}`);
+  console.log(`  - Intra-DEX Cycles:                    ${scoutMetrics.intraDexRoutesCount}`);
+  console.log(`  - Inter-DEX Cycles:                    ${scoutMetrics.interDexRoutesCount}`);
+  console.log(`  Route Generation Latency:              ${scoutMetrics.routeGenerationTimeMs} ms`);
+  console.log(`  Target 1 Milestone (>= 100 routes):    ${scoutMetrics.totalRoutesInLibrary >= 100 ? 'ACHIEVED' : 'IN_PROGRESS'} (${scoutMetrics.totalRoutesInLibrary}/100)`);
+  console.log(`  Target 2 Milestone (>= 250 routes):    ${scoutMetrics.totalRoutesInLibrary >= 250 ? 'ACHIEVED' : 'IN_PROGRESS'} (${scoutMetrics.totalRoutesInLibrary}/250)`);
+
   console.log('\n--- PHASE 1.4 LIVE INTERVAL VALIDATION MONITORING (120s) ---');
   console.log('| Interval | Stored | VERIFIED | READY | STALE | BLOCKED | DirectPools | QuoteValid | PeakREADY | R->S | S->R | Drops | PersistErr |');
   console.log('|----------|--------|----------|-------|-------|---------|-------------|------------|-----------|------|------|-------|------------|');

@@ -11,13 +11,15 @@ import {
   CostBreakdown,
   AuditMetrics,
   VerifiedPoolRecord,
-  RouteSummaryStats
+  RouteSummaryStats,
+  ScoutMetricsSummary
 } from '../types/index.js';
+import { AutomaticScout, ScoutCycleResult } from './automaticScout.js';
 import { SolanaRpcProvider } from '../providers/solanaRpc.js';
 import { SolanaWsProvider } from '../providers/solanaWs.js';
 import { JupiterClient } from '../providers/jupiterClient.js';
 import { dexRegistry } from '../dex/index.js';
-import { PoolRegistry } from './poolRegistry.js';
+import { PoolRegistry, PoolConfig } from './poolRegistry.js';
 import { loadDiscoveredCandidates } from './poolDiscovery.js';
 import { StateCache } from './stateCache.js';
 import { CostModel } from '../profit/costModel.js';
@@ -65,6 +67,7 @@ export class ArbitrageScanner {
   private routeIndex: RouteIndex;
   private eventQueue: BoundedEventQueue;
   private latencyTracker: LatencyTracker;
+  private automaticScout: AutomaticScout;
   private isDrainingQueue = false;
 
   private isRunning = false;
@@ -207,6 +210,22 @@ export class ArbitrageScanner {
     // Phase 1.4: Sync verified pools and routes into persistent SQLite library
     this.syncRouteLibraryToStorage();
 
+    // Phase 1.5: Automatic Scout Engine
+    this.automaticScout = new AutomaticScout(
+      this.poolRegistry,
+      this.routeIndex,
+      this.repository,
+      this.rpc,
+      {
+        intervalMs: 24 * 60 * 60 * 1000,
+        runOnStartup: true,
+        persistenceFilePath: discoveredFile
+      },
+      async (pool: PoolConfig) => {
+        await this.hotActivateDiscoveredPool(pool);
+      }
+    );
+
     // Setup WS disconnect/reconnect hooks
     this.ws.onDisconnect(() => {
       this.stateCache.invalidateAll('DISCONNECTED');
@@ -301,6 +320,9 @@ export class ArbitrageScanner {
         this.repository.updateRouteReadiness(expired.routeId, false, expired.verificationDetails);
       }
     }, scanInterval);
+
+    // 5. Start Automatic Scout scheduler
+    this.automaticScout.start();
   }
 
   private enqueueUpdate(update: QueuedAccountUpdate): void {
@@ -1898,8 +1920,62 @@ export class ArbitrageScanner {
     return this.profitThresholdManager;
   }
 
+  public async hotActivateDiscoveredPool(pool: PoolConfig): Promise<void> {
+    if (this.isRunning && this.ws) {
+      this.ws.subscribeAccount(pool.id, (buf, slot, rxTime, monoTime) => {
+        this.enqueueUpdate({
+          type: 'POOL_ACCOUNT',
+          key: pool.id,
+          data: buf,
+          slot,
+          receivedAtMs: rxTime || Date.now(),
+          monotonicReceiptTime: monoTime || performance.now()
+        });
+      });
+
+      if (pool.dex === 'ORCA_WHIRLPOOL') {
+        const poolState = this.stateCache.getPoolState(pool.id);
+        const tickCurrent = poolState?.extraData && (poolState.extraData as any).tickCurrent;
+        const tickSpacing = poolState?.extraData && (poolState.extraData as any).tickSpacing;
+        if (tickCurrent !== undefined && tickSpacing !== undefined) {
+          const surroundingStarts = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+          for (const startIdx of surroundingStarts) {
+            try {
+              const pda = deriveTickArrayPda(new PublicKey(pool.id), startIdx);
+              const pdaStr = pda.toBase58();
+              this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx });
+              this.ws.subscribeAccount(pdaStr, (buf, slot, rxTime, monoTime) => {
+                this.enqueueUpdate({
+                  type: 'TICK_ARRAY_ACCOUNT',
+                  key: pdaStr,
+                  data: buf,
+                  slot,
+                  receivedAtMs: rxTime || Date.now(),
+                  monotonicReceiptTime: monoTime || performance.now()
+                });
+              });
+            } catch {}
+          }
+        }
+      }
+    }
+  }
+
+  public getAutomaticScout(): AutomaticScout {
+    return this.automaticScout;
+  }
+
+  public async triggerScoutDiscovery(source: 'SCHEDULED' | 'MANUAL' = 'MANUAL'): Promise<ScoutCycleResult> {
+    return await this.automaticScout.runScoutCycle(source);
+  }
+
+  public getScoutMetrics(): ScoutMetricsSummary {
+    return this.automaticScout.getMetrics();
+  }
+
   public stop(): void {
     this.isRunning = false;
+    this.automaticScout.stop();
     if (this.scanTimer) {
       clearInterval(this.scanTimer);
       this.scanTimer = null;
