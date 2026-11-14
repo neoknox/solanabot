@@ -42,6 +42,12 @@ import {
   getRequiredTickArrayStartIndices,
   getTickArrayContentSignature
 } from '../dex/orcaTickArray.js';
+import {
+  deriveRaydiumClmmTickArrayPda,
+  decodeRaydiumClmmTickArray,
+  getSurroundingRaydiumClmmTickArrayStartIndices,
+  getRequiredRaydiumClmmTickArrayStartIndices
+} from '../dex/raydiumClmmTickArray.js';
 import { KNOWN_PROGRAM_IDS } from '../config/index.js';
 
 export type CandidateListener = (candidate: ArbitrageCandidate) => void;
@@ -76,7 +82,7 @@ export class ArbitrageScanner {
   private candidateListeners: CandidateListener[] = [];
   private vaultToPool = new Map<string, { poolId: string; isA: boolean }>();
   private openOrdersToPool = new Map<string, string>();
-  private tickArrayToPool = new Map<string, { poolId: string; startTickIndex: number }>();
+  private tickArrayToPool = new Map<string, { poolId: string; startTickIndex: number; isClmm?: boolean }>();
   private subscribedAccounts = new Set<string>();
 
   private qualifiedCount = 0;
@@ -407,7 +413,9 @@ export class ArbitrageScanner {
             this.currentSolPriceUSDC = new Decimal(price);
             this.lastSolPriceTime = Date.now();
           }
-        } catch {}
+        } catch (fatalErr) {
+      console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
+    }
       }
 
       // Preserve existing hydrated state and verify dependency freshness
@@ -721,7 +729,9 @@ export class ArbitrageScanner {
             }
           }
         }
-      } catch {}
+      } catch (fatalErr) {
+      console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
+    }
     }
   }
 
@@ -735,7 +745,7 @@ export class ArbitrageScanner {
     if (!mapping) return;
 
     const pool = this.stateCache.getPoolState(mapping.poolId);
-    if (!pool || pool.dex !== 'ORCA_WHIRLPOOL') return;
+    if (!pool || (pool.dex !== 'ORCA_WHIRLPOOL' && pool.dex !== 'RAYDIUM_CLMM')) return;
 
     const extra = (pool.extraData || {}) as any;
     const currentArraySlot = extra.tickArraySlots?.[mapping.startTickIndex] || 0;
@@ -744,7 +754,9 @@ export class ArbitrageScanner {
       return;
     }
 
-    const decoded = decodeTickArrayAccount(update.data, mapping.poolId);
+    const decoded = pool.dex === 'RAYDIUM_CLMM' || mapping.isClmm
+      ? decodeRaydiumClmmTickArray(update.data, mapping.poolId)
+      : decodeTickArrayAccount(update.data, mapping.poolId);
     if (!decoded) return;
 
     if (!extra.tickArrays) extra.tickArrays = {};
@@ -756,14 +768,16 @@ export class ArbitrageScanner {
     extra.tickArrayReceivedAt[mapping.startTickIndex] = update.receivedAtMs;
 
     // Independent Freshness: Do NOT overwrite pool.slot or pool.receivedAt with tick array update!
-    // The Whirlpool's observation timestamp and slot represent the pool state itself.
+    // The pool's observation timestamp and slot represent the pool state itself.
 
-    // Safe Promotion: Check if Orca Whirlpool now has all required surrounding tick arrays hydrated and fresh
+    // Safe Promotion: Check if pool now has all required surrounding tick arrays hydrated and fresh
     const tickSpacing = extra.tickSpacing || 1;
     const tickCurrent = extra.tickCurrent;
     const liquidity = BigInt(extra?.liquidity || '0');
     if (tickCurrent !== undefined && extra.tickArrays && liquidity > 0n) {
-      const surroundingStarts = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+      const surroundingStarts = pool.dex === 'RAYDIUM_CLMM' || mapping.isClmm
+        ? getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing)
+        : getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
       const arrayTimestamps = extra.tickArrayReceivedAt || {};
       const arraySlots = extra.tickArraySlots || {};
       const ttl = 30000;
@@ -1422,12 +1436,24 @@ export class ArbitrageScanner {
               this.routeIndex.updatePoolStatus(poolConfig.id, 'QUOTE_UNVERIFIED');
               continue;
             }
+          } else if (poolConfig.dex === 'RAYDIUM_CLMM') {
+            const onChainOwner = accountInfo.owner ? accountInfo.owner.toBase58() : '';
+            if (onChainOwner !== KNOWN_PROGRAM_IDS.RAYDIUM_CLMM) {
+              this.poolRegistry.updatePoolVerification(poolConfig.id, 'QUOTE_UNVERIFIED', 'INVALID_PROGRAM_OWNER');
+              this.routeIndex.updatePoolStatus(poolConfig.id, 'QUOTE_UNVERIFIED');
+              continue;
+            }
+            if (accountInfo.data.length < 1544) {
+              this.poolRegistry.updatePoolVerification(poolConfig.id, 'QUOTE_UNVERIFIED', 'INVALID_ACCOUNT_LAYOUT');
+              this.routeIndex.updatePoolStatus(poolConfig.id, 'QUOTE_UNVERIFIED');
+              continue;
+            }
           }
 
           const decoded = adapter.decodePoolState(accountInfo.data, poolConfig.id, snapshotSlot);
           if (decoded) {
-            // Strict mint pair match and positive on-chain liquidity for Orca Whirlpool candidates
-            if (poolConfig.dex === 'ORCA_WHIRLPOOL') {
+            // Strict mint pair match and positive on-chain liquidity for Orca Whirlpool & Raydium CLMM candidates
+            if (poolConfig.dex === 'ORCA_WHIRLPOOL' || poolConfig.dex === 'RAYDIUM_CLMM') {
               const matchesMints =
                 (decoded.tokenAMint === poolConfig.tokenAMint && decoded.tokenBMint === poolConfig.tokenBMint) ||
                 (decoded.tokenAMint === poolConfig.tokenBMint && decoded.tokenBMint === poolConfig.tokenAMint);
@@ -1503,7 +1529,9 @@ export class ArbitrageScanner {
                   this.currentSolPriceUSDC = new Decimal(price);
                   this.lastSolPriceTime = Date.now();
                 }
-              } catch {}
+              } catch (fatalErr) {
+      console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
+    }
             }
           }
         }
@@ -1549,7 +1577,9 @@ export class ArbitrageScanner {
               }
             }
           }
-        } catch {}
+        } catch (fatalErr) {
+      console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
+    }
       }
 
       // Step 3: Single bounded attempt to fetch OpenOrders accounts for Raydium V4 pools
@@ -1662,23 +1692,28 @@ export class ArbitrageScanner {
         }
       }
 
-      // Step 4: Batch fetch and subscribe to nearby initialized TickArrays for Orca Whirlpool pools
-      const tickArraysToFetch: { pda: PublicKey; poolIndex: number; startTickIndex: number; poolId: string }[] = [];
+      // Step 4: Batch fetch and subscribe to nearby initialized TickArrays for Orca Whirlpool & Raydium CLMM pools
+      const tickArraysToFetch: { pda: PublicKey; poolIndex: number; startTickIndex: number; poolId: string; isClmm: boolean }[] = [];
       for (let pIdx = 0; pIdx < decodedPools.length; pIdx++) {
         const pool = decodedPools[pIdx];
-        if (pool.dex === 'ORCA_WHIRLPOOL') {
+        if (pool.dex === 'ORCA_WHIRLPOOL' || pool.dex === 'RAYDIUM_CLMM') {
+          const isClmm = pool.dex === 'RAYDIUM_CLMM';
           const extra = (pool.extraData || {}) as any;
           const tickSpacing = extra.tickSpacing || 1;
           const tickCurrent = extra.tickCurrent;
           if (tickCurrent !== undefined) {
             if (!extra.tickArrays) extra.tickArrays = {};
-            const surroundingStarts = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+            const surroundingStarts = isClmm
+              ? getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing)
+              : getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
             for (const startIdx of surroundingStarts) {
-              const pda = deriveTickArrayPda(pool.id, startIdx);
+              const pda = isClmm
+                ? deriveRaydiumClmmTickArrayPda(pool.id, startIdx)
+                : deriveTickArrayPda(pool.id, startIdx);
               const pdaStr = pda.toBase58();
               if (!this.subscribedAccounts.has(pdaStr)) {
                 this.subscribedAccounts.add(pdaStr);
-                this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx });
+                this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx, isClmm });
                 this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
                   this.enqueueUpdate({
                     type: 'TICK_ARRAY_ACCOUNT',
@@ -1690,7 +1725,7 @@ export class ArbitrageScanner {
                   });
                 });
               }
-              tickArraysToFetch.push({ pda, poolIndex: pIdx, startTickIndex: startIdx, poolId: pool.id });
+              tickArraysToFetch.push({ pda, poolIndex: pIdx, startTickIndex: startIdx, poolId: pool.id, isClmm });
             }
           }
         }
@@ -1711,11 +1746,14 @@ export class ArbitrageScanner {
             if (!pool || !acc || !acc.data) continue;
 
             const ownerStr = acc.owner ? acc.owner.toBase58() : '';
-            if (ownerStr && ownerStr !== KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL) {
+            const expectedOwner = item.isClmm ? KNOWN_PROGRAM_IDS.RAYDIUM_CLMM : KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL;
+            if (ownerStr && ownerStr !== expectedOwner) {
               continue;
             }
 
-            const decodedArray = decodeTickArrayAccount(acc.data, item.poolId);
+            const decodedArray = item.isClmm
+              ? decodeRaydiumClmmTickArray(acc.data, item.poolId)
+              : decodeTickArrayAccount(acc.data, item.poolId);
             if (decodedArray) {
               const extra = (pool.extraData || {}) as any;
               if (!extra.tickArrays) extra.tickArrays = {};
@@ -1726,8 +1764,8 @@ export class ArbitrageScanner {
               extra.tickArrayReceivedAt[item.startTickIndex] = Date.now();
             }
           }
-        } catch {
-          // Bounded timeout: continue without blocking
+        } catch (err) {
+          console.warn('[refreshAllPoolStates] Tick arrays fetch error:', err);
         }
       }
 
@@ -1741,15 +1779,18 @@ export class ArbitrageScanner {
           }
         }
 
-        // Safe Promotion: Promote Orca Whirlpools to VERIFIED_DIRECT only when all surrounding tick arrays are hydrated and fresh
-        if (pool.dex === 'ORCA_WHIRLPOOL') {
+        // Safe Promotion: Promote Orca Whirlpools & Raydium CLMM to VERIFIED_DIRECT only when all surrounding tick arrays are hydrated and fresh
+        if (pool.dex === 'ORCA_WHIRLPOOL' || pool.dex === 'RAYDIUM_CLMM') {
+          const isClmm = pool.dex === 'RAYDIUM_CLMM';
           const extra = (pool.extraData || {}) as any;
           const tickSpacing = extra.tickSpacing || 1;
           const tickCurrent = extra.tickCurrent;
           const liquidity = BigInt(extra?.liquidity || '0');
 
           if (tickCurrent !== undefined && extra.tickArrays && liquidity > 0n) {
-            const surroundingStarts = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+            const surroundingStarts = isClmm
+              ? getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing)
+              : getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
             const arrayTimestamps = extra.tickArrayReceivedAt || {};
             const arraySlots = extra.tickArraySlots || {};
             const now = Date.now();
@@ -1782,7 +1823,9 @@ export class ArbitrageScanner {
           this.evaluateAffectedRoutes(pool.id, performance.now());
         }
       }
-    } catch {}
+    } catch (fatalErr) {
+      console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
+    }
   }
 
   /**
@@ -1819,14 +1862,19 @@ export class ArbitrageScanner {
       for (const p of batch) {
         pubkeysToFetch.push(new PublicKey(p.id));
 
-        // For Whirlpools: also include surrounding tick array pubkeys if tickCurrent is known
-        if (p.dex === 'ORCA_WHIRLPOOL') {
+        // For concentrated liquidity (Whirlpools & Raydium CLMM): also include surrounding tick array pubkeys if tickCurrent is known
+        if (p.dex === 'ORCA_WHIRLPOOL' || p.dex === 'RAYDIUM_CLMM') {
+          const isClmm = p.dex === 'RAYDIUM_CLMM';
           const state = this.stateCache.getPoolState(p.id);
           const extra = state?.extraData as any;
           if (extra?.tickCurrent !== undefined && extra?.tickSpacing) {
-            const surrounding = getSurroundingTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing);
+            const surrounding = isClmm
+              ? getSurroundingRaydiumClmmTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing)
+              : getSurroundingTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing);
             for (const startIdx of surrounding) {
-              const pda = deriveTickArrayPda(p.id, startIdx);
+              const pda = isClmm
+                ? deriveRaydiumClmmTickArrayPda(p.id, startIdx)
+                : deriveTickArrayPda(p.id, startIdx);
               pubkeysToFetch.push(pda);
             }
           }
@@ -1847,11 +1895,13 @@ export class ArbitrageScanner {
       for (const p of batch) {
         const poolAcc = accounts[accIndex++];
         if (!poolAcc || !poolAcc.data) {
-          if (p.dex === 'ORCA_WHIRLPOOL') {
+          if (p.dex === 'ORCA_WHIRLPOOL' || p.dex === 'RAYDIUM_CLMM') {
             const state = this.stateCache.getPoolState(p.id);
             const extra = state?.extraData as any;
             if (extra?.tickCurrent !== undefined && extra?.tickSpacing) {
-              const count = getSurroundingTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing).length;
+              const count = p.dex === 'RAYDIUM_CLMM'
+                ? getSurroundingRaydiumClmmTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing).length
+                : getSurroundingTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing).length;
               accIndex += count;
             }
           }
@@ -1866,7 +1916,8 @@ export class ArbitrageScanner {
           decoded.receivedAt = Date.now();
           const existing = this.stateCache.getPoolState(p.id);
 
-          if (decoded.dex === 'ORCA_WHIRLPOOL') {
+          if (decoded.dex === 'ORCA_WHIRLPOOL' || decoded.dex === 'RAYDIUM_CLMM') {
+            const isClmm = decoded.dex === 'RAYDIUM_CLMM';
             const extra = (decoded.extraData || {}) as any;
             const existingExtra = (existing?.extraData || {}) as any;
             if (existingExtra.tickArrays) extra.tickArrays = existingExtra.tickArrays;
@@ -1876,11 +1927,15 @@ export class ArbitrageScanner {
             const tickSpacing = extra.tickSpacing || 1;
             const tickCurrent = extra.tickCurrent;
             if (tickCurrent !== undefined) {
-              const surrounding = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+              const surrounding = isClmm
+                ? getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing)
+                : getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
               for (const startIdx of surrounding) {
                 const tickAcc = accounts[accIndex++];
                 if (tickAcc && tickAcc.data) {
-                  const decodedArr = decodeTickArrayAccount(tickAcc.data, p.id);
+                  const decodedArr = isClmm
+                    ? decodeRaydiumClmmTickArray(tickAcc.data, p.id)
+                    : decodeTickArrayAccount(tickAcc.data, p.id);
                   if (decodedArr) {
                     if (!extra.tickArrays) extra.tickArrays = {};
                     if (!extra.tickArraySlots) extra.tickArraySlots = {};
@@ -2053,6 +2108,14 @@ export class ArbitrageScanner {
     return this.repository;
   }
 
+  public getRpc(): SolanaRpcProvider {
+    return this.rpc;
+  }
+
+  public getWs(): SolanaWsProvider {
+    return this.ws;
+  }
+
   public getRouteLibrarySummary(): RouteSummaryStats {
     return this.repository.getRouteSummaryStats();
   }
@@ -2188,8 +2251,7 @@ export class ArbitrageScanner {
   }
 
   public async hotActivateDiscoveredPool(pool: PoolConfig): Promise<HotActivationOutcome> {
-    // 1. Raydium CLMM and unsupported pricing adapters remain disabled until separately approved
-    if (pool.dex === 'RAYDIUM_CLMM' || pool.blockerReason === 'UNSUPPORTED_PRICING_ADAPTER_CLMM') {
+    if (pool.blockerReason === 'UNSUPPORTED_PRICING_ADAPTER_CLMM') {
       this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'UNSUPPORTED_PRICING_ADAPTER_CLMM');
       this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
       return 'UNSUPPORTED';
@@ -2232,14 +2294,18 @@ export class ArbitrageScanner {
       }
 
       // 4. Decode and validate pool state
-      if (pool.dex === 'ORCA_WHIRLPOOL') {
+      if (pool.dex === 'ORCA_WHIRLPOOL' || pool.dex === 'RAYDIUM_CLMM') {
+        const isClmm = pool.dex === 'RAYDIUM_CLMM';
+        const expectedOwner = isClmm ? KNOWN_PROGRAM_IDS.RAYDIUM_CLMM : KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL;
+        const minLayout = isClmm ? 1544 : 653;
+
         const onChainOwner = accountInfo.owner ? accountInfo.owner.toBase58() : '';
-        if (onChainOwner !== KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL) {
+        if (onChainOwner !== expectedOwner) {
           this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'INVALID_PROGRAM_OWNER');
           this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
           return 'FAILED';
         }
-        if (accountInfo.data.length < 653) {
+        if (accountInfo.data.length < minLayout) {
           this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'INVALID_ACCOUNT_LAYOUT');
           this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
           return 'FAILED';
@@ -2248,6 +2314,15 @@ export class ArbitrageScanner {
         const decoded = adapter.decodePoolState(accountInfo.data, pool.id, snapshotSlot);
         if (!decoded) {
           this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'DECODE_FAILED');
+          this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+          return 'FAILED';
+        }
+
+        const matchesMints =
+          (decoded.tokenAMint === pool.tokenAMint && decoded.tokenBMint === pool.tokenBMint) ||
+          (decoded.tokenAMint === pool.tokenBMint && decoded.tokenBMint === pool.tokenAMint);
+        if (!matchesMints) {
+          this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'MINT_PAIR_MISMATCH');
           this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
           return 'FAILED';
         }
@@ -2272,17 +2347,21 @@ export class ArbitrageScanner {
           if (!extra.tickArraySlots) extra.tickArraySlots = {};
           if (!extra.tickArrayReceivedAt) extra.tickArrayReceivedAt = {};
 
-          const surroundingStarts = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+          const surroundingStarts = isClmm
+            ? getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing)
+            : getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
           const pdaPubkeys: PublicKey[] = [];
           const startIndices: number[] = [];
 
           for (const startIdx of surroundingStarts) {
             try {
-              const pda = deriveTickArrayPda(pool.id, startIdx);
+              const pda = isClmm
+                ? deriveRaydiumClmmTickArrayPda(pool.id, startIdx)
+                : deriveTickArrayPda(pool.id, startIdx);
               const pdaStr = pda.toBase58();
               if (!this.subscribedAccounts.has(pdaStr)) {
                 this.subscribedAccounts.add(pdaStr);
-                this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx });
+                this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx, isClmm });
                 this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
                   this.enqueueUpdate({
                     type: 'TICK_ARRAY_ACCOUNT',
@@ -2296,7 +2375,9 @@ export class ArbitrageScanner {
               }
               pdaPubkeys.push(pda);
               startIndices.push(startIdx);
-            } catch {}
+            } catch (fatalErr) {
+      console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
+    }
           }
 
           // Hydrate required tick arrays via RPC out-of-band
@@ -2308,7 +2389,9 @@ export class ArbitrageScanner {
                 const acc = tRes.value[i];
                 const startIdx = startIndices[i];
                 if (acc && acc.data) {
-                  const decodedArray = decodeTickArrayAccount(acc.data, pool.id);
+                  const decodedArray = isClmm
+                    ? decodeRaydiumClmmTickArray(acc.data, pool.id)
+                    : decodeTickArrayAccount(acc.data, pool.id);
                   if (decodedArray) {
                     extra.tickArrays[startIdx] = decodedArray;
                     extra.tickArraySlots[startIdx] = tSlot;
@@ -2429,7 +2512,9 @@ export class ArbitrageScanner {
             if (decoded.reserveA !== undefined && decoded.reserveB !== undefined && decoded.reserveA > 0n && decoded.reserveB > 0n) {
               vaultsHydrated = true;
             }
-          } catch {}
+          } catch (fatalErr) {
+      console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
+    }
         }
 
         // Hydrate and subscribe OpenOrders
@@ -2478,7 +2563,9 @@ export class ArbitrageScanner {
                 openOrdersHydrated = true;
               }
             }
-          } catch {}
+          } catch (fatalErr) {
+      console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
+    }
         }
 
         decoded.receivedAt = Date.now();

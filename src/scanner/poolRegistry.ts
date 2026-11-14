@@ -299,7 +299,7 @@ export class PoolRegistry {
   }
 
   public isVenueSupported(dex: DexType): boolean {
-    return dex === 'ORCA_WHIRLPOOL' || dex === 'RAYDIUM_AMM';
+    return dex === 'ORCA_WHIRLPOOL' || dex === 'RAYDIUM_AMM' || dex === 'RAYDIUM_CLMM';
   }
 
   public getSupportedPools(): PoolConfig[] {

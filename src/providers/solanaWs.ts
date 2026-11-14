@@ -16,6 +16,7 @@ export interface WsStats {
   lastSlot: number;
   lastMessageTime: number;
   subscriptionCount: number;
+  messagesTotal?: number;
 }
 
 export class SolanaWsProvider {
@@ -37,6 +38,7 @@ export class SolanaWsProvider {
   private reqIdToPubkey = new Map<number, string>();
   private reqIdForSlot: number | null = null;
   private slotSubId: number | null = null;
+  private messagesTotal = 0;
 
   private onReconnectCallbacks: Array<() => void> = [];
   private onDisconnectCallbacks: Array<() => void> = [];
@@ -155,6 +157,7 @@ export class SolanaWsProvider {
   }
 
   private handleMessage(rawMessage: string): void {
+    this.messagesTotal++;
     try {
       const msg = JSON.parse(rawMessage);
 
@@ -283,7 +286,8 @@ export class SolanaWsProvider {
       reconnectCount: this.reconnectAttempts,
       lastSlot: this.currentSlot,
       lastMessageTime: this.lastMessageTime,
-      subscriptionCount: this.accountSubscriptions.size
+      subscriptionCount: this.accountSubscriptions.size,
+      messagesTotal: this.messagesTotal
     };
   }
 

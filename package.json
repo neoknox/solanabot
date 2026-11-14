@@ -16,6 +16,7 @@
     "export:csv": "tsx src/cli/exportCsv.ts",
     "benchmark:registry": "tsx src/cli/persistent_registry_benchmark.ts",
     "benchmark:scaling": "tsx src/cli/phase1_6_benchmark.ts",
+    "benchmark:mainnet:10min": "tsx src/cli/phase1_6_mainnet_10min.ts",
     "build": "tsc"
   },
   "keywords": [

@@ -56,6 +56,7 @@ export interface IndexedDirectedRoute {
   protocolAdapterVersion: string;
   lastVerifiedAt: number;
   isUnprofitablePreserved: boolean;
+  isRestored?: boolean;
   lastQuoteExpectedNetUSDC?: string;
   lastQuoteTimestamp?: number;
   verificationDetails?: string;
@@ -228,10 +229,8 @@ export class RouteIndex {
   }
 
   private isDirectDex(dex: DexType): boolean {
-    // Only Orca Whirlpool is verified direct
-    // Raydium AMM V4 is marked QUOTE_UNVERIFIED due to BLOCKED_RPC_TIMEOUT on public OpenOrders account
-    // Meteora DLMM is marked QUOTE_UNVERIFIED due to missing bin-array streaming
-    return dex === 'ORCA_WHIRLPOOL';
+    // Orca Whirlpool and Raydium CLMM have verified pricing adapters with active tick-array hydration
+    return dex === 'ORCA_WHIRLPOOL' || dex === 'RAYDIUM_CLMM';
   }
 
   private getPoolPair(pool: PoolConfig): [string, string] {
@@ -259,6 +258,7 @@ export class RouteIndex {
     switch (dex) {
       case 'RAYDIUM_AMM': return 65000;
       case 'ORCA_WHIRLPOOL': return 95000;
+      case 'RAYDIUM_CLMM': return 95000;
       case 'METEORA_DLMM': return 120000;
       default: return 80000;
     }
@@ -334,6 +334,19 @@ export class RouteIndex {
           dynamicDeps.push({
             addressType: 'UNRESOLVED_DESCRIPTOR',
             descriptor: 'ORCA_TICK_ARRAYS_DYNAMIC',
+            isResolved: false,
+            role: 'TICK_ARRAY',
+            type: 'TICK_ARRAY',
+            refreshIntervalMs: 400
+          });
+          seenDynamic.add(tickDesc);
+        }
+      } else if (pool.dex === 'RAYDIUM_CLMM') {
+        const tickDesc = `${leg.poolId}:RAYDIUM_CLMM_TICK_ARRAYS_DYNAMIC`;
+        if (!seenDynamic.has(tickDesc)) {
+          dynamicDeps.push({
+            addressType: 'UNRESOLVED_DESCRIPTOR',
+            descriptor: 'RAYDIUM_CLMM_TICK_ARRAYS_DYNAMIC',
             isResolved: false,
             role: 'TICK_ARRAY',
             type: 'TICK_ARRAY',
@@ -771,6 +784,10 @@ export class RouteIndex {
     return this.routeById.get(routeId);
   }
 
+  public getPoolConfig(poolId: string): PoolConfig | undefined {
+    return this.poolConfigs.get(poolId);
+  }
+
   public getReadyRoutes(): IndexedDirectedRoute[] {
     return this.allRoutes.filter(r => r.state === 'READY');
   }
@@ -1115,6 +1132,7 @@ export class RouteIndex {
 
       const existing = this.routeById.get(saved.routeId);
       if (existing) {
+        existing.isRestored = true;
         existing.state = targetState;
         existing.isDirectToDirect = allDirect;
         existing.isUnprofitablePreserved = saved.isUnprofitablePreserved !== false;
@@ -1169,6 +1187,7 @@ export class RouteIndex {
           protocolAdapterVersion: saved.protocolAdapterVersion || '1.4.0',
           lastVerifiedAt: saved.lastVerifiedAt || 0,
           isUnprofitablePreserved: saved.isUnprofitablePreserved !== false,
+          isRestored: true,
           lastQuoteExpectedNetUSDC: undefined, // Do not store stale quotes as executable opportunities
           lastQuoteTimestamp: undefined,
           verificationDetails: saved.verificationDetails
@@ -1185,7 +1204,7 @@ export class RouteIndex {
       }
     }
 
-    this.restoredRouteCount = this.routeById.size;
+    this.restoredRouteCount = this.allRoutes.filter(r => r.isRestored).length;
     this.allRoutes.sort((a, b) => b.priorityScore - a.priorityScore);
     return { recovered, blocked, updated };
   }

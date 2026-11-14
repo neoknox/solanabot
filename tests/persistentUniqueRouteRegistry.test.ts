@@ -14,25 +14,21 @@ import {
 import { CANONICAL_USDC_MINT, CANONICAL_WSOL_MINT, CANONICAL_USDT_MINT, KNOWN_PROGRAM_IDS } from '../src/config/index.js';
 
 describe('SOLANABOT — Persistent Unique Route Registry Suite', () => {
-  const testDbPath = path.resolve(__dirname, 'test_unique_route_registry.db');
-  let config = loadConfig({ DB_PATH: testDbPath });
+  let testDbPath: string;
+  let config: ReturnType<typeof loadConfig>;
   let repo: ArbitrageRepository;
   let poolRegistry: PoolRegistry;
 
   beforeEach(() => {
-    for (const suffix of ['', '-wal', '-shm']) {
-      const p = testDbPath + suffix;
-      if (fs.existsSync(p)) {
-        try { fs.unlinkSync(p); } catch {}
-      }
-    }
+    testDbPath = path.resolve(__dirname, `test_unique_route_registry_${Date.now()}_${Math.random().toString(36).slice(2)}.db`);
+    config = loadConfig({ DB_PATH: testDbPath });
     repo = new ArbitrageRepository(config);
     poolRegistry = new PoolRegistry();
   });
 
   afterEach(() => {
     if (repo) {
-      repo.close();
+      try { repo.close(); } catch {}
     }
     for (const suffix of ['', '-wal', '-shm']) {
       const p = testDbPath + suffix;
@@ -204,22 +200,43 @@ describe('SOLANABOT — Persistent Unique Route Registry Suite', () => {
     const uniqueSavedIds = new Set(savedRoutes.map(r => r.routeId));
     expect(uniqueSavedIds.size).toBe(1000);
 
-    // 3. Restore into clean RouteIndex
+    // 3. Restore into clean RouteIndex using persisted pools
     const restoredRegistry = new PoolRegistry();
     restoredRegistry.loadPersistedPools(savedPools);
 
-    const restartedIndex = new RouteIndex([]);
+    const restartedIndex = new RouteIndex(restoredRegistry.getAllPools());
     const reconcileResult = restartedIndex.reconcilePersistentRoutes(savedRoutes);
 
-    expect(reconcileResult.recovered + reconcileResult.blocked).toBe(1000);
-    expect(restartedIndex.getRouteCount()).toBe(1000);
-    expect(restartedIndex.getUniqueRouteCount()).toBe(1000);
+    expect(reconcileResult.recovered + reconcileResult.blocked + reconcileResult.updated).toBe(1000);
     expect(restartedIndex.getRestoredRouteCount()).toBe(1000);
+    expect(restartedIndex.getRouteCount()).toBeGreaterThanOrEqual(1000);
+    expect(restartedIndex.getUniqueRouteCount()).toBeGreaterThanOrEqual(1000);
+
+    // Verify actual pool metadata survives
+    for (const pool of pools) {
+      const restoredPool = restartedIndex.getPoolConfig(pool.id);
+      expect(restoredPool).toBeDefined();
+      expect(restoredPool?.tokenAMint).toBe(pool.tokenAMint);
+      expect(restoredPool?.tokenBMint).toBe(pool.tokenBMint);
+      expect(restoredPool?.feeBps).toBe(pool.feeBps);
+    }
+
+    // Confirm restored routes do not inherit READY status or stale quotes
+    expect(restartedIndex.getReadyRouteCount()).toBe(0);
+    for (const r of restartedIndex.getAllRoutes()) {
+      expect(r.state).not.toBe('READY');
+      expect(r.lastQuoteExpectedNetUSDC).toBeUndefined();
+    }
 
     // Verify zero duplicate IDs in in-memory index
     const inMemoryRoutes = restartedIndex.getAllRoutes();
     const inMemoryIds = inMemoryRoutes.map(r => r.routeId);
-    expect(new Set(inMemoryIds).size).toBe(1000);
+    expect(new Set(inMemoryIds).size).toBe(inMemoryRoutes.length);
+
+    // Verify exactly 1,000 unique definitions were restored with zero duplicates
+    const restoredRoutes = inMemoryRoutes.filter(r => r.isRestored);
+    expect(restoredRoutes.length).toBe(1000);
+    expect(new Set(restoredRoutes.map(r => r.routeId)).size).toBe(1000);
 
     restartedRepo.close();
   });

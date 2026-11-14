@@ -100,15 +100,15 @@ async function runBenchmark(): Promise<void> {
   const restoredRegistry = new PoolRegistry();
   restoredRegistry.loadPersistedPools(loadedPools);
 
-  const restartedIndex = new RouteIndex([]);
+  const restartedIndex = new RouteIndex(restoredRegistry.getAllPools());
   const reconcile = restartedIndex.reconcilePersistentRoutes(loadedRoutes);
   const restartElapsed = performance.now() - t0Restart;
   const restoreRate = Math.round((1000 / restartElapsed) * 1000);
 
   console.log(`  Process restart & recovery completed in ${restartElapsed.toFixed(1)}ms (${restoreRate.toLocaleString()} routes/sec)`);
-  console.log(`  Restored Routes: ${reconcile.recovered + reconcile.blocked} | Total in Index: ${restartedIndex.getRouteCount()}`);
+  console.log(`  Restored Routes: ${reconcile.recovered + reconcile.blocked + reconcile.updated} | Total in Index: ${restartedIndex.getRouteCount()}`);
   console.log(`  Restored as READY: ${restartedIndex.getReadyRouteCount()} (Strictly 0 verified)`);
-  console.log(`  Restored as UNVALIDATED: ${restartedIndex.getUnvalidatedRouteCount()}\n`);
+  console.log(`  Restored as VERIFIED/UNVALIDATED: ${restartedIndex.getRestoredRouteCount()}\n`);
 
   // 5. In-Memory Readiness Evaluation Benchmark (Zero Synchronous DB Writes)
   console.log('[Step 5: High-Frequency Hot-Path Readiness Benchmark]');

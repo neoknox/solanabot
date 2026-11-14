@@ -500,6 +500,10 @@ describe('Phase 1.1 Final Accuracy Closeout: Orca Multi-Tick Parity, Fingerprint
     };
 
     it('matches exact official WASM reference outputs across all probe sizes in Direction 1 (USDC -> WSOL)', () => {
+      multiTickPool.receivedAt = Date.now();
+      for (const k of Object.keys(multiTickPool.extraData!.tickArrayReceivedAt!)) {
+        (multiTickPool.extraData!.tickArrayReceivedAt as any)[k] = Date.now();
+      }
       const sequenceArrays = [arrayMinus25344, arrayMinus24992, arrayMinus24640];
       const whirlpoolFacade: any = {
         feeTierIndexSeed: new Uint8Array([4, 0]),
@@ -544,6 +548,10 @@ describe('Phase 1.1 Final Accuracy Closeout: Orca Multi-Tick Parity, Fingerprint
     });
 
     it('matches exact official WASM reference outputs across all probe sizes in Direction 2 (WSOL -> USDC)', () => {
+      multiTickPool.receivedAt = Date.now();
+      for (const k of Object.keys(multiTickPool.extraData!.tickArrayReceivedAt!)) {
+        (multiTickPool.extraData!.tickArrayReceivedAt as any)[k] = Date.now();
+      }
       const sequenceArrays = [arrayMinus25344, arrayMinus25696, arrayMinus26048];
       const whirlpoolFacade: any = {
         feeTierIndexSeed: new Uint8Array([4, 0]),

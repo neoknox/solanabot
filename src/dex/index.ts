@@ -2,6 +2,7 @@ import { DexAdapter } from './types.js';
 import { RaydiumAmmAdapter } from './raydiumAmmAdapter.js';
 import { OrcaWhirlpoolAdapter } from './orcaWhirlpoolAdapter.js';
 import { MeteoraDlmmAdapter } from './meteoraDlmmAdapter.js';
+import { RaydiumClmmAdapter } from './raydiumClmmAdapter.js';
 import { DexType, DexSupportStatus } from '../types/index.js';
 import { KNOWN_PROGRAM_IDS } from '../config/index.js';
 
@@ -9,6 +10,8 @@ export * from './types.js';
 export * from './raydiumAmmAdapter.js';
 export * from './orcaWhirlpoolAdapter.js';
 export * from './meteoraDlmmAdapter.js';
+export * from './raydiumClmmAdapter.js';
+export * from './raydiumClmmTickArray.js';
 
 export class DexRegistry {
   private adapters = new Map<DexType, DexAdapter>();
@@ -18,6 +21,7 @@ export class DexRegistry {
     this.register(new RaydiumAmmAdapter());
     this.register(new OrcaWhirlpoolAdapter());
     this.register(new MeteoraDlmmAdapter());
+    this.register(new RaydiumClmmAdapter());
   }
 
   public register(adapter: DexAdapter): void {

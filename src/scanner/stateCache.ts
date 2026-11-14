@@ -11,7 +11,7 @@ export interface DedupeKey {
 export function getQuoteRelevantSignature(state: PoolState): string {
   const extra = (state.extraData || {}) as any;
   const basePart = `rA:${state.reserveA?.toString() ?? '0'},rB:${state.reserveB?.toString() ?? '0'},fee:${state.feeBps}`;
-  if (state.dex === 'ORCA_WHIRLPOOL') {
+  if (state.dex === 'ORCA_WHIRLPOOL' || state.dex === 'RAYDIUM_CLMM') {
     let tickArrayContent = '';
     if (extra.tickArrays) {
       const entries: [number, any][] = [];
@@ -37,7 +37,7 @@ export function getQuoteRelevantSignature(state: PoolState): string {
     const pnlB = extra.quoteNeedTakePnl ?? '0';
     return `${basePart},sfn:${sfn},sfd:${sfd},pnlA:${pnlA},pnlB:${pnlB},ooB:${extra.openOrdersBaseTokenTotal ?? '0'},ooQ:${extra.openOrdersQuoteTokenTotal ?? '0'},ooSlot:${extra.openOrdersSlot ?? '0'},vASlot:${extra.vaultASlot ?? '0'},vBSlot:${extra.vaultBSlot ?? '0'}`;
   }
-  return `${basePart},extra:${JSON.stringify(extra)}`;
+  return `${basePart},extra:${JSON.stringify(extra, (_k, v) => typeof v === 'bigint' ? v.toString() : v)}`;
 }
 
 export class StateCache {
