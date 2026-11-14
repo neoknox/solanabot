@@ -59,6 +59,57 @@ export interface IndexedDirectedRoute {
   lastQuoteExpectedNetUSDC?: string;
   lastQuoteTimestamp?: number;
   verificationDetails?: string;
+
+  // Phase 1.6 Uptime & Readiness metrics additions
+  readyDurationMs?: number;
+  lastBecameReadyAt?: number;
+}
+
+export interface RouteBottleneckBreakdown {
+  unverifiedPool: number;
+  unsupportedAdapter: number;
+  missingTickArrays: number;
+  missingVaultOrOpenOrders: number;
+  expiredQuote: number;
+  expiredPoolObservation: number;
+  slotMismatch: number;
+  websocketDelay: number;
+  rpcHydrationFailure: number;
+  incompletePricing: number;
+  insufficientLiquidity: number;
+  other: number;
+}
+
+export interface QuoteAgeDistribution {
+  under500ms: number;
+  from500to1000ms: number;
+  from1000to2000ms: number;
+  from2000to2500ms: number;
+  over2500ms: number;
+}
+
+export interface SlotLagDistribution {
+  lag0to1: number;
+  lag2to4: number;
+  lag5to7: number;
+  lag8to10: number;
+  lagOver10: number;
+}
+
+export interface ReadyMetricsSummary {
+  currentReady: number;
+  peakReady: number;
+  minReady: number;
+  timeWeightedReadyAvg: number;
+  p10ReadyCount: number;
+  totalSamples: number;
+}
+
+export interface RouteUptimeStats {
+  routeId: string;
+  state: RouteState;
+  readyDurationMs: number;
+  uptimePercent: number;
 }
 
 export class RouteIndex {
@@ -81,6 +132,7 @@ export class RouteIndex {
   private readyToStaleTransitions = 0;
   private staleToReadyRecoveries = 0;
   private peakReadyCount = 0;
+  private readySamples: number[] = [];
 
   constructor(pools: PoolConfig[]) {
     this.buildIndices(pools);
@@ -123,6 +175,10 @@ export class RouteIndex {
       if (!isDirect) {
         if (route.state === 'READY') {
           this.readyToStaleTransitions++;
+          if (route.lastBecameReadyAt) {
+            route.readyDurationMs = (route.readyDurationMs || 0) + (Date.now() - route.lastBecameReadyAt);
+            route.lastBecameReadyAt = undefined;
+          }
         }
         route.state = 'BLOCKED';
         route.verificationDetails = `DEPENDENCY_UNVERIFIED:${poolId}`;
@@ -661,8 +717,12 @@ export class RouteIndex {
     return this.tokenToPools.get(tokenMint) || [];
   }
 
-  public getRoutesAffectedByPool(poolId: string): IndexedDirectedRoute[] {
-    return this.poolToRoutes.get(poolId) || [];
+  public getRoutesAffectedByPool(poolId: string, onlyEligible: boolean = false): IndexedDirectedRoute[] {
+    const routes = this.poolToRoutes.get(poolId) || [];
+    if (onlyEligible) {
+      return routes.filter(r => r.state !== 'BLOCKED');
+    }
+    return routes;
   }
 
   public getAllRoutes(): IndexedDirectedRoute[] {
@@ -757,6 +817,9 @@ export class RouteIndex {
 
     const prevState = route.state;
     route.state = 'READY';
+    if (prevState !== 'READY') {
+      route.lastBecameReadyAt = Date.now();
+    }
     if (prevState === 'STALE') {
       this.staleToReadyRecoveries++;
     }
@@ -780,6 +843,10 @@ export class RouteIndex {
 
     if (route.state === 'READY') {
       this.readyToStaleTransitions++;
+      if (route.lastBecameReadyAt) {
+        route.readyDurationMs = (route.readyDurationMs || 0) + (Date.now() - route.lastBecameReadyAt);
+        route.lastBecameReadyAt = undefined;
+      }
     }
 
     // Transitory freshness loss: transitions READY or VERIFIED -> STALE.
@@ -970,6 +1037,10 @@ export class RouteIndex {
       if (isExpired) {
         route.state = 'STALE';
         this.readyToStaleTransitions++;
+        if (route.lastBecameReadyAt) {
+          route.readyDurationMs = (route.readyDurationMs || 0) + (now - route.lastBecameReadyAt);
+          route.lastBecameReadyAt = undefined;
+        }
         route.verificationDetails = expireReason;
         expired.push(route);
       }
@@ -1113,5 +1184,258 @@ export class RouteIndex {
 
   public getAllPermanentRecords(): PermanentRouteRecord[] {
     return this.allRoutes.map(r => this.toPermanentRecord(r));
+  }
+
+  public recordReadySample(): number {
+    const readyCount = this.getReadyRouteCount();
+    this.readySamples.push(readyCount);
+    return readyCount;
+  }
+
+  public getReadyMetricsSummary(): ReadyMetricsSummary {
+    const currentReady = this.getReadyRouteCount();
+    if (this.readySamples.length === 0) {
+      return {
+        currentReady,
+        peakReady: this.peakReadyCount,
+        minReady: currentReady,
+        timeWeightedReadyAvg: currentReady,
+        p10ReadyCount: currentReady,
+        totalSamples: 0
+      };
+    }
+
+    const sorted = [...this.readySamples].sort((a, b) => a - b);
+    const sum = this.readySamples.reduce((acc, v) => acc + v, 0);
+    const avg = Number((sum / this.readySamples.length).toFixed(2));
+    const min = sorted[0];
+    const p10Index = Math.max(0, Math.floor(sorted.length * 0.10));
+    const p10 = sorted[p10Index];
+
+    return {
+      currentReady,
+      peakReady: this.peakReadyCount,
+      minReady: min,
+      timeWeightedReadyAvg: avg,
+      p10ReadyCount: p10,
+      totalSamples: this.readySamples.length
+    };
+  }
+
+  public getBottleneckBreakdown(
+    getPoolState: (poolId: string) => { dex: string; reserveA?: bigint; reserveB?: bigint; extraData?: any } | undefined,
+    currentSlot?: number,
+    wsConnected: boolean = true
+  ): RouteBottleneckBreakdown {
+    const breakdown: RouteBottleneckBreakdown = {
+      unverifiedPool: 0,
+      unsupportedAdapter: 0,
+      missingTickArrays: 0,
+      missingVaultOrOpenOrders: 0,
+      expiredQuote: 0,
+      expiredPoolObservation: 0,
+      slotMismatch: 0,
+      websocketDelay: 0,
+      rpcHydrationFailure: 0,
+      incompletePricing: 0,
+      insufficientLiquidity: 0,
+      other: 0
+    };
+
+    for (const route of this.allRoutes) {
+      if (route.state === 'READY') continue;
+
+      let classified = false;
+
+      if (!wsConnected) {
+        breakdown.websocketDelay++;
+        continue;
+      }
+
+      for (const leg of route.legs) {
+        const poolCfg = this.poolConfigs.get(leg.poolId);
+        if (!poolCfg) {
+          breakdown.unverifiedPool++;
+          classified = true;
+          break;
+        }
+
+        if (
+          poolCfg.dex === 'RAYDIUM_CLMM' ||
+          poolCfg.dex === 'PHOENIX' ||
+          poolCfg.blockerReason === 'UNSUPPORTED_PRICING_ADAPTER_CLMM' ||
+          poolCfg.blockerReason === 'PENDING_ORDERBOOK_STREAMING'
+        ) {
+          breakdown.unsupportedAdapter++;
+          classified = true;
+          break;
+        }
+
+        if (poolCfg.blockerReason === 'RPC_TIMEOUT' || poolCfg.blockerReason === 'ACCOUNT_NOT_FOUND') {
+          breakdown.rpcHydrationFailure++;
+          classified = true;
+          break;
+        }
+
+        if (poolCfg.verificationStatus !== 'VERIFIED_DIRECT') {
+          if (poolCfg.blockerReason === 'MISSING_TICK_DATA') {
+            breakdown.missingTickArrays++;
+          } else if (
+            poolCfg.blockerReason === 'UNHYDRATED_VAULTS' ||
+            poolCfg.blockerReason === 'RAYDIUM_AMM_V4_ADAPTER_PENDING' ||
+            poolCfg.blockerReason === 'OPENORDERS_LAYOUT_INVALID' ||
+            poolCfg.blockerReason === 'MISSING_VAULT_METADATA'
+          ) {
+            breakdown.missingVaultOrOpenOrders++;
+          } else {
+            breakdown.unverifiedPool++;
+          }
+          classified = true;
+          break;
+        }
+
+        const poolState = getPoolState(leg.poolId);
+        if (!poolState) {
+          breakdown.rpcHydrationFailure++;
+          classified = true;
+          break;
+        }
+
+        if (poolState.dex === 'RAYDIUM_AMM') {
+          if ((poolState.reserveA ?? 0n) <= 0n || (poolState.reserveB ?? 0n) <= 0n) {
+            breakdown.insufficientLiquidity++;
+            classified = true;
+            break;
+          }
+        }
+
+        if (poolState.dex === 'ORCA_WHIRLPOOL') {
+          const extra = poolState.extraData as any;
+          if (!extra?.tickArrays || Object.keys(extra.tickArrays).length === 0) {
+            breakdown.missingTickArrays++;
+            classified = true;
+            break;
+          }
+        }
+      }
+
+      if (!classified) {
+        if (route.state === 'STALE') {
+          const details = route.verificationDetails || '';
+          if (details.includes('EXPIRED_QUOTE')) {
+            breakdown.expiredQuote++;
+          } else if (
+            details.includes('EXPIRED_DEPENDENCY_STATE') ||
+            details.includes('STALE_QUOTE') ||
+            details.includes('STALE_VAULT_SNAPSHOT')
+          ) {
+            breakdown.expiredPoolObservation++;
+          } else if (
+            details.includes('SLOT_MISMATCH') ||
+            details.includes('EXCESSIVE_SLOT_LAG') ||
+            details.includes('SLOT_GAP_EXCEEDED')
+          ) {
+            breakdown.slotMismatch++;
+          } else if (details.includes('WS_DISCONNECTED')) {
+            breakdown.websocketDelay++;
+          } else {
+            breakdown.other++;
+          }
+        } else {
+          breakdown.other++;
+        }
+      }
+    }
+
+    return breakdown;
+  }
+
+  public getQuoteAgeDistribution(now: number = Date.now()): QuoteAgeDistribution {
+    const dist: QuoteAgeDistribution = {
+      under500ms: 0,
+      from500to1000ms: 0,
+      from1000to2000ms: 0,
+      from2000to2500ms: 0,
+      over2500ms: 0
+    };
+
+    for (const route of this.allRoutes) {
+      if (!route.lastQuoteTimestamp) continue;
+      const age = now - route.lastQuoteTimestamp;
+      if (age < 500) dist.under500ms++;
+      else if (age < 1000) dist.from500to1000ms++;
+      else if (age < 2000) dist.from1000to2000ms++;
+      else if (age <= 2500) dist.from2000to2500ms++;
+      else dist.over2500ms++;
+    }
+
+    return dist;
+  }
+
+  public getSlotLagDistribution(
+    getPoolState: (poolId: string) => { slot?: number } | undefined,
+    currentSlot: number
+  ): SlotLagDistribution {
+    const dist: SlotLagDistribution = {
+      lag0to1: 0,
+      lag2to4: 0,
+      lag5to7: 0,
+      lag8to10: 0,
+      lagOver10: 0
+    };
+
+    if (currentSlot <= 0) return dist;
+
+    for (const route of this.allRoutes) {
+      if (route.state !== 'READY' && route.state !== 'VERIFIED' && route.state !== 'STALE') continue;
+
+      let maxLag = 0;
+      for (const leg of route.legs) {
+        const pool = getPoolState(leg.poolId);
+        if (pool && pool.slot) {
+          const lag = Math.max(0, currentSlot - pool.slot);
+          if (lag > maxLag) maxLag = lag;
+        }
+      }
+
+      if (maxLag <= 1) dist.lag0to1++;
+      else if (maxLag <= 4) dist.lag2to4++;
+      else if (maxLag <= 7) dist.lag5to7++;
+      else if (maxLag <= 10) dist.lag8to10++;
+      else dist.lagOver10++;
+    }
+
+    return dist;
+  }
+
+  public getRouteUptimeReport(sessionDurationMs: number): { averageUptimePercent: number; routeUptimes: RouteUptimeStats[] } {
+    const now = Date.now();
+    const duration = Math.max(1, sessionDurationMs);
+    const uptimes: RouteUptimeStats[] = [];
+
+    let totalPercent = 0;
+    const verifiedRoutes = this.allRoutes.filter(r => r.state === 'READY' || r.state === 'STALE' || r.state === 'VERIFIED');
+
+    for (const route of verifiedRoutes) {
+      let activeMs = route.readyDurationMs || 0;
+      if (route.state === 'READY' && route.lastBecameReadyAt) {
+        activeMs += (now - route.lastBecameReadyAt);
+      }
+      const percent = Math.min(100, Number(((activeMs / duration) * 100).toFixed(2)));
+      totalPercent += percent;
+
+      uptimes.push({
+        routeId: route.routeId,
+        state: route.state,
+        readyDurationMs: activeMs,
+        uptimePercent: percent
+      });
+    }
+
+    const averageUptimePercent = verifiedRoutes.length > 0 ? Number((totalPercent / verifiedRoutes.length).toFixed(2)) : 0;
+    return {
+      averageUptimePercent,
+      routeUptimes: uptimes
+    };
   }
 }

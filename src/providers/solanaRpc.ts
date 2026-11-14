@@ -111,6 +111,25 @@ export class SolanaRpcProvider {
 
   public async getMultipleAccountsAndContext(pubkeys: PublicKey[]): Promise<{ slot: number; value: (AccountInfo<Buffer> | null)[] }> {
     if (pubkeys.length === 0) return { slot: 0, value: [] };
+
+    // Solana public RPC limits getMultipleAccounts to 100 pubkeys per request.
+    // Chunk automatically to support arbitrary batch sizes without caller complexity.
+    if (pubkeys.length > 100) {
+      const CHUNK_SIZE = 100;
+      const results: (AccountInfo<Buffer> | null)[] = [];
+      let latestSlot = 0;
+      for (let i = 0; i < pubkeys.length; i += CHUNK_SIZE) {
+        const chunk = pubkeys.slice(i, i + CHUNK_SIZE);
+        const chunkRes = await this.getMultipleAccountsAndContext(chunk);
+        results.push(...chunkRes.value);
+        if (chunkRes.slot > latestSlot) latestSlot = chunkRes.slot;
+      }
+      return {
+        slot: latestSlot,
+        value: results
+      };
+    }
+
     await this.throttle();
     const start = Date.now();
     try {

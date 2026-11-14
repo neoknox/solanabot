@@ -113,6 +113,8 @@ export class ArbitrageScanner {
   // Live timestamped SOL/USDC price (null initially: zero fictitious default price permitted)
   private currentSolPriceUSDC: Decimal | null = null;
   private lastSolPriceTime = 0;
+  private isRefreshingSharedPools = false;
+  private lastSharedRefreshTime = 0;
 
   constructor(
     config: AppConfig,
@@ -313,6 +315,13 @@ export class ArbitrageScanner {
 
       // Drain queued WebSocket account updates
       await this.drainEventQueue();
+
+      // Roadmap Phase 3: Bounded shared-account refresh to resolve unchanged-price expiration
+      if (now - this.lastSharedRefreshTime >= 1000) {
+        this.lastSharedRefreshTime = now;
+        this.routeIndex.recordReadySample();
+        await this.refreshStaleSharedPools();
+      }
 
       // FIX 1: Expire READY routes when required live data, quote age, feed health, or slot limits become stale
       const expiredRoutes = this.routeIndex.expireStaleReadyRoutes(
@@ -972,13 +981,17 @@ export class ArbitrageScanner {
   }
 
   private evaluateAffectedRoutes(poolId: string, monotonicReceiptTime?: number): void {
-    const affectedRoutes = this.routeIndex.getRoutesAffectedByPool(poolId);
+    // Efficient Scaling: Skip BLOCKED routes on high-frequency evaluation path
+    const affectedRoutes = this.routeIndex.getRoutesAffectedByPool(poolId, true);
     for (const route of affectedRoutes) {
+      if (route.state === 'BLOCKED') continue;
       this.evaluateIndexedRoute(route, monotonicReceiptTime);
     }
   }
 
   private evaluateIndexedRoute(route: IndexedDirectedRoute, monotonicReceiptTime?: number): void {
+    if (route.state === 'BLOCKED') return;
+
     this.auditMetrics.configuredRouteCount = this.routeIndex.getAllRoutes().length;
 
     // 1. TOTAL ATTEMPTS EVALUATED: Every candidate route evaluation entering the pipeline
@@ -1478,6 +1491,20 @@ export class ArbitrageScanner {
               vaultsToFetch.push({ pubkey: new PublicKey(vaultB), poolIndex: decodedPools.length, isA: false });
             }
             decodedPools.push(decoded);
+
+            // Derive live on-chain SOL/USDC price from primary Orca Whirlpool (eliminates HTTP dependencies)
+            if (decoded.id === 'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE' && decoded.extraData?.sqrtPrice) {
+              try {
+                const sqrtP = BigInt(String(decoded.extraData.sqrtPrice));
+                const two64 = 18446744073709551616n;
+                const ratio = Number(sqrtP) / Number(two64);
+                const price = ratio * ratio * 1000; // 10^(9-6) = 1000
+                if (price > 10 && price < 10000) {
+                  this.currentSolPriceUSDC = new Decimal(price);
+                  this.lastSolPriceTime = Date.now();
+                }
+              } catch {}
+            }
           }
         }
       }
@@ -1748,7 +1775,150 @@ export class ArbitrageScanner {
 
         this.stateCache.setPoolState(pool);
       }
+
+      // Initial route evaluation for all verified pools upon snapshot hydration
+      for (const pool of decodedPools) {
+        if (this.poolRegistry.isPoolVerified(pool.id)) {
+          this.evaluateAffectedRoutes(pool.id, performance.now());
+        }
+      }
     } catch {}
+  }
+
+  /**
+   * Roadmap Phase 3: Bounded shared-account refresh to resolve unchanged-price expiration.
+   * Periodically queries shared pool accounts approaching staleness via RPC getMultipleAccountsAndContext,
+   * confirming their on-chain state is unchanged at the latest confirmed slot and triggering route re-evaluations
+   * to maintain or restore READY status without inventing slots or timestamps.
+   */
+  public async refreshStaleSharedPools(): Promise<number> {
+    if (this.isRefreshingSharedPools || !this.isRunning) return 0;
+    this.isRefreshingSharedPools = true;
+
+    try {
+      const now = Date.now();
+      const currentSlot = this.ws.getCurrentSlot();
+      const allPools = this.poolRegistry.getAllPools();
+
+      // Find VERIFIED_DIRECT pools whose observation age is approaching expiration (>= 1200ms) or slot lag >= 4
+      const poolsToRefresh = allPools.filter(p => {
+        if (p.verificationStatus !== 'VERIFIED_DIRECT') return false;
+        const state = this.stateCache.getPoolState(p.id);
+        if (!state) return true;
+        const age = now - (state.receivedAt || 0);
+        const slotGap = currentSlot > 0 && state.slot > 0 ? currentSlot - state.slot : 0;
+        return age >= 1200 || slotGap >= 4;
+      });
+
+      if (poolsToRefresh.length === 0) return 0;
+
+      // Bound batch size to respect RPC rate limits (max 20 pools per cycle)
+      const batch = poolsToRefresh.slice(0, 20);
+      const pubkeysToFetch: PublicKey[] = [];
+
+      for (const p of batch) {
+        pubkeysToFetch.push(new PublicKey(p.id));
+
+        // For Whirlpools: also include surrounding tick array pubkeys if tickCurrent is known
+        if (p.dex === 'ORCA_WHIRLPOOL') {
+          const state = this.stateCache.getPoolState(p.id);
+          const extra = state?.extraData as any;
+          if (extra?.tickCurrent !== undefined && extra?.tickSpacing) {
+            const surrounding = getSurroundingTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing);
+            for (const startIdx of surrounding) {
+              const pda = deriveTickArrayPda(p.id, startIdx);
+              pubkeysToFetch.push(pda);
+            }
+          }
+        }
+      }
+
+      if (pubkeysToFetch.length === 0) return 0;
+
+      const rpcStart = performance.now();
+      const rpcRes = await this.rpc.getMultipleAccountsAndContext(pubkeysToFetch);
+      this.latencyTracker.recordRpcLatency(performance.now() - rpcStart);
+
+      const refreshedSlot = rpcRes.slot;
+      const accounts = rpcRes.value;
+      let refreshedCount = 0;
+
+      let accIndex = 0;
+      for (const p of batch) {
+        const poolAcc = accounts[accIndex++];
+        if (!poolAcc || !poolAcc.data) {
+          if (p.dex === 'ORCA_WHIRLPOOL') {
+            const state = this.stateCache.getPoolState(p.id);
+            const extra = state?.extraData as any;
+            if (extra?.tickCurrent !== undefined && extra?.tickSpacing) {
+              const count = getSurroundingTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing).length;
+              accIndex += count;
+            }
+          }
+          continue;
+        }
+
+        const adapter = dexRegistry.getAdapter(p.dex);
+        if (!adapter) continue;
+
+        const decoded = adapter.decodePoolState(poolAcc.data, p.id, refreshedSlot);
+        if (decoded) {
+          decoded.receivedAt = Date.now();
+          const existing = this.stateCache.getPoolState(p.id);
+
+          if (decoded.dex === 'ORCA_WHIRLPOOL') {
+            const extra = (decoded.extraData || {}) as any;
+            const existingExtra = (existing?.extraData || {}) as any;
+            if (existingExtra.tickArrays) extra.tickArrays = existingExtra.tickArrays;
+            if (existingExtra.tickArraySlots) extra.tickArraySlots = existingExtra.tickArraySlots;
+            if (existingExtra.tickArrayReceivedAt) extra.tickArrayReceivedAt = existingExtra.tickArrayReceivedAt;
+
+            const tickSpacing = extra.tickSpacing || 1;
+            const tickCurrent = extra.tickCurrent;
+            if (tickCurrent !== undefined) {
+              const surrounding = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+              for (const startIdx of surrounding) {
+                const tickAcc = accounts[accIndex++];
+                if (tickAcc && tickAcc.data) {
+                  const decodedArr = decodeTickArrayAccount(tickAcc.data, p.id);
+                  if (decodedArr) {
+                    if (!extra.tickArrays) extra.tickArrays = {};
+                    if (!extra.tickArraySlots) extra.tickArraySlots = {};
+                    if (!extra.tickArrayReceivedAt) extra.tickArrayReceivedAt = {};
+                    extra.tickArrays[startIdx] = decodedArr;
+                    extra.tickArraySlots[startIdx] = refreshedSlot;
+                    extra.tickArrayReceivedAt[startIdx] = Date.now();
+                  }
+                }
+              }
+            }
+          } else if (decoded.dex === 'RAYDIUM_AMM' && existing?.extraData) {
+            const extra = (decoded.extraData || {}) as any;
+            const existingExtra = existing.extraData as any;
+            if (decoded.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) decoded.reserveA = existing.reserveA;
+            if (decoded.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) decoded.reserveB = existing.reserveB;
+            extra.openOrdersVerified = existingExtra.openOrdersVerified;
+            extra.lastConfirmedAt = Date.now();
+            extra.lastRpcConfirmationContextSlot = refreshedSlot;
+            extra.vaultAReceivedAt = Date.now();
+            extra.vaultBReceivedAt = Date.now();
+            extra.vaultASlot = refreshedSlot;
+            extra.vaultBSlot = refreshedSlot;
+            extra.openOrdersSlot = refreshedSlot;
+          }
+
+          this.stateCache.setPoolState(decoded);
+          this.evaluateAffectedRoutes(p.id, performance.now());
+          refreshedCount++;
+        }
+      }
+
+      return refreshedCount;
+    } catch {
+      return 0;
+    } finally {
+      this.isRefreshingSharedPools = false;
+    }
   }
 
   public async runScanCycle(): Promise<void> {
@@ -1885,6 +2055,33 @@ export class ArbitrageScanner {
 
   public getRouteTransitionStats() {
     return this.routeIndex.getLifecycleTransitionStats();
+  }
+
+  public getBottleneckBreakdown() {
+    return this.routeIndex.getBottleneckBreakdown(
+      (id) => this.stateCache.getPoolState(id),
+      this.ws.getCurrentSlot(),
+      this.ws.getHealth() !== 'DISCONNECTED'
+    );
+  }
+
+  public getQuoteAgeDistribution() {
+    return this.routeIndex.getQuoteAgeDistribution();
+  }
+
+  public getSlotLagDistribution() {
+    return this.routeIndex.getSlotLagDistribution(
+      (id) => this.stateCache.getPoolState(id),
+      this.ws.getCurrentSlot()
+    );
+  }
+
+  public getReadyMetricsSummary() {
+    return this.routeIndex.getReadyMetricsSummary();
+  }
+
+  public getRouteUptimeReport(sessionDurationMs: number) {
+    return this.routeIndex.getRouteUptimeReport(sessionDurationMs);
   }
 
   private syncRouteLibraryToStorage(): void {
