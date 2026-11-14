@@ -14,6 +14,8 @@
     "hud": "tsx src/cli/hud.ts",
     "report": "tsx src/cli/report.ts",
     "export:csv": "tsx src/cli/exportCsv.ts",
+    "benchmark:registry": "tsx src/cli/persistent_registry_benchmark.ts",
+    "benchmark:scaling": "tsx src/cli/phase1_6_benchmark.ts",
     "build": "tsc"
   },
   "keywords": [

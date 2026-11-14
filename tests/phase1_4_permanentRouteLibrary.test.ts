@@ -19,8 +19,11 @@ describe('Phase 1.4: Permanent Route Library Suite (90-Day Roadmap Phase 1 Gate)
   let poolRegistry: PoolRegistry;
 
   beforeEach(() => {
-    if (fs.existsSync(testDbPath)) {
-      try { fs.unlinkSync(testDbPath); } catch {}
+    for (const suffix of ['', '-wal', '-shm']) {
+      const p = testDbPath + suffix;
+      if (fs.existsSync(p)) {
+        try { fs.unlinkSync(p); } catch {}
+      }
     }
     repo = new ArbitrageRepository(config);
     poolRegistry = new PoolRegistry();
@@ -30,8 +33,11 @@ describe('Phase 1.4: Permanent Route Library Suite (90-Day Roadmap Phase 1 Gate)
     if (repo) {
       repo.close();
     }
-    if (fs.existsSync(testDbPath)) {
-      try { fs.unlinkSync(testDbPath); } catch {}
+    for (const suffix of ['', '-wal', '-shm']) {
+      const p = testDbPath + suffix;
+      if (fs.existsSync(p)) {
+        try { fs.unlinkSync(p); } catch {}
+      }
     }
   });
 

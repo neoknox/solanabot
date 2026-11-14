@@ -309,4 +309,8 @@ export class PoolRegistry {
   public getUnsupportedCatalog(): PoolConfig[] {
     return Array.from(this.pools.values()).filter(p => !this.isVenueSupported(p.dex));
   }
+
+  public removePool(id: string): boolean {
+    return this.pools.delete(id);
+  }
 }

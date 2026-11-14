@@ -133,6 +133,7 @@ export class RouteIndex {
   private staleToReadyRecoveries = 0;
   private peakReadyCount = 0;
   private readySamples: number[] = [];
+  private restoredRouteCount = 0;
 
   constructor(pools: PoolConfig[]) {
     this.buildIndices(pools);
@@ -144,6 +145,7 @@ export class RouteIndex {
     this.routeById.clear();
     this.allRoutes = [];
     this.poolConfigs.clear();
+    this.restoredRouteCount = 0;
     this.buildIndices(pools);
   }
 
@@ -778,15 +780,27 @@ export class RouteIndex {
   }
 
   public getVerifiedRoutes(): IndexedDirectedRoute[] {
-    return this.allRoutes.filter(r => r.state === 'VERIFIED' || r.state === 'READY' || r.state === 'STALE');
+    return this.allRoutes.filter(r => r.state === 'VERIFIED' || r.state === 'READY' || r.state === 'STALE' || r.state === 'UNVALIDATED');
   }
 
   public getVerifiedRouteCount(): number {
-    return this.allRoutes.filter(r => r.state === 'VERIFIED' || r.state === 'READY' || r.state === 'STALE').length;
+    return this.allRoutes.filter(r => r.state === 'VERIFIED' || r.state === 'READY' || r.state === 'STALE' || r.state === 'UNVALIDATED').length;
   }
 
   public getStaleRouteCount(): number {
     return this.allRoutes.filter(r => r.state === 'STALE').length;
+  }
+
+  public getUnvalidatedRouteCount(): number {
+    return this.allRoutes.filter(r => r.state === 'UNVALIDATED').length;
+  }
+
+  public getRestoredRouteCount(): number {
+    return this.restoredRouteCount;
+  }
+
+  public getUniqueRouteCount(): number {
+    return this.routeById.size;
   }
 
   public getRouteCountByState(state: RouteState): number {
@@ -1052,6 +1066,8 @@ export class RouteIndex {
   /**
    * Reconciles saved routes from SQLite into the active RouteIndex.
    * Saved routes must pass current pool and adapter verification before becoming eligible for live quoting.
+   * Restored routes initialize as UNVALIDATED (or BLOCKED if dependencies unverified), never READY.
+   * Stale quotes from previous runs are wiped to ensure zero stale quotes are treated as executable.
    */
   public reconcilePersistentRoutes(savedRoutes: PermanentRouteRecord[]): { recovered: number; blocked: number; updated: number } {
     let recovered = 0;
@@ -1059,11 +1075,31 @@ export class RouteIndex {
     let updated = 0;
 
     for (const saved of savedRoutes) {
-      // 1. Verify every pool exists in current PoolRegistry configs
-      const poolsExist = saved.orderedPoolIds.every(id => this.poolConfigs.has(id));
-      if (!poolsExist) {
-        blocked++;
-        continue;
+      // 1. Fallback: If missing from poolConfigs, reconstruct minimal PoolConfig from saved route metadata
+      for (let i = 0; i < saved.orderedPoolIds.length; i++) {
+        const poolId = saved.orderedPoolIds[i];
+        if (!this.poolConfigs.has(poolId)) {
+          const programId = saved.orderedDexPrograms?.[i] || '';
+          let dex: DexType = 'ORCA_WHIRLPOOL';
+          if (programId === KNOWN_PROGRAM_IDS.RAYDIUM_AMM_V4) dex = 'RAYDIUM_AMM';
+          else if (programId === KNOWN_PROGRAM_IDS.RAYDIUM_CLMM) dex = 'RAYDIUM_CLMM';
+          else if (programId === KNOWN_PROGRAM_IDS.METEORA_DLMM) dex = 'METEORA_DLMM';
+
+          const inputMint = saved.orderedTokens?.[i] || '';
+          const outputMint = saved.orderedTokens?.[i + 1] || saved.orderedTokens?.[0] || '';
+
+          this.poolConfigs.set(poolId, {
+            id: poolId,
+            dex,
+            programId,
+            tokenAMint: inputMint,
+            tokenBMint: outputMint,
+            feeBps: 30,
+            verificationStatus: 'QUOTE_UNVERIFIED',
+            blockerReason: 'PENDING_RESTART_REVALIDATION',
+            lastVerifiedAt: 0
+          });
+        }
       }
 
       // 2. Verify all pools are VERIFIED_DIRECT
@@ -1072,16 +1108,20 @@ export class RouteIndex {
         return pool && this.isPoolVerifiedDirect(pool);
       });
 
-      // Saved routes never start as READY upon restart; they start as VERIFIED or BLOCKED
-      const targetState: RouteState = allDirect ? 'VERIFIED' : 'BLOCKED';
+      // Restored routes never start as READY upon restart; they start as UNVALIDATED, VERIFIED, or BLOCKED
+      const targetState: RouteState = allDirect
+        ? (saved.state === 'READY' ? 'UNVALIDATED' : (saved.state || 'UNVALIDATED'))
+        : 'BLOCKED';
 
       const existing = this.routeById.get(saved.routeId);
       if (existing) {
         existing.state = targetState;
         existing.isDirectToDirect = allDirect;
         existing.isUnprofitablePreserved = saved.isUnprofitablePreserved !== false;
-        existing.lastQuoteExpectedNetUSDC = saved.lastQuoteExpectedNetUSDC;
-        existing.lastQuoteTimestamp = saved.lastQuoteTimestamp;
+        existing.lastQuoteExpectedNetUSDC = undefined; // Do not store stale quotes as executable opportunities
+        existing.lastQuoteTimestamp = undefined;
+        existing.lastBecameReadyAt = undefined;
+        existing.readyDurationMs = 0;
         if (saved.lastVerifiedAt) existing.lastVerifiedAt = saved.lastVerifiedAt;
         updated++;
       } else {
@@ -1129,8 +1169,8 @@ export class RouteIndex {
           protocolAdapterVersion: saved.protocolAdapterVersion || '1.4.0',
           lastVerifiedAt: saved.lastVerifiedAt || 0,
           isUnprofitablePreserved: saved.isUnprofitablePreserved !== false,
-          lastQuoteExpectedNetUSDC: saved.lastQuoteExpectedNetUSDC,
-          lastQuoteTimestamp: saved.lastQuoteTimestamp,
+          lastQuoteExpectedNetUSDC: undefined, // Do not store stale quotes as executable opportunities
+          lastQuoteTimestamp: undefined,
           verificationDetails: saved.verificationDetails
         };
 
@@ -1145,8 +1185,66 @@ export class RouteIndex {
       }
     }
 
+    this.restoredRouteCount = this.routeById.size;
     this.allRoutes.sort((a, b) => b.priorityScore - a.priorityScore);
     return { recovered, blocked, updated };
+  }
+
+  /**
+   * Permanently removes all routes involving a pool that was deleted or unregistered.
+   * Returns the IDs of the removed routes.
+   */
+  public removeRoutesForPool(poolId: string): string[] {
+    const affectedRoutes = this.poolToRoutes.get(poolId) || [];
+    if (affectedRoutes.length === 0) return [];
+
+    const removedIds: string[] = [];
+    const removedSet = new Set<string>();
+
+    for (const r of affectedRoutes) {
+      removedIds.push(r.routeId);
+      removedSet.add(r.routeId);
+      this.routeById.delete(r.routeId);
+    }
+
+    this.allRoutes = this.allRoutes.filter(r => !removedSet.has(r.routeId));
+    this.poolToRoutes.delete(poolId);
+
+    for (const [pId, rList] of this.poolToRoutes.entries()) {
+      this.poolToRoutes.set(pId, rList.filter(r => !removedSet.has(r.routeId)));
+    }
+
+    this.poolConfigs.delete(poolId);
+    return removedIds;
+  }
+
+  /**
+   * Invalidates all routes involving a pool that has become unusable, unverified, or structurally invalid.
+   */
+  public invalidateRoutesForPool(poolId: string, reason: string): IndexedDirectedRoute[] {
+    const changedRoutes: IndexedDirectedRoute[] = [];
+    const affectedRoutes = this.poolToRoutes.get(poolId) || [];
+
+    for (const route of affectedRoutes) {
+      const prevState = route.state;
+      if (route.state === 'READY') {
+        this.readyToStaleTransitions++;
+        if (route.lastBecameReadyAt) {
+          route.readyDurationMs = (route.readyDurationMs || 0) + (Date.now() - route.lastBecameReadyAt);
+          route.lastBecameReadyAt = undefined;
+        }
+      }
+      route.isDirectToDirect = false;
+      route.state = 'BLOCKED';
+      route.verificationDetails = reason;
+      route.lastVerifiedAt = 0;
+
+      if (prevState !== 'BLOCKED') {
+        changedRoutes.push(route);
+      }
+    }
+
+    return changedRoutes;
   }
 
   public toPermanentRecord(route: IndexedDirectedRoute): PermanentRouteRecord {

@@ -489,6 +489,48 @@ export class ArbitrageRepository {
     }
   }
 
+  public deleteRoutes(routeIds: string[]): number {
+    if (routeIds.length === 0) return 0;
+    this.flushSync();
+    try {
+      const stmt = this.db.prepare('DELETE FROM routes WHERE route_id = ?');
+      const deleteTx = this.db.transaction((ids: string[]) => {
+        let count = 0;
+        for (const id of ids) {
+          const res = stmt.run(id);
+          count += res.changes;
+        }
+        return count;
+      });
+      return deleteTx(routeIds);
+    } catch (err) {
+      this.recordPersistenceError('deleteRoutes', err);
+      return 0;
+    }
+  }
+
+  public deleteRoutesForPool(poolId: string): number {
+    this.flushSync();
+    try {
+      const stmt = this.db.prepare('DELETE FROM routes WHERE ordered_pool_ids LIKE ?');
+      const res = stmt.run(`%"${poolId}"%`);
+      return res.changes;
+    } catch (err) {
+      this.recordPersistenceError('deleteRoutesForPool', err);
+      return 0;
+    }
+  }
+
+  public deleteVerifiedPool(poolId: string): boolean {
+    try {
+      const res = this.db.prepare('DELETE FROM verified_pools WHERE pool_id = ?').run(poolId);
+      return res.changes > 0;
+    } catch (err) {
+      this.recordPersistenceError('deleteVerifiedPool', err);
+      return false;
+    }
+  }
+
   public saveVerifiedPool(pool: VerifiedPoolRecord): boolean {
     try {
       this.executeUpsertPool(pool);
@@ -541,6 +583,7 @@ export class ArbitrageRepository {
     let staleCount = 0;
     let blockedCount = 0;
     let executionPreparedCount = 0;
+    let unvalidatedCount = 0;
     let twoLegCount = 0;
     let threeLegCount = 0;
     let intraDexCount = 0;
@@ -554,6 +597,7 @@ export class ArbitrageRepository {
       else if (state === 'STALE') staleCount++;
       else if (state === 'BLOCKED') blockedCount++;
       else if (state === 'EXECUTION_PREPARED') executionPreparedCount++;
+      else if (state === 'UNVALIDATED') unvalidatedCount++;
 
       if (r.cycle_type === '2_LEG') twoLegCount++;
       else if (r.cycle_type === '3_LEG') threeLegCount++;
@@ -582,7 +626,9 @@ export class ArbitrageRepository {
       unverifiedPoolCount: unverified,
       totalStoredPoolCount: totalPools,
       persistenceErrorsCount: this.persistenceErrorsCount,
-      verifiedPoolCount: verifiedDirect
+      verifiedPoolCount: verifiedDirect,
+      unvalidatedCount,
+      uniqueRouteCount: rows.length
     };
   }
 

@@ -2007,7 +2007,11 @@ export class ArbitrageScanner {
       rejectedCount: this.rejectedCount,
       rejectionBreakdown: { ...this.rejectionBreakdown },
       activePoolCount: allStates.length,
-      poolsPerDex
+      poolsPerDex,
+      restoredRouteCount: this.routeIndex.getRestoredRouteCount(),
+      uniqueRouteCount: this.routeIndex.getUniqueRouteCount(),
+      readyRouteCount: this.routeIndex.getReadyRouteCount(),
+      verifiedRouteCount: this.routeIndex.getVerifiedRouteCount()
     };
   }
 
@@ -2108,6 +2112,63 @@ export class ArbitrageScanner {
     } catch (err) {
       this.repository.recordPersistenceError('syncRouteLibraryToStorage', err);
     }
+  }
+
+  /**
+   * Removes a pool when it disappears or is deleted, invalidating and removing associated routes.
+   */
+  public removePool(poolId: string): string[] {
+    this.poolRegistry.removePool(poolId);
+    const removedRouteIds = this.routeIndex.removeRoutesForPool(poolId);
+    if (removedRouteIds.length > 0) {
+      this.repository.deleteRoutes(removedRouteIds);
+    }
+    this.repository.deleteVerifiedPool(poolId);
+    this.subscribedAccounts.delete(poolId);
+    return removedRouteIds;
+  }
+
+  /**
+   * Invalidates a pool and all associated routes when it becomes unusable.
+   */
+  public invalidatePool(poolId: string, reason: string): void {
+    this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', reason);
+    const changedRoutes = this.routeIndex.invalidateRoutesForPool(poolId, reason);
+    for (const r of changedRoutes) {
+      this.repository.queueRouteStateUpdate(r.routeId, 'BLOCKED', reason);
+    }
+  }
+
+  /**
+   * Handles structural changes to an underlying pool (fee tier, token pairs, etc.),
+   * replacing obsolete route definitions with new valid routes.
+   */
+  public handlePoolStructuralChange(pool: PoolConfig): { removedRouteIds: string[]; newRoutes: IndexedDirectedRoute[] } {
+    const removedRouteIds = this.routeIndex.removeRoutesForPool(pool.id);
+    if (removedRouteIds.length > 0) {
+      this.repository.deleteRoutes(removedRouteIds);
+    }
+    this.poolRegistry.register(pool);
+    const newRoutes = this.routeIndex.addPoolAndGenerateRoutes(pool);
+    this.repository.saveVerifiedPool({
+      poolId: pool.id,
+      dex: pool.dex,
+      programId: pool.programId,
+      tokenAMint: pool.tokenAMint,
+      tokenBMint: pool.tokenBMint,
+      feeBps: pool.feeBps,
+      verificationStatus: pool.verificationStatus || 'QUOTE_UNVERIFIED',
+      blockerReason: pool.blockerReason,
+      initialLiquidityUsd: pool.initialLiquidityUsd || 0,
+      accountLayoutSize: 0,
+      lastVerifiedAt: pool.lastVerifiedAt || 0,
+      createdAt: Date.now()
+    });
+    if (newRoutes.length > 0) {
+      const permanent = newRoutes.map(r => this.routeIndex.toPermanentRecord(r));
+      this.repository.upsertRoutes(permanent);
+    }
+    return { removedRouteIds, newRoutes };
   }
 
   public getCompetitorAnalyzer(): CompetitorAnalyzer {

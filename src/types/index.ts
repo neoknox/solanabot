@@ -280,6 +280,10 @@ export interface ScanHealthStatus {
   rejectionBreakdown: Record<string, number>;
   activePoolCount: number;
   poolsPerDex: Record<string, number>;
+  restoredRouteCount?: number;
+  uniqueRouteCount?: number;
+  readyRouteCount?: number;
+  verifiedRouteCount?: number;
 }
 
 export interface AuditMetrics {
@@ -329,7 +333,8 @@ export type RouteState =
   | 'STALE'
   | 'BLOCKED'
   | 'EXECUTION_PREPARED'
-  | 'SIMULATION_VERIFIED'; // Reserved for Phase 2, never assigned in this roadmap
+  | 'SIMULATION_VERIFIED' // Reserved for Phase 2, never assigned in this roadmap
+  | 'UNVALIDATED';
 
 export type AccountDependencyRole =
   | 'POOL_ACCOUNT'
@@ -421,6 +426,9 @@ export interface RouteSummaryStats {
   totalStoredPoolCount: number;
   persistenceErrorsCount: number;
   verifiedPoolCount?: number;          // Backward compatibility alias for verifiedDirectPoolCount
+  unvalidatedCount?: number;
+  restoredRouteCount?: number;
+  uniqueRouteCount?: number;
 }
 
 /**
