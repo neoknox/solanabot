@@ -9,6 +9,13 @@ import {
 
 export type VerificationStatus = 'VERIFIED_DIRECT' | 'QUOTE_UNVERIFIED';
 
+export type PoolVerificationListener = (
+  poolId: string,
+  status: VerificationStatus,
+  blockerReason?: string,
+  lastVerifiedAt?: number
+) => void;
+
 export interface PoolConfig {
   id: string;
   dex: DexType;
@@ -57,7 +64,7 @@ export class PoolRegistry {
       initialLiquidityUsd: 32000000,
       description: 'Orca Whirlpool 0.04% SOL/USDC',
       verificationStatus: 'VERIFIED_DIRECT',
-      lastVerifiedAt: 1700000000000
+      lastVerifiedAt: 0
     });
 
     // 3. Orca Whirlpool Secondary (FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q, verified on-chain 2 bps)
@@ -72,7 +79,7 @@ export class PoolRegistry {
       initialLiquidityUsd: 1200000,
       description: 'Orca Whirlpool 0.02% SOL/USDC (Intra-DEX tier)',
       verificationStatus: 'VERIFIED_DIRECT',
-      lastVerifiedAt: 1700000000000
+      lastVerifiedAt: 0
     });
 
     // 4. Meteora DLMM (Primary dynamic bin pool - marked QUOTE_UNVERIFIED without bin-array streaming)
@@ -101,7 +108,7 @@ export class PoolRegistry {
       initialLiquidityUsd: 25000000,
       description: 'Orca Whirlpool 0.01% USDC/USDT Stable Pair',
       verificationStatus: 'VERIFIED_DIRECT',
-      lastVerifiedAt: 1700000000000
+      lastVerifiedAt: 0
     });
 
     // 6. Raydium AMM V4 WSOL/USDT (dynamic runtime verification)
@@ -196,6 +203,12 @@ export class PoolRegistry {
     return Array.from(this.pools.values()).filter(p => p.dex === dex);
   }
 
+  private verificationListeners: PoolVerificationListener[] = [];
+
+  public onVerificationChange(listener: PoolVerificationListener): void {
+    this.verificationListeners.push(listener);
+  }
+
   public updatePoolVerification(id: string, status: VerificationStatus, blockerReason?: string, lastVerifiedAt?: number): void {
     const pool = this.pools.get(id);
     if (pool) {
@@ -208,6 +221,12 @@ export class PoolRegistry {
       } else if (status === 'QUOTE_UNVERIFIED') {
         pool.lastVerifiedAt = 0;
       }
+
+      for (const listener of this.verificationListeners) {
+        try {
+          listener(id, status, blockerReason, pool.lastVerifiedAt);
+        } catch {}
+      }
     }
   }
 
@@ -216,11 +235,14 @@ export class PoolRegistry {
     for (const record of persisted) {
       const existing = this.pools.get(record.poolId);
       if (existing) {
-        existing.verificationStatus = record.verificationStatus;
-        existing.blockerReason = record.blockerReason;
-        existing.lastVerifiedAt = record.lastVerifiedAt;
+        if (record.lastVerifiedAt) {
+          existing.lastVerifiedAt = record.lastVerifiedAt;
+        }
         count++;
       } else {
+        // Non-default pools loaded from SQLite:
+        // Saved verification evidence must not automatically count as fresh on-chain validation after restart.
+        // Revalidate on-chain before promoting routes.
         this.register({
           id: record.poolId,
           dex: record.dex,
@@ -229,9 +251,9 @@ export class PoolRegistry {
           tokenBMint: record.tokenBMint,
           feeBps: record.feeBps,
           initialLiquidityUsd: record.initialLiquidityUsd,
-          verificationStatus: record.verificationStatus,
-          blockerReason: record.blockerReason,
-          lastVerifiedAt: record.lastVerifiedAt
+          verificationStatus: 'QUOTE_UNVERIFIED',
+          blockerReason: 'PENDING_RESTART_REVALIDATION',
+          lastVerifiedAt: record.lastVerifiedAt || 0
         });
         count++;
       }

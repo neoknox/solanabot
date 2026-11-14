@@ -165,6 +165,32 @@ export class ArbitrageScanner {
     this.eventQueue = new BoundedEventQueue(config.MAX_EVENT_QUEUE_CAPACITY || 2000);
     this.latencyTracker = new LatencyTracker();
 
+    // Phase 1.4 FIX 2: Wire pool verification changes to RouteIndex and SQLite persistence
+    this.poolRegistry.onVerificationChange((poolId, status, blockerReason, lastVerifiedAt) => {
+      this.routeIndex.updatePoolStatus(poolId, status, lastVerifiedAt);
+      const poolConfig = this.poolRegistry.getPool(poolId);
+      if (poolConfig) {
+        try {
+          this.repository.saveVerifiedPool({
+            poolId: poolConfig.id,
+            dex: poolConfig.dex,
+            programId: poolConfig.programId,
+            tokenAMint: poolConfig.tokenAMint,
+            tokenBMint: poolConfig.tokenBMint,
+            feeBps: poolConfig.feeBps,
+            verificationStatus: poolConfig.verificationStatus || status,
+            blockerReason: poolConfig.blockerReason || blockerReason,
+            initialLiquidityUsd: poolConfig.initialLiquidityUsd || 0,
+            accountLayoutSize: 0,
+            lastVerifiedAt: poolConfig.lastVerifiedAt || 0,
+            createdAt: Date.now()
+          });
+        } catch (err) {
+          this.repository.recordPersistenceError('saveVerifiedPool', err);
+        }
+      }
+    });
+
     // Phase 1.4: Reconcile saved permanent routes from SQLite repository
     try {
       const savedRoutes = this.repository.getAllRoutes();
@@ -260,6 +286,17 @@ export class ArbitrageScanner {
 
       // Drain queued WebSocket account updates
       await this.drainEventQueue();
+
+      // FIX 1: Expire READY routes when required live data, quote age, feed health, or slot limits become stale
+      const expiredRoutes = this.routeIndex.expireStaleReadyRoutes(
+        (id) => this.stateCache.getPoolState(id),
+        this.config.MAX_QUOTE_AGE_MS || 2500,
+        this.config.MAX_SLOT_GAP || 10,
+        this.ws.getCurrentSlot()
+      );
+      for (const expired of expiredRoutes) {
+        this.repository.updateRouteReadiness(expired.routeId, false, expired.verificationDetails);
+      }
     }, scanInterval);
   }
 
@@ -1738,6 +1775,17 @@ export class ArbitrageScanner {
     const wsStats = this.ws.getStats();
     const jupStats = this.jupiter.getStats();
     const allStates = this.stateCache.getAllPoolStates();
+
+    // FIX 1: Ensure reported readiness reflects current freshness, feed health, and slot limits
+    const expiredRoutes = this.routeIndex.expireStaleReadyRoutes(
+      (id) => this.stateCache.getPoolState(id),
+      this.config.MAX_QUOTE_AGE_MS || 2500,
+      this.config.MAX_SLOT_GAP || 10,
+      wsStats.lastSlot
+    );
+    for (const expired of expiredRoutes) {
+      this.repository.updateRouteReadiness(expired.routeId, false, expired.verificationDetails);
+    }
 
     const poolsPerDex: Record<string, number> = {};
     for (const pool of allStates) {

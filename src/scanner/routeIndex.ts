@@ -90,10 +90,17 @@ export class RouteIndex {
     this.buildIndices(pools);
   }
 
-  public updatePoolStatus(poolId: string, status: VerificationStatus): void {
+  public updatePoolStatus(poolId: string, status: VerificationStatus, lastVerifiedAt?: number): void {
     const pool = this.poolConfigs.get(poolId);
     if (pool) {
       pool.verificationStatus = status;
+      if (lastVerifiedAt !== undefined) {
+        pool.lastVerifiedAt = lastVerifiedAt;
+      } else if (status === 'VERIFIED_DIRECT' && !pool.lastVerifiedAt) {
+        pool.lastVerifiedAt = Date.now();
+      } else if (status === 'QUOTE_UNVERIFIED') {
+        pool.lastVerifiedAt = 0;
+      }
     }
 
     const affectedRoutes = this.poolToRoutes.get(poolId) || [];
@@ -106,8 +113,12 @@ export class RouteIndex {
       route.isDirectToDirect = isDirect;
       if (!isDirect) {
         route.state = 'BLOCKED';
-      } else if (route.state === 'BLOCKED') {
-        route.state = 'VERIFIED';
+        route.lastVerifiedAt = 0;
+      } else {
+        if (route.state === 'BLOCKED') {
+          route.state = 'VERIFIED';
+        }
+        route.lastVerifiedAt = Math.min(...route.poolIds.map(id => this.poolConfigs.get(id)?.lastVerifiedAt || 0));
       }
 
       let priority = 0;
@@ -576,7 +587,8 @@ export class RouteIndex {
 
   /**
    * Restores a STALE route to READY only after validating that all dependency pool states
-   * exist, have healthy feed status, are within slot age limits, and satisfy slot gap constraints.
+   * exist, have valid required timestamp, slot, and healthy feed evidence.
+   * Missing, invalid, expired, or lagging evidence strictly fails closed.
    */
   public validateAndRestoreRoute(
     routeId: string,
@@ -602,38 +614,153 @@ export class RouteIndex {
         return false;
       }
 
-      if (poolState.feedHealth && poolState.feedHealth !== 'HEALTHY') {
+      // FIX 3: Required timestamp evidence must be present, valid, non-future, and non-expired
+      if (typeof poolState.receivedAt !== 'number' || poolState.receivedAt <= 0 || isNaN(poolState.receivedAt)) {
         route.state = 'STALE';
-        route.verificationDetails = `UNHEALTHY_FEED:${leg.poolId}`;
+        route.verificationDetails = `MISSING_TIMESTAMP_EVIDENCE:${leg.poolId}`;
         return false;
       }
-
-      if (poolState.receivedAt && (now - poolState.receivedAt > maxSlotAgeMs)) {
+      if (poolState.receivedAt > now + 5000) {
+        route.state = 'STALE';
+        route.verificationDetails = `FUTURE_TIMESTAMP:${leg.poolId}`;
+        return false;
+      }
+      if (now - poolState.receivedAt > maxSlotAgeMs) {
         route.state = 'STALE';
         route.verificationDetails = `EXPIRED_DEPENDENCY_STATE:${leg.poolId}`;
         return false;
       }
 
-      if (poolState.slot !== undefined) {
-        if (currentSlot !== undefined && poolState.slot > currentSlot + 10) {
-          route.state = 'STALE';
-          route.verificationDetails = `FUTURE_SLOT:${leg.poolId}`;
-          return false;
-        }
-        if (poolState.slot < minSlot) minSlot = poolState.slot;
-        if (poolState.slot > maxSlot) maxSlot = poolState.slot;
+      // FIX 3: Required slot evidence must be present, valid, non-future, and non-lagging
+      if (typeof poolState.slot !== 'number' || poolState.slot <= 0 || isNaN(poolState.slot)) {
+        route.state = 'STALE';
+        route.verificationDetails = `MISSING_SLOT_EVIDENCE:${leg.poolId}`;
+        return false;
       }
+      if (currentSlot !== undefined && poolState.slot > currentSlot + 10) {
+        route.state = 'STALE';
+        route.verificationDetails = `FUTURE_SLOT:${leg.poolId}`;
+        return false;
+      }
+      if (currentSlot !== undefined && currentSlot - poolState.slot > maxSlotGap) {
+        route.state = 'STALE';
+        route.verificationDetails = `EXCESSIVE_SLOT_LAG:${leg.poolId}`;
+        return false;
+      }
+
+      // FIX 3: Required feed-health evidence must be present and HEALTHY
+      if (!poolState.feedHealth || typeof poolState.feedHealth !== 'string' || poolState.feedHealth !== 'HEALTHY') {
+        route.state = 'STALE';
+        route.verificationDetails = `MISSING_OR_UNHEALTHY_FEED_EVIDENCE:${leg.poolId}`;
+        return false;
+      }
+
+      if (poolState.slot < minSlot) minSlot = poolState.slot;
+      if (poolState.slot > maxSlot) maxSlot = poolState.slot;
     }
 
+    // Inter-pool slot gap check
     if (maxSlot !== -Infinity && minSlot !== Infinity && (maxSlot - minSlot > maxSlotGap)) {
       route.state = 'STALE';
-      route.verificationDetails = 'SLOT_GAP_EXCEEDED';
+      route.verificationDetails = `SLOT_GAP_EXCEEDED:${maxSlot - minSlot} > ${maxSlotGap}`;
       return false;
     }
 
     // Dependencies verified fresh -> restore to READY
     route.state = 'READY';
     return true;
+  }
+
+  /**
+   * FIX 1: Expire READY routes when required live data, quote age, feed health, or slot limits become stale.
+   * Uses existing scanner configuration (maxSlotAgeMs / maxSlotGap / currentSlot).
+   */
+  public expireStaleReadyRoutes(
+    getPoolState: (poolId: string) => { receivedAt?: number; slot?: number; feedHealth?: string } | undefined,
+    maxSlotAgeMs: number = 2500,
+    maxSlotGap: number = 10,
+    currentSlot?: number
+  ): IndexedDirectedRoute[] {
+    const expired: IndexedDirectedRoute[] = [];
+    const now = Date.now();
+
+    for (const route of this.allRoutes) {
+      if (route.state !== 'READY') continue;
+
+      let isExpired = false;
+      let expireReason = '';
+
+      // Check route's own quote timestamp freshness using existing maxSlotAgeMs / MAX_QUOTE_AGE_MS
+      if (route.lastQuoteTimestamp && (now - route.lastQuoteTimestamp > maxSlotAgeMs)) {
+        isExpired = true;
+        expireReason = `EXPIRED_QUOTE:${now - route.lastQuoteTimestamp}ms > ${maxSlotAgeMs}ms`;
+      }
+
+      if (!isExpired) {
+        let minSlot = Infinity;
+        let maxSlot = -Infinity;
+
+        for (const leg of route.legs) {
+          const poolState = getPoolState(leg.poolId);
+          if (!poolState) {
+            isExpired = true;
+            expireReason = `MISSING_DEPENDENCY_STATE:${leg.poolId}`;
+            break;
+          }
+          if (typeof poolState.receivedAt !== 'number' || poolState.receivedAt <= 0 || isNaN(poolState.receivedAt)) {
+            isExpired = true;
+            expireReason = `MISSING_TIMESTAMP_EVIDENCE:${leg.poolId}`;
+            break;
+          }
+          if (poolState.receivedAt > now + 5000) {
+            isExpired = true;
+            expireReason = `FUTURE_TIMESTAMP:${leg.poolId}`;
+            break;
+          }
+          if (now - poolState.receivedAt > maxSlotAgeMs) {
+            isExpired = true;
+            expireReason = `EXPIRED_DEPENDENCY_STATE:${leg.poolId}`;
+            break;
+          }
+          if (typeof poolState.slot !== 'number' || poolState.slot <= 0 || isNaN(poolState.slot)) {
+            isExpired = true;
+            expireReason = `MISSING_SLOT_EVIDENCE:${leg.poolId}`;
+            break;
+          }
+          if (currentSlot !== undefined && poolState.slot > currentSlot + 10) {
+            isExpired = true;
+            expireReason = `FUTURE_SLOT:${leg.poolId}`;
+            break;
+          }
+          if (currentSlot !== undefined && currentSlot - poolState.slot > maxSlotGap) {
+            isExpired = true;
+            expireReason = `EXCESSIVE_SLOT_LAG:${leg.poolId}`;
+            break;
+          }
+          if (!poolState.feedHealth || typeof poolState.feedHealth !== 'string' || poolState.feedHealth !== 'HEALTHY') {
+            isExpired = true;
+            expireReason = `MISSING_OR_UNHEALTHY_FEED_EVIDENCE:${leg.poolId}`;
+            break;
+          }
+
+          if (poolState.slot < minSlot) minSlot = poolState.slot;
+          if (poolState.slot > maxSlot) maxSlot = poolState.slot;
+        }
+
+        if (!isExpired && maxSlot !== -Infinity && minSlot !== Infinity && (maxSlot - minSlot > maxSlotGap)) {
+          isExpired = true;
+          expireReason = `SLOT_GAP_EXCEEDED:${maxSlot - minSlot} > ${maxSlotGap}`;
+        }
+      }
+
+      if (isExpired) {
+        route.state = 'STALE';
+        route.verificationDetails = expireReason;
+        expired.push(route);
+      }
+    }
+
+    return expired;
   }
 
   /**

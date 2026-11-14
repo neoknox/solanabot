@@ -473,7 +473,7 @@ describe('Phase 1.4: Permanent Route Library Suite (90-Day Roadmap Phase 1 Gate)
     expect(stats.verifiedPoolCount).toBe(stats.verifiedDirectPoolCount);
   });
 
-  it('Gate 1.4.14 - Honest Dependency Descriptors & Verification Timestamps: No synthetic pubkeys or fake timestamps', () => {
+  it('Gate 1.4.14 - Honest Dependency Descriptors & Verification Timestamps: No synthetic pubkeys or misleading catalog timestamps (FIX 5)', () => {
     const pools = poolRegistry.getAllPools();
     const routeIndex = new RouteIndex(pools);
     const routes = routeIndex.getAllRoutes();
@@ -492,12 +492,239 @@ describe('Phase 1.4: Permanent Route Library Suite (90-Day Roadmap Phase 1 Gate)
         }
       }
 
-      // If route contains unverified pools, lastVerifiedAt must be 0, never Date.now()
-      if (!route.isDirectToDirect) {
-        expect(route.lastVerifiedAt).toBe(0);
-      } else {
-        expect(route.lastVerifiedAt).toBeGreaterThan(0);
-      }
+      // FIX 5: Remove misleading verification timestamps from default catalog
+      // In default catalog, routes without genuine on-chain verification events must have lastVerifiedAt: 0
+      expect(route.lastVerifiedAt).toBe(0);
     }
+
+    // When genuine verification events occur with known provenance timestamps
+    const verifiedEventTime = 1720000000000;
+    const targetRoute = routeIndex.getVerifiedDirectRoutes()[0];
+    for (const poolId of targetRoute.poolIds) {
+      routeIndex.updatePoolStatus(poolId, 'VERIFIED_DIRECT', verifiedEventTime);
+    }
+
+    // Now route reflects the recorded timestamp from genuine verification events
+    const updatedRoute = routeIndex.getRouteById(targetRoute.routeId);
+    expect(updatedRoute?.lastVerifiedAt).toBe(verifiedEventTime);
+  });
+
+  it('Gate 1.4.15 - READY Expiration: Live data staleness automatically transitions READY routes to STALE (FIX 1)', () => {
+    const pools = poolRegistry.getAllPools();
+    const routeIndex = new RouteIndex(pools);
+    const targetRoute = routeIndex.getVerifiedDirectRoutes()[0];
+
+    // 1. Route quoted and marked READY with recent timestamp
+    const now = Date.now();
+    routeIndex.setRouteReady(targetRoute.routeId, {
+      expectedNetUSDC: '0.650000',
+      timestamp: now
+    });
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.state).toBe('READY');
+
+    // 2. Data becomes stale: Quote age exceeds maxSlotAgeMs (e.g. 2500ms)
+    routeIndex.getRouteById(targetRoute.routeId)!.lastQuoteTimestamp = now - 3000;
+    const expiredByQuoteAge = routeIndex.expireStaleReadyRoutes(
+      (_id) => ({ receivedAt: now, slot: 100, feedHealth: 'HEALTHY' }),
+      2500,
+      10,
+      100
+    );
+    expect(expiredByQuoteAge.some(r => r.routeId === targetRoute.routeId)).toBe(true);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.state).toBe('STALE');
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('EXPIRED_QUOTE');
+
+    // 3. Re-mark READY, then dependency feed health becomes UNHEALTHY
+    routeIndex.setRouteReady(targetRoute.routeId, { expectedNetUSDC: '0.650000', timestamp: Date.now() });
+    const expiredByFeed = routeIndex.expireStaleReadyRoutes(
+      (_id) => ({ receivedAt: Date.now(), slot: 100, feedHealth: 'STALE' }),
+      2500,
+      10,
+      100
+    );
+    expect(expiredByFeed.some(r => r.routeId === targetRoute.routeId)).toBe(true);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.state).toBe('STALE');
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('MISSING_OR_UNHEALTHY_FEED_EVIDENCE');
+
+    // 4. Re-mark READY, then slot lag exceeds MAX_SLOT_GAP (10 slots)
+    routeIndex.setRouteReady(targetRoute.routeId, { expectedNetUSDC: '0.650000', timestamp: Date.now() });
+    const expiredBySlotLag = routeIndex.expireStaleReadyRoutes(
+      (_id) => ({ receivedAt: Date.now(), slot: 85, feedHealth: 'HEALTHY' }),
+      2500,
+      10,
+      100 // current slot 100 vs pool slot 85 -> gap 15 > maxSlotGap 10
+    );
+    expect(expiredBySlotLag.some(r => r.routeId === targetRoute.routeId)).toBe(true);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.state).toBe('STALE');
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('EXCESSIVE_SLOT_LAG');
+  });
+
+  it('Gate 1.4.16 - Runtime Verification Persistence & Safe Restart Revalidation (FIX 2)', () => {
+    // 1. Update pool verification on registry and verify it notifies and persists to SQLite
+    const customPoolAddr = 'CustomDiscoveredPoolAddr11111111111111111111';
+    poolRegistry.register({
+      id: customPoolAddr,
+      dex: 'ORCA_WHIRLPOOL',
+      programId: 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
+      tokenAMint: 'So11111111111111111111111111111111111111112',
+      tokenBMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+      feeBps: 4,
+      initialLiquidityUsd: 500000,
+      verificationStatus: 'QUOTE_UNVERIFIED',
+      blockerReason: 'PENDING_ONCHAIN_REVALIDATION',
+      lastVerifiedAt: 0
+    });
+
+    const routeIndex = new RouteIndex(poolRegistry.getAllPools());
+
+    // Wire persistence callback as ArbitrageScanner does
+    poolRegistry.onVerificationChange((poolId, status, blockerReason, lastVerifiedAt) => {
+      routeIndex.updatePoolStatus(poolId, status, lastVerifiedAt);
+      const pool = poolRegistry.getPool(poolId);
+      if (pool) {
+        repo.saveVerifiedPool({
+          poolId: pool.id,
+          dex: pool.dex,
+          programId: pool.programId,
+          tokenAMint: pool.tokenAMint,
+          tokenBMint: pool.tokenBMint,
+          feeBps: pool.feeBps,
+          verificationStatus: status,
+          blockerReason: blockerReason,
+          initialLiquidityUsd: pool.initialLiquidityUsd || 0,
+          accountLayoutSize: 0,
+          lastVerifiedAt: lastVerifiedAt || 0,
+          createdAt: Date.now()
+        });
+      }
+    });
+
+    // Simulate on-chain verification promotion event
+    const genuineVerifiedTime = 1725000000000;
+    poolRegistry.updatePoolVerification(customPoolAddr, 'VERIFIED_DIRECT', undefined, genuineVerifiedTime);
+
+    // Verify it was persisted to SQLite
+    const storedPool = repo.getVerifiedPool(customPoolAddr);
+    expect(storedPool).not.toBeNull();
+    expect(storedPool?.verificationStatus).toBe('VERIFIED_DIRECT');
+    expect(storedPool?.lastVerifiedAt).toBe(genuineVerifiedTime);
+
+    // 2. Restart simulation: loaded persisted pools must NOT automatically count as fresh on-chain validation
+    const freshRegistry = new PoolRegistry();
+    const persistedPools = repo.getAllVerifiedPools();
+    freshRegistry.loadPersistedPools(persistedPools);
+
+    const reloadedCustomPool = freshRegistry.getPool(customPoolAddr);
+    expect(reloadedCustomPool).toBeDefined();
+    // Reverted to QUOTE_UNVERIFIED upon restart pending live on-chain revalidation!
+    expect(reloadedCustomPool?.verificationStatus).toBe('QUOTE_UNVERIFIED');
+    expect(reloadedCustomPool?.blockerReason).toBe('PENDING_RESTART_REVALIDATION');
+    // Provenance timestamp is preserved
+    expect(reloadedCustomPool?.lastVerifiedAt).toBe(genuineVerifiedTime);
+  });
+
+  it('Gate 1.4.17 - Strict Freshness Validation: Missing, invalid, expired, and future evidence fails closed (FIX 3)', () => {
+    const pools = poolRegistry.getAllPools();
+    const routeIndex = new RouteIndex(pools);
+    const targetRoute = routeIndex.getVerifiedDirectRoutes()[0];
+
+    // Put route in STALE
+    routeIndex.setRouteStale(targetRoute.routeId, 'INIT');
+    const now = Date.now();
+
+    // A) Missing timestamp evidence (undefined or <= 0)
+    expect(routeIndex.validateAndRestoreRoute(targetRoute.routeId, () => ({ slot: 100, feedHealth: 'HEALTHY' }))).toBe(false);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('MISSING_TIMESTAMP_EVIDENCE');
+
+    expect(routeIndex.validateAndRestoreRoute(targetRoute.routeId, () => ({ receivedAt: 0, slot: 100, feedHealth: 'HEALTHY' }))).toBe(false);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('MISSING_TIMESTAMP_EVIDENCE');
+
+    // B) Future timestamp evidence (> now + 5000)
+    expect(routeIndex.validateAndRestoreRoute(targetRoute.routeId, () => ({ receivedAt: now + 10000, slot: 100, feedHealth: 'HEALTHY' }))).toBe(false);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('FUTURE_TIMESTAMP');
+
+    // C) Expired timestamp evidence (> maxSlotAgeMs)
+    expect(routeIndex.validateAndRestoreRoute(targetRoute.routeId, () => ({ receivedAt: now - 6000, slot: 100, feedHealth: 'HEALTHY' }), 2500)).toBe(false);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('EXPIRED_DEPENDENCY_STATE');
+
+    // D) Missing slot evidence (undefined or <= 0)
+    expect(routeIndex.validateAndRestoreRoute(targetRoute.routeId, () => ({ receivedAt: now, feedHealth: 'HEALTHY' }))).toBe(false);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('MISSING_SLOT_EVIDENCE');
+
+    expect(routeIndex.validateAndRestoreRoute(targetRoute.routeId, () => ({ receivedAt: now, slot: -5, feedHealth: 'HEALTHY' }))).toBe(false);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('MISSING_SLOT_EVIDENCE');
+
+    // E) Future slot (> currentSlot + 10)
+    expect(routeIndex.validateAndRestoreRoute(targetRoute.routeId, () => ({ receivedAt: now, slot: 150, feedHealth: 'HEALTHY' }), 2500, 10, 100)).toBe(false);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('FUTURE_SLOT');
+
+    // F) Excessive slot lag (currentSlot - slot > maxSlotGap)
+    expect(routeIndex.validateAndRestoreRoute(targetRoute.routeId, () => ({ receivedAt: now, slot: 80, feedHealth: 'HEALTHY' }), 2500, 10, 100)).toBe(false);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('EXCESSIVE_SLOT_LAG');
+
+    // G) Missing or unhealthy feed health
+    expect(routeIndex.validateAndRestoreRoute(targetRoute.routeId, () => ({ receivedAt: now, slot: 100, feedHealth: undefined }))).toBe(false);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('MISSING_OR_UNHEALTHY_FEED_EVIDENCE');
+
+    expect(routeIndex.validateAndRestoreRoute(targetRoute.routeId, () => ({ receivedAt: now, slot: 100, feedHealth: 'DISCONNECTED' }))).toBe(false);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.verificationDetails).toContain('MISSING_OR_UNHEALTHY_FEED_EVIDENCE');
+
+    // H) All evidence present, fresh, and valid -> Restores to READY!
+    const restored = routeIndex.validateAndRestoreRoute(
+      targetRoute.routeId,
+      () => ({ receivedAt: now, slot: 100, feedHealth: 'HEALTHY' }),
+      2500,
+      10,
+      102
+    );
+    expect(restored).toBe(true);
+    expect(routeIndex.getRouteById(targetRoute.routeId)?.state).toBe('READY');
+  });
+
+  it('Gate 1.4.18 - SQLite Write Reliability: Bounded retries and no permanent loss on database failure (FIX 4)', () => {
+    const pools = poolRegistry.getAllPools();
+    const routeIndex = new RouteIndex(pools);
+    repo.upsertRoutes(routeIndex.getAllPermanentRecords());
+
+    const targetRoute = routeIndex.getVerifiedDirectRoutes()[0];
+
+    // Queue readiness update
+    repo.updateRouteReadiness(targetRoute.routeId, true, undefined, {
+      expectedNetUSDC: '0.700000',
+      timestamp: Date.now()
+    });
+    expect(repo.getQueuedReadinessCount()).toBe(1);
+
+    // Simulate database write failure by replacing transaction with throwing mock
+    const originalTx = (repo as any).batchUpdateReadinessTx;
+    let attempts = 0;
+    (repo as any).batchUpdateReadinessTx = () => {
+      attempts++;
+      throw new Error('Simulated SQLite disk lock error');
+    };
+
+    // First flush fails
+    repo.flushSync();
+    expect(attempts).toBe(1);
+    expect(repo.getPersistenceErrorsCount()).toBeGreaterThan(0);
+    // FIX 4: Update is NOT permanently discarded! Retained in queue for retry
+    expect(repo.getQueuedReadinessCount()).toBe(1);
+
+    // Second flush fails
+    repo.flushSync();
+    expect(attempts).toBe(2);
+    expect(repo.getQueuedReadinessCount()).toBe(1);
+
+    // Restore working transaction
+    (repo as any).batchUpdateReadinessTx = originalTx;
+
+    // Third flush succeeds
+    repo.flushSync();
+    expect(repo.getQueuedReadinessCount()).toBe(0);
+
+    // Stored route reflects the committed update
+    const stored = repo.getRoute(targetRoute.routeId);
+    expect(stored?.state).toBe('READY');
+    expect(stored?.lastQuoteExpectedNetUSDC).toBe('0.700000');
   });
 });

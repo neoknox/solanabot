@@ -97,6 +97,7 @@ export class ArbitrageRepository {
     lastQuoteTimestamp?: number;
     updatedAt: number;
   }>) => void>;
+  public static readonly MAX_READINESS_RETRIES = 3;
   private candidateQueue: ArbitrageCandidate[] = [];
   private routeReadinessQueue = new Map<string, {
     routeId: string;
@@ -105,6 +106,7 @@ export class ArbitrageRepository {
     lastQuoteExpectedNetUSDC?: string;
     lastQuoteTimestamp?: number;
     updatedAt: number;
+    retryCount?: number;
   }>();
   private flushTimer: NodeJS.Timeout | null = null;
   private persistenceErrorsCount = 0;
@@ -411,6 +413,10 @@ export class ArbitrageRepository {
     }
   }
 
+  public getQueuedReadinessCount(): number {
+    return this.routeReadinessQueue.size;
+  }
+
   public updateRouteReadiness(
     routeId: string,
     isReady: boolean,
@@ -425,7 +431,8 @@ export class ArbitrageRepository {
       details,
       lastQuoteExpectedNetUSDC: quoteStats?.expectedNetUSDC,
       lastQuoteTimestamp: quoteStats?.timestamp,
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
+      retryCount: 0
     });
   }
 
@@ -572,6 +579,23 @@ export class ArbitrageRepository {
         this.batchUpdateReadinessTx(updates);
       } catch (err) {
         this.recordPersistenceError('flushRouteReadiness', err);
+        // FIX 4: Bounded retry mechanism with error reporting
+        // Do not permanently discard queued readiness updates after a failed database transaction
+        for (const update of updates) {
+          const retries = (update.retryCount || 0) + 1;
+          if (retries <= ArbitrageRepository.MAX_READINESS_RETRIES) {
+            update.retryCount = retries;
+            // Re-queue only if not superseded by a newer update in the queue
+            if (!this.routeReadinessQueue.has(update.routeId)) {
+              this.routeReadinessQueue.set(update.routeId, update);
+            }
+          } else {
+            this.recordPersistenceError(
+              'flushRouteReadiness:retryLimitExceeded',
+              new Error(`Readiness update for route ${update.routeId} exhausted ${ArbitrageRepository.MAX_READINESS_RETRIES} retries`)
+            );
+          }
+        }
       }
     }
   }
