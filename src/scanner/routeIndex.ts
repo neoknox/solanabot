@@ -77,6 +77,11 @@ export class RouteIndex {
   // Pool ID -> PoolConfig snapshot for dynamic classification
   private poolConfigs = new Map<string, PoolConfig>();
 
+  // Route lifecycle transition counters
+  private readyToStaleTransitions = 0;
+  private staleToReadyRecoveries = 0;
+  private peakReadyCount = 0;
+
   constructor(pools: PoolConfig[]) {
     this.buildIndices(pools);
   }
@@ -90,7 +95,7 @@ export class RouteIndex {
     this.buildIndices(pools);
   }
 
-  public updatePoolStatus(poolId: string, status: VerificationStatus, lastVerifiedAt?: number): void {
+  public updatePoolStatus(poolId: string, status: VerificationStatus, lastVerifiedAt?: number): IndexedDirectedRoute[] {
     const pool = this.poolConfigs.get(poolId);
     if (pool) {
       pool.verificationStatus = status;
@@ -103,8 +108,12 @@ export class RouteIndex {
       }
     }
 
+    const changedRoutes: IndexedDirectedRoute[] = [];
     const affectedRoutes = this.poolToRoutes.get(poolId) || [];
     for (const route of affectedRoutes) {
+      const prevState = route.state;
+      const prevDirect = route.isDirectToDirect;
+
       const isDirect = route.poolIds.every(id => {
         const cfg = this.poolConfigs.get(id);
         return cfg ? this.isPoolVerifiedDirect(cfg) : false;
@@ -112,13 +121,22 @@ export class RouteIndex {
 
       route.isDirectToDirect = isDirect;
       if (!isDirect) {
+        if (route.state === 'READY') {
+          this.readyToStaleTransitions++;
+        }
         route.state = 'BLOCKED';
+        route.verificationDetails = `DEPENDENCY_UNVERIFIED:${poolId}`;
         route.lastVerifiedAt = 0;
       } else {
         if (route.state === 'BLOCKED') {
           route.state = 'VERIFIED';
+          route.verificationDetails = undefined;
         }
         route.lastVerifiedAt = Math.min(...route.poolIds.map(id => this.poolConfigs.get(id)?.lastVerifiedAt || 0));
+      }
+
+      if (route.state !== prevState || route.isDirectToDirect !== prevDirect) {
+        changedRoutes.push(route);
       }
 
       let priority = 0;
@@ -141,6 +159,7 @@ export class RouteIndex {
     }
 
     this.allRoutes.sort((a, b) => b.priorityScore - a.priorityScore);
+    return changedRoutes;
   }
 
   private isPoolVerifiedDirect(pool: PoolConfig): boolean {
@@ -556,13 +575,42 @@ export class RouteIndex {
     return this.allRoutes.filter(r => r.state === 'STALE').length;
   }
 
+  public getRouteCountByState(state: RouteState): number {
+    return this.allRoutes.filter(r => r.state === state).length;
+  }
+
+  public getRoutesByState(state: RouteState): IndexedDirectedRoute[] {
+    return this.allRoutes.filter(r => r.state === state);
+  }
+
+  public getLifecycleTransitionStats(): {
+    readyToStaleTransitions: number;
+    staleToReadyRecoveries: number;
+    peakReadyCount: number;
+  } {
+    return {
+      readyToStaleTransitions: this.readyToStaleTransitions,
+      staleToReadyRecoveries: this.staleToReadyRecoveries,
+      peakReadyCount: this.peakReadyCount
+    };
+  }
+
   public setRouteReady(routeId: string, quoteStats?: { expectedNetUSDC: string; timestamp: number }): boolean {
     const route = this.routeById.get(routeId);
     if (!route || !route.isDirectToDirect || route.state === 'BLOCKED') {
       return false;
     }
 
+    const prevState = route.state;
     route.state = 'READY';
+    if (prevState === 'STALE') {
+      this.staleToReadyRecoveries++;
+    }
+    const currentReady = this.getReadyRouteCount();
+    if (currentReady > this.peakReadyCount) {
+      this.peakReadyCount = currentReady;
+    }
+
     if (quoteStats) {
       route.lastQuoteExpectedNetUSDC = quoteStats.expectedNetUSDC;
       route.lastQuoteTimestamp = quoteStats.timestamp;
@@ -574,6 +622,10 @@ export class RouteIndex {
     const route = this.routeById.get(routeId);
     if (!route || !route.isDirectToDirect || route.state === 'BLOCKED') {
       return false;
+    }
+
+    if (route.state === 'READY') {
+      this.readyToStaleTransitions++;
     }
 
     // Transitory freshness loss: transitions READY or VERIFIED -> STALE.
@@ -667,7 +719,15 @@ export class RouteIndex {
     }
 
     // Dependencies verified fresh -> restore to READY
+    const prevState = route.state;
     route.state = 'READY';
+    if (prevState === 'STALE') {
+      this.staleToReadyRecoveries++;
+    }
+    const currentReady = this.getReadyRouteCount();
+    if (currentReady > this.peakReadyCount) {
+      this.peakReadyCount = currentReady;
+    }
     return true;
   }
 
@@ -755,6 +815,7 @@ export class RouteIndex {
 
       if (isExpired) {
         route.state = 'STALE';
+        this.readyToStaleTransitions++;
         route.verificationDetails = expireReason;
         expired.push(route);
       }

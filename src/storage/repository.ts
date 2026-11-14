@@ -173,7 +173,7 @@ export class ArbitrageRepository {
     this.selectAllRoutesStmt = this.db.prepare(`SELECT * FROM routes ORDER BY updated_at DESC`);
     this.selectRoutesByStateStmt = this.db.prepare(`SELECT * FROM routes WHERE state = ? ORDER BY updated_at DESC`);
     this.updateRouteStateStmt = this.db.prepare(`
-      UPDATE routes SET state = ?, verification_details = COALESCE(?, verification_details), updated_at = ?
+      UPDATE routes SET state = ?, verification_details = ?, updated_at = ?
       WHERE route_id = ?
     `);
     this.updateRouteReadinessStmt = this.db.prepare(`
@@ -181,7 +181,7 @@ export class ArbitrageRepository {
         state = ?,
         last_quote_expected_net_usdc = COALESCE(?, last_quote_expected_net_usdc),
         last_quote_timestamp = COALESCE(?, last_quote_timestamp),
-        verification_details = COALESCE(?, verification_details),
+        verification_details = ?,
         updated_at = ?
       WHERE route_id = ?
     `);
@@ -417,6 +417,19 @@ export class ArbitrageRepository {
     return this.routeReadinessQueue.size;
   }
 
+  public queueRouteStateUpdate(routeId: string, state: RouteState, details?: string): void {
+    const existing = this.routeReadinessQueue.get(routeId);
+    this.routeReadinessQueue.set(routeId, {
+      routeId,
+      state,
+      details: details !== undefined ? details : (state === 'VERIFIED' || state === 'READY' ? undefined : existing?.details),
+      lastQuoteExpectedNetUSDC: existing?.lastQuoteExpectedNetUSDC,
+      lastQuoteTimestamp: existing?.lastQuoteTimestamp,
+      updatedAt: Date.now(),
+      retryCount: 0
+    });
+  }
+
   public updateRouteReadiness(
     routeId: string,
     isReady: boolean,
@@ -424,13 +437,14 @@ export class ArbitrageRepository {
     quoteStats?: { expectedNetUSDC: string; timestamp: number }
   ): void {
     const state: RouteState = isReady ? 'READY' : 'STALE';
+    const existing = this.routeReadinessQueue.get(routeId);
     // Non-blocking in-memory queue with key coalescing to keep writes off the quoting hot path
     this.routeReadinessQueue.set(routeId, {
       routeId,
       state,
-      details,
-      lastQuoteExpectedNetUSDC: quoteStats?.expectedNetUSDC,
-      lastQuoteTimestamp: quoteStats?.timestamp,
+      details: details !== undefined ? details : (isReady ? undefined : existing?.details),
+      lastQuoteExpectedNetUSDC: quoteStats?.expectedNetUSDC ?? existing?.lastQuoteExpectedNetUSDC,
+      lastQuoteTimestamp: quoteStats?.timestamp ?? existing?.lastQuoteTimestamp,
       updatedAt: Date.now(),
       retryCount: 0
     });

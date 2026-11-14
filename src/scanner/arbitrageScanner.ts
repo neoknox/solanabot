@@ -167,7 +167,10 @@ export class ArbitrageScanner {
 
     // Phase 1.4 FIX 2: Wire pool verification changes to RouteIndex and SQLite persistence
     this.poolRegistry.onVerificationChange((poolId, status, blockerReason, lastVerifiedAt) => {
-      this.routeIndex.updatePoolStatus(poolId, status, lastVerifiedAt);
+      const changedRoutes = this.routeIndex.updatePoolStatus(poolId, status, lastVerifiedAt);
+      for (const route of changedRoutes) {
+        this.repository.queueRouteStateUpdate(route.routeId, route.state, route.verificationDetails);
+      }
       const poolConfig = this.poolRegistry.getPool(poolId);
       if (poolConfig) {
         try {
@@ -1847,6 +1850,10 @@ export class ArbitrageScanner {
 
   public getRouteLibrarySummary(): RouteSummaryStats {
     return this.repository.getRouteSummaryStats();
+  }
+
+  public getRouteTransitionStats() {
+    return this.routeIndex.getLifecycleTransitionStats();
   }
 
   private syncRouteLibraryToStorage(): void {

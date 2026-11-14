@@ -65,9 +65,65 @@ async function main() {
 
   await scanner.start();
 
-  const scanDurationSec = process.env.SCAN_DURATION_SEC ? parseInt(process.env.SCAN_DURATION_SEC, 10) : 60;
-  console.log(`Running sustained read-only scan against Solana mainnet for ${scanDurationSec} seconds...\n`);
-  await new Promise(resolve => setTimeout(resolve, scanDurationSec * 1000));
+  const scanDurationSec = process.env.SCAN_DURATION_SEC ? parseInt(process.env.SCAN_DURATION_SEC, 10) : 120;
+  const intervalSec = process.env.INTERVAL_SEC ? parseInt(process.env.INTERVAL_SEC, 10) : 20;
+  console.log(`Running sustained read-only scan against Solana mainnet for ${scanDurationSec} seconds (recording intervals every ${intervalSec}s)...\n`);
+
+  interface ValidationSnapshot {
+    elapsedSec: number;
+    storedRoutes: number;
+    verifiedRoutes: number;
+    readyRoutes: number;
+    staleRoutes: number;
+    blockedRoutes: number;
+    verifiedDirectPools: number;
+    quoteValidEvaluations: number;
+    peakReadyCount: number;
+    readyToStaleTransitions: number;
+    staleToReadyRecoveries: number;
+    queueDrops: number;
+    persistenceErrors: number;
+  }
+
+  const snapshots: ValidationSnapshot[] = [];
+  const captureSnapshot = (elapsedSec: number): ValidationSnapshot => {
+    // Flush to ensure SQLite view is current with non-blocking queued updates
+    scanner.getRepository().flushSync();
+    const routeLibStats = scanner.getRouteLibrarySummary();
+    const transStats = scanner.getRouteTransitionStats();
+    const auditMetrics = scanner.getAuditMetrics();
+    const eqStats = scanner.getEventQueueStats();
+    const poolReg = scanner.getPoolRegistry();
+
+    const snap: ValidationSnapshot = {
+      elapsedSec,
+      storedRoutes: routeLibStats.totalRoutes,
+      verifiedRoutes: routeIndex.getRouteCountByState('VERIFIED'),
+      readyRoutes: routeIndex.getRouteCountByState('READY'),
+      staleRoutes: routeIndex.getRouteCountByState('STALE'),
+      blockedRoutes: routeIndex.getRouteCountByState('BLOCKED'),
+      verifiedDirectPools: poolReg.getAllPools().filter(p => p.verificationStatus === 'VERIFIED_DIRECT').length,
+      quoteValidEvaluations: auditMetrics.quoteValidRouteCount || 0,
+      peakReadyCount: transStats.peakReadyCount,
+      readyToStaleTransitions: transStats.readyToStaleTransitions,
+      staleToReadyRecoveries: transStats.staleToReadyRecoveries,
+      queueDrops: eqStats.droppedCount || 0,
+      persistenceErrors: scanner.getRepository().getPersistenceErrorsCount()
+    };
+    snapshots.push(snap);
+    console.log(`[INTERVAL T+${elapsedSec.toString().padStart(3, ' ')}s] Stored: ${snap.storedRoutes} | VERIFIED: ${snap.verifiedRoutes} | READY: ${snap.readyRoutes} | STALE: ${snap.staleRoutes} | BLOCKED: ${snap.blockedRoutes} | VerifiedPools: ${snap.verifiedDirectPools} | QuoteValid: ${snap.quoteValidEvaluations} | PeakREADY: ${snap.peakReadyCount} | R->S: ${snap.readyToStaleTransitions} | S->R: ${snap.staleToReadyRecoveries} | QueueDrops: ${snap.queueDrops} | PersistErr: ${snap.persistenceErrors}`);
+    return snap;
+  };
+
+  captureSnapshot(0);
+
+  let elapsed = 0;
+  while (elapsed < scanDurationSec) {
+    const sleepSec = Math.min(intervalSec, scanDurationSec - elapsed);
+    await new Promise(resolve => setTimeout(resolve, sleepSec * 1000));
+    elapsed += sleepSec;
+    captureSnapshot(elapsed);
+  }
 
   const totalRunTimeMs = performance.now() - startTimeMs;
   const cpuEnd = process.cpuUsage(cpuStart);
@@ -128,6 +184,7 @@ async function main() {
 
   console.log('\n--- PHASE 1.4 PERMANENT ROUTE LIBRARY BENCHMARK ---');
   const routeLibStats = scanner.getRouteLibrarySummary();
+  const transitionStats = scanner.getRouteTransitionStats();
   console.log(`  Total Persistent Routes in SQLite:     ${routeLibStats.totalRoutes}`);
   console.log(`  - Structurally Verified Routes:        ${routeLibStats.verifiedCount}`);
   console.log(`  - Live READY Routes:                   ${routeLibStats.readyCount}`);
@@ -137,11 +194,22 @@ async function main() {
   console.log(`  - 3-Leg Cycles:                        ${routeLibStats.threeLegCount}`);
   console.log(`  - Intra-DEX Routes:                    ${routeLibStats.intraDexCount}`);
   console.log(`  - Inter-DEX Routes:                    ${routeLibStats.interDexCount}`);
+  console.log(`  Route Lifecycle Transitions:`);
+  console.log(`  - Peak READY Count:                    ${transitionStats.peakReadyCount}`);
+  console.log(`  - READY-to-STALE Transitions:          ${transitionStats.readyToStaleTransitions}`);
+  console.log(`  - STALE-to-READY Recoveries:           ${transitionStats.staleToReadyRecoveries}`);
   console.log(`  Pool Storage Breakdown:`);
   console.log(`  - Total Stored Pools:                  ${routeLibStats.totalStoredPoolCount}`);
   console.log(`  - VERIFIED_DIRECT Pools:               ${routeLibStats.verifiedDirectPoolCount}`);
   console.log(`  - QUOTE_UNVERIFIED Pools:              ${routeLibStats.unverifiedPoolCount}`);
   console.log(`  Persistence Errors Count:              ${routeLibStats.persistenceErrorsCount}`);
+
+  console.log('\n--- PHASE 1.4 LIVE INTERVAL VALIDATION MONITORING (120s) ---');
+  console.log('| Interval | Stored | VERIFIED | READY | STALE | BLOCKED | DirectPools | QuoteValid | PeakREADY | R->S | S->R | Drops | PersistErr |');
+  console.log('|----------|--------|----------|-------|-------|---------|-------------|------------|-----------|------|------|-------|------------|');
+  for (const s of snapshots) {
+    console.log(`| T+${s.elapsedSec.toString().padStart(3, ' ')}s    | ${s.storedRoutes.toString().padStart(6, ' ')} | ${s.verifiedRoutes.toString().padStart(8, ' ')} | ${s.readyRoutes.toString().padStart(5, ' ')} | ${s.staleRoutes.toString().padStart(5, ' ')} | ${s.blockedRoutes.toString().padStart(7, ' ')} | ${s.verifiedDirectPools.toString().padStart(11, ' ')} | ${s.quoteValidEvaluations.toString().padStart(10, ' ')} | ${s.peakReadyCount.toString().padStart(9, ' ')} | ${s.readyToStaleTransitions.toString().padStart(4, ' ')} | ${s.staleToReadyRecoveries.toString().padStart(4, ' ')} | ${s.queueDrops.toString().padStart(5, ' ')} | ${s.persistenceErrors.toString().padStart(10, ' ')} |`);
+  }
 
   console.log('\n--- RUNTIME POOL VERIFICATION STATUS ---');
   const poolReg = scanner.getPoolRegistry();

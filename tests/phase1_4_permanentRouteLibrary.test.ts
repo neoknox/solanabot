@@ -727,4 +727,110 @@ describe('Phase 1.4: Permanent Route Library Suite (90-Day Roadmap Phase 1 Gate)
     expect(stored?.state).toBe('READY');
     expect(stored?.lastQuoteExpectedNetUSDC).toBe('0.700000');
   });
+
+  it('Gate 1.4.19 - Route State Consistency: When pool verification changes, affected route states remain consistent in RouteIndex and SQLite via asynchronous non-blocking queue', () => {
+    // 1. Initial state: Orca pools are VERIFIED_DIRECT, Orca-Orca routes are VERIFIED in RouteIndex & SQLite
+    const pools = poolRegistry.getAllPools();
+    const routeIndex = new RouteIndex(pools);
+    repo.upsertRoutes(routeIndex.getAllPermanentRecords());
+
+    const directRoutes = routeIndex.getVerifiedDirectRoutes();
+    expect(directRoutes.length).toBeGreaterThan(0);
+    const targetRoute = directRoutes[0];
+    const targetPoolId = targetRoute.legs[0].poolId;
+
+    // Verify initial SQLite state
+    const initialStored = repo.getRoute(targetRoute.routeId);
+    expect(initialStored?.state).toBe('VERIFIED');
+
+    // 2. Simulate pool verification change: Pool becomes QUOTE_UNVERIFIED
+    const changedRoutes = routeIndex.updatePoolStatus(targetPoolId, 'QUOTE_UNVERIFIED');
+    expect(changedRoutes.some(r => r.routeId === targetRoute.routeId)).toBe(true);
+
+    // In-memory RouteIndex is immediately updated: BLOCKED
+    const updatedRouteInMemory = routeIndex.getRouteById(targetRoute.routeId);
+    expect(updatedRouteInMemory?.state).toBe('BLOCKED');
+    expect(updatedRouteInMemory?.verificationDetails).toContain(`DEPENDENCY_UNVERIFIED:${targetPoolId}`);
+
+    // Non-blocking queue receives update without synchronous quote hot-path disk write
+    for (const route of changedRoutes) {
+      repo.queueRouteStateUpdate(route.routeId, route.state, route.verificationDetails);
+    }
+    expect(repo.getQueuedReadinessCount()).toBeGreaterThan(0);
+
+    // Flush asynchronously queued updates to SQLite
+    repo.flushSync();
+    expect(repo.getQueuedReadinessCount()).toBe(0);
+
+    // SQLite routes table now accurately reflects BLOCKED state and verification details
+    const storedAfterBlocked = repo.getRoute(targetRoute.routeId);
+    expect(storedAfterBlocked?.state).toBe('BLOCKED');
+    expect(storedAfterBlocked?.verificationDetails).toContain(`DEPENDENCY_UNVERIFIED:${targetPoolId}`);
+
+    // 3. Restore pool verification back to VERIFIED_DIRECT
+    const restoredRoutes = routeIndex.updatePoolStatus(targetPoolId, 'VERIFIED_DIRECT', Date.now());
+    expect(restoredRoutes.some(r => r.routeId === targetRoute.routeId)).toBe(true);
+
+    // In-memory RouteIndex is immediately restored to VERIFIED
+    const restoredRouteInMemory = routeIndex.getRouteById(targetRoute.routeId);
+    expect(restoredRouteInMemory?.state).toBe('VERIFIED');
+    expect(restoredRouteInMemory?.verificationDetails).toBeUndefined();
+
+    // Queue and flush to SQLite
+    for (const route of restoredRoutes) {
+      repo.queueRouteStateUpdate(route.routeId, route.state, route.verificationDetails);
+    }
+    repo.flushSync();
+
+    // SQLite routes table now accurately reflects restored VERIFIED state with blocker reason cleared
+    const storedAfterRestored = repo.getRoute(targetRoute.routeId);
+    expect(storedAfterRestored?.state).toBe('VERIFIED');
+    expect(storedAfterRestored?.verificationDetails).toBeUndefined();
+  });
+
+  it('Gate 1.4.20 - Lifecycle Transition Tracking: Accurately records peak READY count, READY-to-STALE transitions, and STALE-to-READY recoveries', () => {
+    const pools = poolRegistry.getAllPools();
+    const routeIndex = new RouteIndex(pools);
+    const directRoutes = routeIndex.getVerifiedDirectRoutes();
+    expect(directRoutes.length).toBeGreaterThanOrEqual(2);
+
+    const routeA = directRoutes[0];
+    const routeB = directRoutes[1];
+
+    // Initial transition stats
+    expect(routeIndex.getLifecycleTransitionStats()).toEqual({
+      readyToStaleTransitions: 0,
+      staleToReadyRecoveries: 0,
+      peakReadyCount: 0
+    });
+
+    // 1. Mark Route A and Route B READY -> Peak count becomes 2
+    routeIndex.setRouteReady(routeA.routeId, { expectedNetUSDC: '0.500000', timestamp: Date.now() });
+    expect(routeIndex.getLifecycleTransitionStats().peakReadyCount).toBe(1);
+
+    routeIndex.setRouteReady(routeB.routeId, { expectedNetUSDC: '0.600000', timestamp: Date.now() });
+    expect(routeIndex.getLifecycleTransitionStats().peakReadyCount).toBe(2);
+
+    // 2. Mark Route A STALE -> readyToStaleTransitions increments
+    routeIndex.setRouteStale(routeA.routeId, 'EXPIRED_QUOTE');
+    expect(routeIndex.getLifecycleTransitionStats().readyToStaleTransitions).toBe(1);
+
+    // 3. Expire Route B via expireStaleReadyRoutes -> readyToStaleTransitions increments again
+    const expired = routeIndex.expireStaleReadyRoutes(() => undefined);
+    expect(expired.some(r => r.routeId === routeB.routeId)).toBe(true);
+    expect(routeIndex.getLifecycleTransitionStats().readyToStaleTransitions).toBe(2);
+
+    // 4. Restore Route A from STALE back to READY -> staleToReadyRecoveries increments
+    const now = Date.now();
+    const restored = routeIndex.validateAndRestoreRoute(
+      routeA.routeId,
+      () => ({ receivedAt: now, slot: 500, feedHealth: 'HEALTHY' }),
+      2500,
+      10,
+      501
+    );
+    expect(restored).toBe(true);
+    expect(routeIndex.getLifecycleTransitionStats().staleToReadyRecoveries).toBe(1);
+    expect(routeIndex.getLifecycleTransitionStats().peakReadyCount).toBe(2);
+  });
 });
