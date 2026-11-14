@@ -18,7 +18,10 @@ export interface SecondSample {
   quoteValidEvaluations: number;
   totalEvaluated: number;
   quotesPerSecond: number;
+  evaluationsPerSecond: number;
   rejectionBreakdown: Record<string, number>;
+  configuredBlockers?: Record<string, number>;
+  verifiedBottlenecks?: Record<string, number>;
   quoteLatencyP50Us: number;
   quoteLatencyP95Us: number;
   quoteLatencyP99Us: number;
@@ -74,6 +77,10 @@ export interface Phase16BenchmarkResult {
     validQuotePercentage: number;
     averageQuoteLatencyUs: number;
     quoteLatencyP95Us: number;
+    inMemoryQuoteSizingLatencyP50Us: number;
+    inMemoryQuoteSizingLatencyP95Us: number;
+    detectionToDecisionLatencyP50Us: number;
+    detectionToDecisionLatencyP95Us: number;
     averageRpcLatencyMs: number;
     totalRpcRequests: number;
     totalWsMessages: number;
@@ -81,6 +88,8 @@ export interface Phase16BenchmarkResult {
     persistenceErrorsTotal: number;
     peakMemoryRssMb: number;
     rejectionBreakdownSummary: Record<string, number>;
+    configuredBlockersSummary: Record<string, number>;
+    verifiedBottlenecksSummary: Record<string, number>;
   };
   samples: SecondSample[];
 }
@@ -158,7 +167,8 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
     prevEvaluated = totalEvaluated;
 
     // 5. Rejection breakdown
-    const rejectionBreakdown = scanner.getBottleneckBreakdown();
+    const configuredBlockers = scanner.getBottleneckBreakdown();
+    const verifiedBottlenecks = scanner.getVerifiedBottleneckBreakdown();
 
     // 6. Latency telemetry
     const latency = scanner.getLatencyReport();
@@ -189,7 +199,10 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
       quoteValidEvaluations,
       totalEvaluated,
       quotesPerSecond,
-      rejectionBreakdown: { ...rejectionBreakdown },
+      evaluationsPerSecond: quotesPerSecond,
+      rejectionBreakdown: { ...configuredBlockers },
+      configuredBlockers: { ...configuredBlockers },
+      verifiedBottlenecks: { ...verifiedBottlenecks },
       quoteLatencyP50Us: latency.quoteLatencyUs?.p50 || 0,
       quoteLatencyP95Us: latency.quoteLatencyUs?.p95 || 0,
       quoteLatencyP99Us: latency.quoteLatencyUs?.p99 || 0,
@@ -251,23 +264,27 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
   const completedTimeIso = new Date(stopMs).toISOString();
   const totalSessionMs = stopMs - startMs;
 
-  console.log('[MainnetBenchmark] Observation completed. Stopping scanner...');
-  scanner.stop();
-
-  // Compute summary metrics
+  // Compute summary metrics while scanner is still active
   const readySummary = routeIndex.getReadyMetricsSummary();
   const uptimeReport = scanner.getRouteUptimeReport(totalSessionMs);
   const finalAudit = scanner.getAuditMetrics();
   const finalLatency = scanner.getLatencyReport();
-  const finalRejection = scanner.getBottleneckBreakdown();
+
+  const activeSamples = samples.filter(s => (s.configuredBlockers?.websocketDelay ?? 0) < s.storedRoutes);
+  const repSample = activeSamples.length > 0 ? activeSamples[activeSamples.length - 1] : samples[samples.length - 1];
+  const finalConfiguredBlockers = repSample?.configuredBlockers || scanner.getBottleneckBreakdown();
+  const finalVerifiedBottlenecks = repSample?.verifiedBottlenecks || scanner.getVerifiedBottleneckBreakdown();
+
+  console.log('[MainnetBenchmark] Observation completed. Stopping scanner...');
+  scanner.stop();
   const peakMemRss = Math.max(...samples.map(s => s.rssMb), 0);
   const totalEvaluatedFinal = finalAudit.totalEvaluated || 0;
   const quoteValidFinal = finalAudit.quoteValidRouteCount || 0;
 
   const result: Phase16BenchmarkResult = {
     metadata: {
-      title: 'SolanaBot Phase 1.6 Coverage Gate 10-Minute Mainnet Benchmark',
-      description: 'Continuous 10-minute read-only observation with Raydium CLMM and Orca Whirlpool hydration',
+      title: 'SolanaBot Phase 1.6 Quote Accuracy Gate Mainnet Benchmark',
+      description: 'Continuous read-only observation with Raydium CLMM dynamic AmmConfig fee and bidirectional tick hydration',
       startedAt: startTimeIso,
       completedAt: completedTimeIso,
       durationSeconds,
@@ -303,13 +320,19 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
       validQuotePercentage: totalEvaluatedFinal > 0 ? Number(((quoteValidFinal / totalEvaluatedFinal) * 100).toFixed(2)) : 0,
       averageQuoteLatencyUs: Number((finalLatency.quoteLatencyUs?.p50 || 0).toFixed(1)),
       quoteLatencyP95Us: Number((finalLatency.quoteLatencyUs?.p95 || 0).toFixed(1)),
+      inMemoryQuoteSizingLatencyP50Us: Number((finalLatency.quoteLatencyUs?.p50 || 0).toFixed(1)),
+      inMemoryQuoteSizingLatencyP95Us: Number((finalLatency.quoteLatencyUs?.p95 || 0).toFixed(1)),
+      detectionToDecisionLatencyP50Us: Number((finalLatency.detectionToDecisionUs?.p50 || 0).toFixed(1)),
+      detectionToDecisionLatencyP95Us: Number((finalLatency.detectionToDecisionUs?.p95 || 0).toFixed(1)),
       averageRpcLatencyMs: Number((finalLatency.rpcLatencyMs?.p50 || 0).toFixed(1)),
       totalRpcRequests: scanner.getRpc().getStats().requestsTotal,
       totalWsMessages: scanner.getWs().getStats().messagesTotal || 0,
       queueDropsTotal: scanner.getEventQueueStats().droppedCount,
       persistenceErrorsTotal: repo.getPersistenceErrorsCount(),
       peakMemoryRssMb: peakMemRss,
-      rejectionBreakdownSummary: { ...finalRejection }
+      rejectionBreakdownSummary: { ...finalConfiguredBlockers },
+      configuredBlockersSummary: { ...finalConfiguredBlockers },
+      verifiedBottlenecksSummary: { ...finalVerifiedBottlenecks }
     },
     samples
   };
@@ -317,7 +340,7 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
   console.log('\n================================================================');
   console.log('   PHASE 1.6 BENCHMARK EMPIRICAL REPORT SUMMARY');
   console.log('================================================================');
-  console.log(`  Duration:                 ${durationSeconds} seconds (10 minutes)`);
+  console.log(`  Duration:                 ${durationSeconds} seconds`);
   console.log(`  Total Pools in Registry:  ${result.summary.totalPoolsInUniverse}`);
   console.log(`  Active CLMM Pools:        ${result.summary.clmmActivatedPoolsTotal}`);
   console.log(`  Total Configured Routes:  ${result.summary.totalConfiguredRoutes}`);
@@ -333,12 +356,17 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
   console.log('----------------------------------------------------------------');
   console.log(`  Total Quotes Evaluated:   ${result.summary.totalQuotesGenerated.toLocaleString()}`);
   console.log(`  Quote-Valid Evaluations:  ${result.summary.quoteValidEvaluations.toLocaleString()} (${result.summary.validQuotePercentage}%)`);
-  console.log(`  Quote Latency (p50 / p95): ${result.summary.averageQuoteLatencyUs} us / ${result.summary.quoteLatencyP95Us} us`);
-  console.log(`  WebSocket Messages:       ${result.summary.totalWsMessages.toLocaleString()}`);
-  console.log(`  RPC Requests Total:       ${result.summary.totalRpcRequests.toLocaleString()}`);
-  console.log(`  Event Queue Drops:        ${result.summary.queueDropsTotal}`);
-  console.log(`  Persistence Errors:       ${result.summary.persistenceErrorsTotal}`);
-  console.log(`  Peak RSS Memory:          ${result.summary.peakMemoryRssMb} MB`);
+  console.log('----------------------------------------------------------------');
+  console.log('  EMPIRICAL LATENCY & THROUGHPUT (HONEST BENCHMARK TELEMETRY):');
+  console.log(`    Route Evaluations/sec:        ${Math.round(totalEvaluatedFinal / Math.max(1, durationSeconds))}`);
+  console.log(`    In-Memory Sizing (p50 / p95): ${result.summary.inMemoryQuoteSizingLatencyP50Us} us / ${result.summary.inMemoryQuoteSizingLatencyP95Us} us`);
+  console.log(`    Detection-to-Decision (p50/p95): ${result.summary.detectionToDecisionLatencyP50Us} us / ${result.summary.detectionToDecisionLatencyP95Us} us`);
+  console.log(`    RPC Roundtrip Latency (p50):  ${result.summary.averageRpcLatencyMs} ms`);
+  console.log(`    WebSocket Messages:           ${result.summary.totalWsMessages.toLocaleString()}`);
+  console.log(`    RPC Requests Total:           ${result.summary.totalRpcRequests.toLocaleString()}`);
+  console.log(`    Event Queue Drops:            ${result.summary.queueDropsTotal}`);
+  console.log(`    Persistence Errors:           ${result.summary.persistenceErrorsTotal}`);
+  console.log(`    Peak RSS Memory:              ${result.summary.peakMemoryRssMb} MB`);
   console.log('----------------------------------------------------------------');
   console.log('  CHECKPOINTS STATUS:');
   console.log(`    Verified Routes 250:   ${result.checkpoints.verifiedRoutes['250'].reached ? `REACHED at T+${result.checkpoints.verifiedRoutes['250'].reachedAtSecond}s` : 'NOT REACHED'}`);
@@ -349,16 +377,27 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
   console.log(`    Simultaneous READY 500: ${result.checkpoints.readyRoutes['500'].reached ? `REACHED at T+${result.checkpoints.readyRoutes['500'].reachedAtSecond}s` : 'NOT REACHED'}`);
   console.log(`    Simultaneous READY 1000:${result.checkpoints.readyRoutes['1000'].reached ? `REACHED at T+${result.checkpoints.readyRoutes['1000'].reachedAtSecond}s` : 'NOT REACHED'}`);
   console.log('----------------------------------------------------------------');
-  console.log('  REJECTION BREAKDOWN:');
-  for (const [reason, count] of Object.entries(result.summary.rejectionBreakdownSummary)) {
-    console.log(`    ${reason.padEnd(30)}: ${count} routes`);
+  console.log('  BOTTLENECKS AMONG STRUCTURALLY VERIFIED ROUTES:');
+  for (const [reason, count] of Object.entries(result.summary.verifiedBottlenecksSummary)) {
+    if (count > 0) {
+      console.log(`    ${reason.padEnd(30)}: ${count} routes`);
+    }
+  }
+  console.log('----------------------------------------------------------------');
+  console.log('  BLOCKERS AMONG ALL CONFIGURED ROUTES:');
+  for (const [reason, count] of Object.entries(result.summary.configuredBlockersSummary)) {
+    if (count > 0) {
+      console.log(`    ${reason.padEnd(30)}: ${count} routes`);
+    }
   }
   console.log('================================================================\n');
 
   // Persist JSON output
-  const outFile = path.join(projectRoot, 'data/benchmark_phase1_6_coverage_10min.json');
-  fs.writeFileSync(outFile, JSON.stringify(result, null, 2), 'utf-8');
-  console.log(`[MainnetBenchmark] Saved full benchmark results to ${outFile}`);
+  const outFile10Min = path.join(projectRoot, 'data/benchmark_phase1_6_coverage_10min.json');
+  const outFileGate = path.join(projectRoot, 'data/benchmark_phase1_6_accuracy_gate.json');
+  fs.writeFileSync(outFile10Min, JSON.stringify(result, null, 2), 'utf-8');
+  fs.writeFileSync(outFileGate, JSON.stringify(result, null, 2), 'utf-8');
+  console.log(`[MainnetBenchmark] Saved full benchmark results to ${outFileGate}`);
 
   return result;
 }

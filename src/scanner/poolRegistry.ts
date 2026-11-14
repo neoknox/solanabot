@@ -138,7 +138,7 @@ export class PoolRegistry {
       initialLiquidityUsd: 4000000,
       description: 'Raydium CLMM SOL/USDC',
       verificationStatus: 'QUOTE_UNVERIFIED',
-      blockerReason: 'PENDING_ORDERBOOK_STREAMING',
+      blockerReason: 'PENDING_RUNTIME_VERIFICATION',
       lastVerifiedAt: 0
     });
 
@@ -259,6 +259,13 @@ export class PoolRegistry {
           listener(id, status, blockerReason, pool.lastVerifiedAt);
         } catch {}
       }
+    }
+  }
+
+  public updatePoolFee(id: string, feeBps: number): void {
+    const pool = this.pools.get(id);
+    if (pool) {
+      pool.feeBps = feeBps;
     }
   }
 

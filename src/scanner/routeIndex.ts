@@ -1378,7 +1378,6 @@ export class RouteIndex {
         }
 
         if (
-          poolCfg.dex === 'RAYDIUM_CLMM' ||
           poolCfg.dex === 'PHOENIX' ||
           poolCfg.blockerReason === 'UNSUPPORTED_PRICING_ADAPTER_CLMM' ||
           poolCfg.blockerReason === 'PENDING_ORDERBOOK_STREAMING'
@@ -1397,6 +1396,8 @@ export class RouteIndex {
         if (poolCfg.verificationStatus !== 'VERIFIED_DIRECT') {
           if (poolCfg.blockerReason === 'MISSING_TICK_DATA') {
             breakdown.missingTickArrays++;
+          } else if (poolCfg.blockerReason === 'MISSING_AMM_CONFIG') {
+            breakdown.incompletePricing++;
           } else if (
             poolCfg.blockerReason === 'UNHYDRATED_VAULTS' ||
             poolCfg.blockerReason === 'RAYDIUM_AMM_V4_ADAPTER_PENDING' ||
@@ -1426,7 +1427,7 @@ export class RouteIndex {
           }
         }
 
-        if (poolState.dex === 'ORCA_WHIRLPOOL') {
+        if (poolState.dex === 'ORCA_WHIRLPOOL' || poolState.dex === 'RAYDIUM_CLMM') {
           const extra = poolState.extraData as any;
           if (!extra?.tickArrays || Object.keys(extra.tickArrays).length === 0) {
             breakdown.missingTickArrays++;
@@ -1461,6 +1462,105 @@ export class RouteIndex {
         } else {
           breakdown.other++;
         }
+      }
+    }
+
+    return breakdown;
+  }
+
+  public getVerifiedBottleneckBreakdown(
+    getPoolState: (poolId: string) => { dex: string; reserveA?: bigint; reserveB?: bigint; extraData?: any; receivedAt?: number; slot?: number } | undefined,
+    currentSlot?: number,
+    wsConnected: boolean = true
+  ): RouteBottleneckBreakdown {
+    const breakdown: RouteBottleneckBreakdown = {
+      unverifiedPool: 0,
+      unsupportedAdapter: 0,
+      missingTickArrays: 0,
+      missingVaultOrOpenOrders: 0,
+      expiredQuote: 0,
+      expiredPoolObservation: 0,
+      slotMismatch: 0,
+      websocketDelay: 0,
+      rpcHydrationFailure: 0,
+      incompletePricing: 0,
+      insufficientLiquidity: 0,
+      other: 0
+    };
+
+    const verifiedRoutes = this.getVerifiedRoutes().filter(r => r.state !== 'READY');
+    const now = Date.now();
+
+    for (const route of verifiedRoutes) {
+      if (!wsConnected) {
+        breakdown.websocketDelay++;
+        continue;
+      }
+
+      let classified = false;
+      const legPoolStates = route.legs.map(l => getPoolState(l.poolId));
+
+      for (let i = 0; i < route.legs.length; i++) {
+        const poolState = legPoolStates[i];
+        if (!poolState) {
+          breakdown.rpcHydrationFailure++;
+          classified = true;
+          break;
+        }
+
+        if (poolState.receivedAt && now - poolState.receivedAt > 2500) {
+          breakdown.expiredPoolObservation++;
+          classified = true;
+          break;
+        }
+
+        if (poolState.dex === 'ORCA_WHIRLPOOL' || poolState.dex === 'RAYDIUM_CLMM') {
+          const extra = poolState.extraData as any;
+          if (!extra?.tickArrays || Object.keys(extra.tickArrays).length === 0) {
+            breakdown.missingTickArrays++;
+            classified = true;
+            break;
+          }
+          if (extra.tickArrayReceivedAt) {
+            const hasStale = Object.values(extra.tickArrayReceivedAt as Record<number, number>).some(t => now - t > 2500);
+            if (hasStale) {
+              breakdown.missingTickArrays++;
+              classified = true;
+              break;
+            }
+          }
+        }
+
+        if (poolState.dex === 'RAYDIUM_AMM') {
+          if ((poolState.reserveA ?? 0n) <= 0n || (poolState.reserveB ?? 0n) <= 0n) {
+            breakdown.insufficientLiquidity++;
+            classified = true;
+            break;
+          }
+        }
+      }
+
+      if (classified) continue;
+
+      // Slot mismatch between legs
+      const slots = legPoolStates.map(p => p?.slot).filter((s): s is number => s !== undefined && s > 0);
+      if (slots.length >= 2) {
+        const minSlot = Math.min(...slots);
+        const maxSlot = Math.max(...slots);
+        if (maxSlot - minSlot > 10) {
+          breakdown.slotMismatch++;
+          continue;
+        }
+      }
+
+      if (route.lastQuoteTimestamp) {
+        if (now - route.lastQuoteTimestamp > 2500) {
+          breakdown.expiredQuote++;
+        } else {
+          breakdown.other++;
+        }
+      } else {
+        breakdown.incompletePricing++;
       }
     }
 

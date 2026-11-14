@@ -46,8 +46,14 @@ import {
   deriveRaydiumClmmTickArrayPda,
   decodeRaydiumClmmTickArray,
   getSurroundingRaydiumClmmTickArrayStartIndices,
+  getBidirectionalRaydiumClmmTickArrayStartIndices,
   getRequiredRaydiumClmmTickArrayStartIndices
 } from '../dex/raydiumClmmTickArray.js';
+import {
+  RaydiumClmmAmmConfig,
+  decodeRaydiumClmmAmmConfig,
+  RAYDIUM_CLMM_AMM_CONFIG_SIZE
+} from '../dex/raydiumClmmAmmConfig.js';
 import { KNOWN_PROGRAM_IDS } from '../config/index.js';
 
 export type CandidateListener = (candidate: ArbitrageCandidate) => void;
@@ -83,6 +89,8 @@ export class ArbitrageScanner {
   private vaultToPool = new Map<string, { poolId: string; isA: boolean }>();
   private openOrdersToPool = new Map<string, string>();
   private tickArrayToPool = new Map<string, { poolId: string; startTickIndex: number; isClmm?: boolean }>();
+  private ammConfigCache = new Map<string, RaydiumClmmAmmConfig>();
+  private ammConfigToPools = new Map<string, Set<string>>();
   private subscribedAccounts = new Set<string>();
 
   private qualifiedCount = 0;
@@ -369,6 +377,8 @@ export class ArbitrageScanner {
           this.processOpenOrdersAccountUpdate(update);
         } else if (update.type === 'TICK_ARRAY_ACCOUNT') {
           this.processTickArrayAccountUpdate(update);
+        } else if (update.type === 'AMM_CONFIG_ACCOUNT') {
+          this.processAmmConfigAccountUpdate(update);
         }
       }
     } finally {
@@ -434,6 +444,29 @@ export class ArbitrageScanner {
           }
           if (oldExtra.tickArrayReceivedAt) {
             newExtra.tickArrayReceivedAt = oldExtra.tickArrayReceivedAt;
+          }
+        }
+
+        if (decoded.dex === 'RAYDIUM_CLMM' && existing.extraData && decoded.extraData) {
+          if (decoded.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) decoded.reserveA = existing.reserveA;
+          if (decoded.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) decoded.reserveB = existing.reserveB;
+          const oldExtra = existing.extraData as any;
+          const newExtra = decoded.extraData as any;
+          if (oldExtra.tickArrays) {
+            newExtra.tickArrays = oldExtra.tickArrays;
+          }
+          if (oldExtra.tickArraySlots) {
+            newExtra.tickArraySlots = oldExtra.tickArraySlots;
+          }
+          if (oldExtra.tickArrayReceivedAt) {
+            newExtra.tickArrayReceivedAt = oldExtra.tickArrayReceivedAt;
+          }
+          if (oldExtra.tradeFeeRate !== undefined) {
+            newExtra.tradeFeeRate = oldExtra.tradeFeeRate;
+            decoded.feeBps = Math.round(oldExtra.tradeFeeRate / 100);
+          }
+          if (oldExtra.ammConfigData) {
+            newExtra.ammConfigData = oldExtra.ammConfigData;
           }
         }
 
@@ -799,6 +832,42 @@ export class ArbitrageScanner {
     const { hasChanged } = this.stateCache.setPoolState(pool);
     if (hasChanged) {
       this.evaluateAffectedRoutes(mapping.poolId, update.monotonicReceiptTime);
+    }
+  }
+
+  private processAmmConfigAccountUpdate(update: QueuedAccountUpdate): void {
+    const now = Date.now();
+    if (!update.slot || update.slot <= 0 || !update.receivedAtMs || update.receivedAtMs > now + 5000) {
+      return;
+    }
+
+    const decoded = decodeRaydiumClmmAmmConfig(
+      update.data,
+      update.key,
+      update.slot,
+      update.receivedAtMs,
+      KNOWN_PROGRAM_IDS.RAYDIUM_CLMM
+    );
+    if (!decoded) return;
+
+    this.ammConfigCache.set(update.key, decoded);
+
+    const linkedPools = this.ammConfigToPools.get(update.key);
+    if (linkedPools) {
+      for (const poolId of linkedPools) {
+        const pool = this.stateCache.getPoolState(poolId);
+        if (pool && pool.dex === 'RAYDIUM_CLMM' && pool.extraData) {
+          const extra = pool.extraData as any;
+          extra.tradeFeeRate = decoded.tradeFeeRate;
+          extra.ammConfigData = decoded;
+          pool.feeBps = Math.round(decoded.tradeFeeRate / 100);
+          this.poolRegistry.updatePoolFee(poolId, pool.feeBps);
+          const { hasChanged } = this.stateCache.setPoolState(pool);
+          if (hasChanged) {
+            this.evaluateAffectedRoutes(poolId, update.monotonicReceiptTime);
+          }
+        }
+      }
     }
   }
 
@@ -1409,6 +1478,7 @@ export class ArbitrageScanner {
       const decodedPools: PoolState[] = [];
       const vaultsToFetch: { pubkey: PublicKey; poolIndex: number; isA: boolean }[] = [];
       const openOrdersToFetch: { pubkey: PublicKey; poolIndex: number; expectedOwner: string }[] = [];
+      const ammConfigsToFetch: { pubkey: PublicKey; poolIndex: number; configId: string }[] = [];
 
       for (let i = 0; i < pools.length; i++) {
         const poolConfig = pools[i];
@@ -1481,6 +1551,44 @@ export class ArbitrageScanner {
                 poolIndex: decodedPools.length,
                 expectedOwner: extra.marketProgramId || 'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX'
               });
+            }
+
+            if (poolConfig.dex === 'RAYDIUM_CLMM' && extra?.ammConfig) {
+              const cfgId = extra.ammConfig;
+              let poolSet = this.ammConfigToPools.get(cfgId);
+              if (!poolSet) {
+                poolSet = new Set<string>();
+                this.ammConfigToPools.set(cfgId, poolSet);
+              }
+              poolSet.add(decoded.id);
+
+              if (!this.subscribedAccounts.has(cfgId)) {
+                this.subscribedAccounts.add(cfgId);
+                this.ws.subscribeAccount(cfgId, (buf, s, rxTime, monoTime) => {
+                  this.enqueueUpdate({
+                    type: 'AMM_CONFIG_ACCOUNT',
+                    key: cfgId,
+                    data: buf,
+                    slot: s,
+                    receivedAtMs: rxTime || Date.now(),
+                    monotonicReceiptTime: monoTime || performance.now()
+                  });
+                });
+              }
+
+              const cached = this.ammConfigCache.get(cfgId);
+              if (cached) {
+                extra.tradeFeeRate = cached.tradeFeeRate;
+                extra.ammConfigData = cached;
+                decoded.feeBps = Math.round(cached.tradeFeeRate / 100);
+                this.poolRegistry.updatePoolFee(decoded.id, decoded.feeBps);
+              } else {
+                ammConfigsToFetch.push({
+                  pubkey: new PublicKey(cfgId),
+                  poolIndex: decodedPools.length,
+                  configId: cfgId
+                });
+              }
             }
 
             if (vaultA && vaultB) {
@@ -1692,6 +1800,60 @@ export class ArbitrageScanner {
         }
       }
 
+      // Step 3.5: Batch fetch and validate AmmConfig accounts for Raydium CLMM pools
+      if (ammConfigsToFetch.length > 0) {
+        try {
+          const cfgStart = performance.now();
+          const cfgRes = await this.rpc.getMultipleAccountsAndContext(ammConfigsToFetch.map(c => c.pubkey));
+          this.latencyTracker.recordRpcLatency(performance.now() - cfgStart);
+          const cfgSlot = cfgRes.slot;
+          const cfgAccounts = cfgRes.value;
+
+          for (let i = 0; i < ammConfigsToFetch.length; i++) {
+            const item = ammConfigsToFetch[i];
+            const acc = cfgAccounts[i];
+            const pool = decodedPools[item.poolIndex];
+            if (!pool) continue;
+
+            const extra = (pool.extraData || {}) as any;
+
+            if (!acc || !acc.data) {
+              this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'MISSING_AMM_CONFIG');
+              this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+              continue;
+            }
+
+            const ownerStr = acc.owner ? acc.owner.toBase58() : '';
+            if (ownerStr !== KNOWN_PROGRAM_IDS.RAYDIUM_CLMM) {
+              this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'INVALID_AMM_CONFIG_OWNER');
+              this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+              continue;
+            }
+
+            const decodedConfig = decodeRaydiumClmmAmmConfig(
+              acc.data,
+              item.configId,
+              cfgSlot,
+              Date.now(),
+              KNOWN_PROGRAM_IDS.RAYDIUM_CLMM
+            );
+
+            if (decodedConfig) {
+              this.ammConfigCache.set(item.configId, decodedConfig);
+              extra.tradeFeeRate = decodedConfig.tradeFeeRate;
+              extra.ammConfigData = decodedConfig;
+              pool.feeBps = Math.round(decodedConfig.tradeFeeRate / 100);
+              this.poolRegistry.updatePoolFee(pool.id, pool.feeBps);
+            } else {
+              this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'INVALID_AMM_CONFIG_LAYOUT');
+              this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
+            }
+          }
+        } catch (cfgErr) {
+          console.warn('[refreshAllPoolStates] AmmConfig fetch error:', cfgErr);
+        }
+      }
+
       // Step 4: Batch fetch and subscribe to nearby initialized TickArrays for Orca Whirlpool & Raydium CLMM pools
       const tickArraysToFetch: { pda: PublicKey; poolIndex: number; startTickIndex: number; poolId: string; isClmm: boolean }[] = [];
       for (let pIdx = 0; pIdx < decodedPools.length; pIdx++) {
@@ -1704,7 +1866,7 @@ export class ArbitrageScanner {
           if (tickCurrent !== undefined) {
             if (!extra.tickArrays) extra.tickArrays = {};
             const surroundingStarts = isClmm
-              ? getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing)
+              ? getBidirectionalRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing)
               : getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
             for (const startIdx of surroundingStarts) {
               const pda = isClmm
@@ -1803,12 +1965,15 @@ export class ArbitrageScanner {
               return arr && t && (now - t <= ttl) && s && Math.abs(snapshotSlot - s) <= 100;
             });
 
-            if (allSurroundingPresent) {
+            const clmmFeeOk = !isClmm || extra.tradeFeeRate !== undefined;
+
+            if (allSurroundingPresent && clmmFeeOk) {
               delete extra.unverifiedReason;
               this.poolRegistry.updatePoolVerification(pool.id, 'VERIFIED_DIRECT');
               this.routeIndex.updatePoolStatus(pool.id, 'VERIFIED_DIRECT');
             } else if (!this.poolRegistry.isPoolVerified(pool.id)) {
-              this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'MISSING_TICK_DATA');
+              const blocker = !clmmFeeOk ? 'MISSING_AMM_CONFIG' : 'MISSING_TICK_DATA';
+              this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', blocker);
               this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
             }
           }
@@ -2132,6 +2297,14 @@ export class ArbitrageScanner {
     );
   }
 
+  public getVerifiedBottleneckBreakdown() {
+    return this.routeIndex.getVerifiedBottleneckBreakdown(
+      (id) => this.stateCache.getPoolState(id),
+      this.ws.getCurrentSlot(),
+      this.ws.getHealth() !== 'DISCONNECTED'
+    );
+  }
+
   public getQuoteAgeDistribution() {
     return this.routeIndex.getQuoteAgeDistribution();
   }
@@ -2340,7 +2513,54 @@ export class ArbitrageScanner {
           return 'FAILED';
         }
 
-        // 5. Resolve required account dependencies (Tick Arrays)
+        // 5. Resolve required account dependencies (AmmConfig & Tick Arrays)
+        if (isClmm && extra?.ammConfig) {
+          const cfgId = extra.ammConfig;
+          let poolSet = this.ammConfigToPools.get(cfgId);
+          if (!poolSet) {
+            poolSet = new Set<string>();
+            this.ammConfigToPools.set(cfgId, poolSet);
+          }
+          poolSet.add(pool.id);
+
+          if (!this.subscribedAccounts.has(cfgId)) {
+            this.subscribedAccounts.add(cfgId);
+            this.ws.subscribeAccount(cfgId, (buf, s, rxTime, monoTime) => {
+              this.enqueueUpdate({
+                type: 'AMM_CONFIG_ACCOUNT',
+                key: cfgId,
+                data: buf,
+                slot: s,
+                receivedAtMs: rxTime || Date.now(),
+                monotonicReceiptTime: monoTime || performance.now()
+              });
+            });
+          }
+
+          let cfg = this.ammConfigCache.get(cfgId);
+          if (!cfg) {
+            try {
+              const cfgRes = await this.rpc.getMultipleAccountsAndContext([new PublicKey(cfgId)]);
+              const acc = cfgRes.value[0];
+              if (acc && acc.data && (!acc.owner || acc.owner.toBase58() === KNOWN_PROGRAM_IDS.RAYDIUM_CLMM)) {
+                cfg = decodeRaydiumClmmAmmConfig(acc.data, cfgId, cfgRes.slot, Date.now(), KNOWN_PROGRAM_IDS.RAYDIUM_CLMM) || undefined;
+                if (cfg) {
+                  this.ammConfigCache.set(cfgId, cfg);
+                }
+              }
+            } catch (err) {
+              console.warn(`[hotActivateDiscoveredPool] Failed to fetch AmmConfig ${cfgId}:`, err);
+            }
+          }
+
+          if (cfg) {
+            extra.tradeFeeRate = cfg.tradeFeeRate;
+            extra.ammConfigData = cfg;
+            decoded.feeBps = Math.round(cfg.tradeFeeRate / 100);
+            this.poolRegistry.updatePoolFee(pool.id, decoded.feeBps);
+          }
+        }
+
         let allSurroundingPresent = false;
         if (tickCurrent !== undefined) {
           if (!extra.tickArrays) extra.tickArrays = {};
@@ -2348,7 +2568,7 @@ export class ArbitrageScanner {
           if (!extra.tickArrayReceivedAt) extra.tickArrayReceivedAt = {};
 
           const surroundingStarts = isClmm
-            ? getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing)
+            ? getBidirectionalRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing)
             : getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
           const pdaPubkeys: PublicKey[] = [];
           const startIndices: number[] = [];
@@ -2413,12 +2633,15 @@ export class ArbitrageScanner {
             return arr && t && (now - t <= ttl) && s && Math.abs(snapshotSlot - s) <= 100;
           });
 
-          if (allSurroundingPresent) {
+          const clmmFeeOk = !isClmm || extra.tradeFeeRate !== undefined;
+
+          if (allSurroundingPresent && clmmFeeOk) {
             delete extra.unverifiedReason;
             this.poolRegistry.updatePoolVerification(pool.id, 'VERIFIED_DIRECT');
             this.routeIndex.updatePoolStatus(pool.id, 'VERIFIED_DIRECT');
           } else {
-            this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'MISSING_TICK_DATA');
+            const blocker = !clmmFeeOk ? 'MISSING_AMM_CONFIG' : 'MISSING_TICK_DATA';
+            this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', blocker);
             this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
           }
         }
@@ -2426,7 +2649,9 @@ export class ArbitrageScanner {
         decoded.receivedAt = Date.now();
         this.stateCache.setPoolState(decoded);
 
-        if (allSurroundingPresent) {
+        const isFullyReady = allSurroundingPresent && (!isClmm || extra.tradeFeeRate !== undefined);
+
+        if (isFullyReady) {
           this.evaluateAffectedRoutes(pool.id, performance.now());
           return 'ACTIVATED';
         } else {

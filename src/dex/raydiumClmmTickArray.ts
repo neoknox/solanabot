@@ -93,6 +93,26 @@ export function getSurroundingRaydiumClmmTickArrayStartIndices(
 }
 
 /**
+ * Calculates bidirectional tick array start indices covering BOTH swap directions
+ * (2 arrays down, current array, and 2 arrays up): [S0 - 2Δ, S0 - Δ, S0, S0 + Δ, S0 + 2Δ].
+ * Resolves all arrays needed by either zeroForOne or oneForZero traversal.
+ */
+export function getBidirectionalRaydiumClmmTickArrayStartIndices(
+  tickCurrent: number,
+  tickSpacing: number
+): number[] {
+  const currentStart = getRaydiumClmmArrayStartIndex(tickCurrent, tickSpacing);
+  const span = RAYDIUM_CLMM_TICK_ARRAY_SIZE * tickSpacing;
+  return [
+    currentStart - 2 * span,
+    currentStart - span,
+    currentStart,
+    currentStart + span,
+    currentStart + 2 * span
+  ];
+}
+
+/**
  * Decodes a raw Solana account buffer into a validated RaydiumClmmTickArray.
  * Verifies account size (>= 10,240 bytes), pool ID match, and tick structure.
  */

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { PublicKey } from '@solana/web3.js';
 import { tickIndexToSqrtPrice, swapQuoteByInputToken, TickArrayFacade } from '@orca-so/whirlpools-core';
 import { OrcaWhirlpoolAdapter } from '../src/dex/orcaWhirlpoolAdapter.js';
@@ -442,8 +442,24 @@ describe('Pricing Safety & State Integrity Closeout Suite', () => {
     const adapter = new OrcaWhirlpoolAdapter();
     const realisticLiquidity = 50000000000n; // 50B units concentrated liquidity
     const sqrtPriceVal = 5267471982609597336n; // activeTick -25068
-    const now = Date.now();
+    let now = Date.now();
     const slot = 468700000;
+
+    beforeEach(() => {
+      now = Date.now();
+      poolD1.receivedAt = now;
+      (poolD1.extraData as any).tickArrayReceivedAt = {
+        [-25344]: now,
+        [-24992]: now,
+        [-24640]: now
+      };
+      poolD2.receivedAt = now;
+      (poolD2.extraData as any).tickArrayReceivedAt = {
+        [-25344]: now,
+        [-25696]: now,
+        [-26048]: now
+      };
+    });
 
     // Direction 1 Arrays (active tick -25068 in -25344, price moving up: -25344 -> -24992 -> -24640):
     // 1. tick -25040 has +25B liquidityNet (requires ~20.00 USDC to reach)

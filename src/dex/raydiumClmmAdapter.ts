@@ -13,8 +13,9 @@ import {
   RaydiumClmmTickArray,
   RaydiumClmmTickState,
   RAYDIUM_CLMM_TICK_ARRAY_SIZE,
-  getRequiredRaydiumClmmTickArrayStartIndices
+  getRaydiumClmmArrayStartIndex
 } from './raydiumClmmTickArray.js';
+import { RaydiumClmmAmmConfig } from './raydiumClmmAmmConfig.js';
 
 const FEE_RATE_DENOMINATOR = 1_000_000n; // Raydium CLMM fee rate in parts per million (10^-6)
 const Q128 = 1n << 128n;
@@ -71,7 +72,7 @@ export class RaydiumClmmAdapter implements DexAdapter {
         tokenBDecimals: mintDecimals1,
         reserveA: 0n,
         reserveB: 0n,
-        feeBps: 25,
+        feeBps: 0, // Dynamic: updated from verified on-chain AmmConfig
         slot,
         receivedAt: Date.now(),
         liquidityUsd: 0,
@@ -86,8 +87,8 @@ export class RaydiumClmmAdapter implements DexAdapter {
           tickSpacing,
           liquidity: liquidity.toString(),
           sqrtPrice: sqrtPriceX64.toString(),
-          tickCurrent,
-          feeRate: 2500
+          tickCurrent
+          // tradeFeeRate populated when on-chain AmmConfig is resolved
         }
       };
     } catch {
@@ -108,9 +109,18 @@ export class RaydiumClmmAdapter implements DexAdapter {
       return null;
     }
 
-    // Existing quote freshness checks: 2,500ms max age
     const now = Date.now();
-    if (pool.receivedAt && now - pool.receivedAt > 2500) {
+
+    // Strict Freshness: Require valid timestamp and slot metadata on pool
+    if (!pool.receivedAt || now - pool.receivedAt > 2500 || pool.receivedAt > now + 5000) {
+      this.lastFailureReason = 'STALE_QUOTE';
+      return null;
+    }
+    if (!pool.slot || pool.slot <= 0) {
+      this.lastFailureReason = 'QUOTE_UNVERIFIED';
+      return null;
+    }
+    if (pool.feedHealth && pool.feedHealth !== 'HEALTHY') {
       this.lastFailureReason = 'STALE_QUOTE';
       return null;
     }
@@ -120,12 +130,25 @@ export class RaydiumClmmAdapter implements DexAdapter {
       sqrtPrice?: string;
       tickCurrent?: number;
       tickSpacing?: number;
+      tradeFeeRate?: number;
+      ammConfigData?: RaydiumClmmAmmConfig;
       feeRate?: number;
       maxPriceImpactBps?: number;
       tickArrays?: Record<number, RaydiumClmmTickArray>;
       tickArrayReceivedAt?: Record<number, number>;
       tickArraySlots?: Record<number, number>;
     } | undefined;
+
+    // Resolve dynamic pool fee from verified on-chain AmmConfig (fails closed if missing or invalid)
+    const tradeFeeRate =
+      extra?.tradeFeeRate ??
+      extra?.ammConfigData?.tradeFeeRate ??
+      (extra?.feeRate !== undefined ? extra.feeRate : (pool.feeBps ? pool.feeBps * 100 : undefined));
+
+    if (tradeFeeRate === undefined || tradeFeeRate < 0 || tradeFeeRate > 1_000_000) {
+      this.lastFailureReason = 'QUOTE_UNVERIFIED';
+      return null;
+    }
 
     const liquidity = BigInt(extra?.liquidity || '0');
     const sqrtPrice = BigInt(extra?.sqrtPrice || '0');
@@ -148,175 +171,275 @@ export class RaydiumClmmAdapter implements DexAdapter {
     const isInputA = inputMint === pool.tokenAMint;
     const zeroForOne = isInputA;
     const outputMint = isInputA ? pool.tokenBMint : pool.tokenAMint;
-    const direction = zeroForOne ? 'A_TO_B' : 'B_TO_A';
 
-    // Fee rate in ppm (10^-6). E.g., 25 bps = 2500 ppm, 1 bps = 100 ppm
-    const feeRate = extra?.feeRate ?? (pool.feeBps ? pool.feeBps * 100 : 2500);
-    const feeRateBigInt = BigInt(feeRate);
-
-    // Exact pool fee calculation: fee is deducted from input (ceil)
-    const totalFee = (amountIn * feeRateBigInt + (FEE_RATE_DENOMINATOR - 1n)) / FEE_RATE_DENOMINATOR;
-    const netAmountIn = amountIn - totalFee;
-
-    if (netAmountIn <= 0n) {
-      this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
-      return null;
-    }
-
-    // Required tick array hydration & validation
     const loadedTickArrays = extra?.tickArrays;
-    const requiredStartIndices = getRequiredRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing, direction);
-
     if (!loadedTickArrays) {
       this.lastFailureReason = 'MISSING_TICK_DATA';
       return null;
     }
 
     const getTickArray = (idx: number): RaydiumClmmTickArray | undefined => {
-      if (loadedTickArrays instanceof Map) return loadedTickArrays.get(idx);
+      if (loadedTickArrays instanceof Map) return (loadedTickArrays as Map<number, RaydiumClmmTickArray>).get(idx);
       return loadedTickArrays[idx];
     };
 
-    const hasAllArrays = requiredStartIndices.every(idx => !!getTickArray(idx));
-    if (!hasAllArrays) {
+    // Hydration check: Only the tick array containing tickCurrent is strictly required up front
+    const currentStart = getRaydiumClmmArrayStartIndex(tickCurrent, tickSpacing);
+    const initialArray = getTickArray(currentStart);
+    if (!initialArray) {
       this.lastFailureReason = 'MISSING_TICK_DATA';
       return null;
     }
 
-    // Validate freshness of every required tick array (max age 30,000ms, slot gap <= 100)
     const arrayTimestamps = extra?.tickArrayReceivedAt;
     const arraySlots = extra?.tickArraySlots;
-    if (arrayTimestamps && arraySlots) {
-      for (const idx of requiredStartIndices) {
-        const t = arrayTimestamps[idx];
-        const s = arraySlots[idx];
-        if (t && (now - t > 30000 || t > now + 5000)) {
+
+    // Strict Freshness: Validate current tick array timestamp and slot consistency
+    const initT = arrayTimestamps?.[currentStart];
+    const initS = arraySlots?.[currentStart];
+    if (!initT || !initS) {
+      this.lastFailureReason = 'MISSING_TICK_DATA';
+      return null;
+    }
+    if (now - initT > 2500 || initT > now + 5000) {
+      this.lastFailureReason = 'STALE_QUOTE';
+      return null;
+    }
+    if (Math.abs(pool.slot - initS) > 10) {
+      this.lastFailureReason = 'SLOT_MISMATCH';
+      return null;
+    }
+
+    // Directional Multi-Tick Concentrated Liquidity Traversal
+    // Matches Raydium CLMM official integer rounding and per-step fee calculations
+    const feeRateBig = BigInt(tradeFeeRate);
+    const arraySpan = RAYDIUM_CLMM_TICK_ARRAY_SIZE * tickSpacing;
+
+    let currentArray: RaydiumClmmTickArray = initialArray;
+    let currentArrayStart: number = currentStart;
+    let amountRemaining = amountIn;
+    let totalAmountOut = 0n;
+    let totalFee = 0n;
+    let currentSqrtPrice = sqrtPrice;
+    let currentLiquidity = liquidity;
+    let currTick = tickCurrent;
+
+    while (amountRemaining > 0n) {
+      // Find all initialized ticks in currentArray along the swap direction
+      const ticksInArray = currentArray.ticks.filter(t => t.initialized);
+      const relevantTicks = zeroForOne
+        ? ticksInArray.filter(t => t.tick <= currTick).sort((a, b) => b.tick - a.tick)
+        : ticksInArray.filter(t => t.tick > currTick).sort((a, b) => a.tick - b.tick);
+
+      let stepCompletedInArray = false;
+
+      for (const targetTickState of relevantTicks) {
+        if (amountRemaining <= 0n) break;
+
+        const targetTick = targetTickState.tick;
+        const targetSqrtPrice = tickIndexToSqrtPrice(targetTick);
+
+        // Raydium step fee calculation: amount_for_price_calc = floor(amount_remaining * (DENOM - fee_rate) / DENOM)
+        const amountForPriceCalc = (amountRemaining * (FEE_RATE_DENOMINATOR - feeRateBig)) / FEE_RATE_DENOMINATOR;
+
+        let maxAmountIn: bigint;
+        if (zeroForOne) {
+          maxAmountIn = tryGetAmountDeltaA(targetSqrtPrice, currentSqrtPrice, currentLiquidity, true);
+        } else {
+          maxAmountIn = tryGetAmountDeltaB(currentSqrtPrice, targetSqrtPrice, currentLiquidity, true);
+        }
+
+        if (maxAmountIn === 0n) {
+          // Already at tick price: cross tick directly
+          if (zeroForOne) {
+            currentLiquidity -= targetTickState.liquidityNet;
+            currTick = targetTick - 1;
+          } else {
+            currentLiquidity += targetTickState.liquidityNet;
+            currTick = targetTick;
+          }
+          currentSqrtPrice = targetSqrtPrice;
+          continue;
+        }
+
+        if (amountForPriceCalc >= maxAmountIn) {
+          // Step reaches initialized tick boundary
+          let stepAmountOut: bigint;
+          if (zeroForOne) {
+            stepAmountOut = tryGetAmountDeltaB(targetSqrtPrice, currentSqrtPrice, currentLiquidity, false);
+          } else {
+            stepAmountOut = tryGetAmountDeltaA(currentSqrtPrice, targetSqrtPrice, currentLiquidity, false);
+          }
+
+          // fee_amount = ceil(amount_in * fee_rate / (DENOM - fee_rate))
+          const stepFee =
+            (maxAmountIn * feeRateBig + (FEE_RATE_DENOMINATOR - feeRateBig - 1n)) /
+            (FEE_RATE_DENOMINATOR - feeRateBig);
+          const consumed = maxAmountIn + stepFee;
+
+          totalAmountOut += stepAmountOut;
+          totalFee += stepFee;
+          amountRemaining = amountRemaining >= consumed ? amountRemaining - consumed : 0n;
+          currentSqrtPrice = targetSqrtPrice;
+
+          // Cross tick: update active liquidity
+          if (zeroForOne) {
+            currentLiquidity -= targetTickState.liquidityNet;
+            currTick = targetTick - 1;
+          } else {
+            currentLiquidity += targetTickState.liquidityNet;
+            currTick = targetTick;
+          }
+
+          if (currentLiquidity <= 0n && amountRemaining > 0n) {
+            this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+            return null;
+          }
+        } else {
+          // Swap finishes inside this tick range
+          let nextSqrtPrice: bigint;
+          let stepAmountIn: bigint;
+          let stepAmountOut: bigint;
+
+          if (zeroForOne) {
+            nextSqrtPrice = tryGetNextSqrtPriceFromA(currentSqrtPrice, currentLiquidity, amountForPriceCalc, true);
+            stepAmountIn = tryGetAmountDeltaA(nextSqrtPrice, currentSqrtPrice, currentLiquidity, true);
+            stepAmountOut = tryGetAmountDeltaB(nextSqrtPrice, currentSqrtPrice, currentLiquidity, false);
+          } else {
+            nextSqrtPrice = tryGetNextSqrtPriceFromB(currentSqrtPrice, currentLiquidity, amountForPriceCalc, true);
+            stepAmountIn = tryGetAmountDeltaB(currentSqrtPrice, nextSqrtPrice, currentLiquidity, true);
+            stepAmountOut = tryGetAmountDeltaA(currentSqrtPrice, nextSqrtPrice, currentLiquidity, false);
+          }
+
+          const stepFee = amountRemaining > amountForPriceCalc ? amountRemaining - amountForPriceCalc : 0n;
+          totalAmountOut += stepAmountOut;
+          totalFee += stepFee;
+          currentSqrtPrice = nextSqrtPrice;
+          amountRemaining = 0n;
+          stepCompletedInArray = true;
+          break;
+        }
+      }
+
+      if (amountRemaining <= 0n || stepCompletedInArray) {
+        break;
+      }
+
+      // No further initialized ticks in currentArray: step towards currentArray boundary
+      const boundaryTick = zeroForOne
+        ? currentArrayStart
+        : currentArrayStart + arraySpan;
+      const boundarySqrtPrice = tickIndexToSqrtPrice(boundaryTick);
+
+      const amountForPriceCalc = (amountRemaining * (FEE_RATE_DENOMINATOR - feeRateBig)) / FEE_RATE_DENOMINATOR;
+
+      let maxAmountInToBoundary: bigint;
+      if (zeroForOne) {
+        maxAmountInToBoundary = tryGetAmountDeltaA(boundarySqrtPrice, currentSqrtPrice, currentLiquidity, true);
+      } else {
+        maxAmountInToBoundary = tryGetAmountDeltaB(currentSqrtPrice, boundarySqrtPrice, currentLiquidity, true);
+      }
+
+      if (maxAmountInToBoundary === 0n) {
+        // Price already at boundary; cross directly into next array
+        const nextArrayStart = zeroForOne
+          ? currentArrayStart - arraySpan
+          : currentArrayStart + arraySpan;
+        const nextArray = getTickArray(nextArrayStart);
+        if (!nextArray) {
+          this.lastFailureReason = 'MISSING_TICK_DATA';
+          return null;
+        }
+        const nextT = arrayTimestamps?.[nextArrayStart];
+        const nextS = arraySlots?.[nextArrayStart];
+        if (!nextT || !nextS) {
+          this.lastFailureReason = 'MISSING_TICK_DATA';
+          return null;
+        }
+        if (now - nextT > 2500 || nextT > now + 5000) {
           this.lastFailureReason = 'STALE_QUOTE';
           return null;
         }
-        if (pool.slot && s && Math.abs(pool.slot - s) > 100) {
+        if (Math.abs(pool.slot - nextS) > 10) {
           this.lastFailureReason = 'SLOT_MISMATCH';
           return null;
         }
-      }
-    }
-
-    // Collect all initialized ticks from loaded tick arrays
-    const initializedTicks: RaydiumClmmTickState[] = [];
-    let minLoadedTick = Infinity;
-    let maxLoadedTick = -Infinity;
-
-    for (const startIdx of requiredStartIndices) {
-      const arr = getTickArray(startIdx);
-      if (!arr) continue;
-      const arrayMin = arr.startTickIndex;
-      const arrayMax = arr.startTickIndex + RAYDIUM_CLMM_TICK_ARRAY_SIZE * tickSpacing;
-      if (arrayMin < minLoadedTick) minLoadedTick = arrayMin;
-      if (arrayMax > maxLoadedTick) maxLoadedTick = arrayMax;
-
-      for (const t of arr.ticks) {
-        if (t.initialized) {
-          initializedTicks.push(t);
-        }
-      }
-    }
-
-    // Sort initialized ticks by traversal order
-    if (zeroForOne) {
-      // Swapping A -> B (price dropping): traverse initialized ticks <= tickCurrent in descending order
-      initializedTicks.sort((a, b) => b.tick - a.tick);
-    } else {
-      // Swapping B -> A (price rising): traverse initialized ticks > tickCurrent in ascending order
-      initializedTicks.sort((a, b) => a.tick - b.tick);
-    }
-
-    // Multi-Tick Concentrated Liquidity Traversal
-    let netAmountRemaining = netAmountIn;
-    let totalAmountOut = 0n;
-    let currentSqrtPrice = sqrtPrice;
-    let currentLiquidity = liquidity;
-    let currentTick = tickCurrent;
-
-    // Filter relevant initialized ticks based on current price/direction
-    const relevantTicks = zeroForOne
-      ? initializedTicks.filter(t => t.tick <= currentTick)
-      : initializedTicks.filter(t => t.tick > currentTick);
-
-    for (let i = 0; i <= relevantTicks.length; i++) {
-      if (netAmountRemaining <= 0n) break;
-
-      // Determine step target price
-      let targetSqrtPrice: bigint;
-      let targetTick: number;
-      let isArrayBoundary = false;
-
-      if (i < relevantTicks.length) {
-        targetTick = relevantTicks[i].tick;
-        targetSqrtPrice = tickIndexToSqrtPrice(targetTick);
-      } else {
-        // No further initialized ticks; step to loaded array boundary
-        isArrayBoundary = true;
-        targetTick = zeroForOne ? minLoadedTick : maxLoadedTick;
-        targetSqrtPrice = tickIndexToSqrtPrice(targetTick);
+        currentArray = nextArray;
+        currentArrayStart = nextArrayStart;
+        currTick = zeroForOne ? boundaryTick - 1 : boundaryTick;
+        continue;
       }
 
-      // Max input needed to push price all the way to targetSqrtPrice
-      let maxAmountIn: bigint;
-      if (zeroForOne) {
-        maxAmountIn = tryGetAmountDeltaA(targetSqrtPrice, currentSqrtPrice, currentLiquidity, true);
-      } else {
-        maxAmountIn = tryGetAmountDeltaB(currentSqrtPrice, targetSqrtPrice, currentLiquidity, true);
-      }
+      if (amountForPriceCalc >= maxAmountInToBoundary) {
+        // Swap reaches array boundary: requires next tick array to continue
+        const nextArrayStart = zeroForOne
+          ? currentArrayStart - arraySpan
+          : currentArrayStart + arraySpan;
 
-      if (netAmountRemaining >= maxAmountIn && maxAmountIn > 0n) {
-        // Price reaches target boundary
-        if (isArrayBoundary) {
-          // Exceeds loaded tick arrays without completing swap -> fail closed
+        const nextArray = getTickArray(nextArrayStart);
+        if (!nextArray) {
+          // Swap exceeded loaded tick arrays: fail closed
           this.lastFailureReason = 'MISSING_TICK_DATA';
           return null;
         }
 
-        let stepAmountOut: bigint;
-        if (zeroForOne) {
-          stepAmountOut = tryGetAmountDeltaB(targetSqrtPrice, currentSqrtPrice, currentLiquidity, false);
-        } else {
-          stepAmountOut = tryGetAmountDeltaA(currentSqrtPrice, targetSqrtPrice, currentLiquidity, false);
-        }
-
-        totalAmountOut += stepAmountOut;
-        netAmountRemaining -= maxAmountIn;
-        currentSqrtPrice = targetSqrtPrice;
-
-        // Cross tick: update active liquidity
-        const crossingTick = relevantTicks[i];
-        if (zeroForOne) {
-          currentLiquidity -= crossingTick.liquidityNet;
-          currentTick = targetTick - 1;
-        } else {
-          currentLiquidity += crossingTick.liquidityNet;
-          currentTick = targetTick;
-        }
-
-        if (currentLiquidity <= 0n && netAmountRemaining > 0n) {
-          this.lastFailureReason = 'INSUFFICIENT_LIQUIDITY';
+        const nextT = arrayTimestamps?.[nextArrayStart];
+        const nextS = arraySlots?.[nextArrayStart];
+        if (!nextT || !nextS) {
+          this.lastFailureReason = 'MISSING_TICK_DATA';
           return null;
         }
+        if (now - nextT > 2500 || nextT > now + 5000) {
+          this.lastFailureReason = 'STALE_QUOTE';
+          return null;
+        }
+        if (Math.abs(pool.slot - nextS) > 10) {
+          this.lastFailureReason = 'SLOT_MISMATCH';
+          return null;
+        }
+
+        let stepAmountOut: bigint;
+        if (zeroForOne) {
+          stepAmountOut = tryGetAmountDeltaB(boundarySqrtPrice, currentSqrtPrice, currentLiquidity, false);
+        } else {
+          stepAmountOut = tryGetAmountDeltaA(currentSqrtPrice, boundarySqrtPrice, currentLiquidity, false);
+        }
+
+        const stepFee =
+          (maxAmountInToBoundary * feeRateBig + (FEE_RATE_DENOMINATOR - feeRateBig - 1n)) /
+          (FEE_RATE_DENOMINATOR - feeRateBig);
+        const consumed = maxAmountInToBoundary + stepFee;
+
+        totalAmountOut += stepAmountOut;
+        totalFee += stepFee;
+        amountRemaining = amountRemaining >= consumed ? amountRemaining - consumed : 0n;
+        currentSqrtPrice = boundarySqrtPrice;
+
+        // Transition into the next tick array
+        currentArray = nextArray;
+        currentArrayStart = nextArrayStart;
+        currTick = zeroForOne ? boundaryTick - 1 : boundaryTick;
       } else {
-        // Swap completes inside this tick range
+        // Swap completes before reaching array boundary
         let nextSqrtPrice: bigint;
+        let stepAmountIn: bigint;
         let stepAmountOut: bigint;
 
         if (zeroForOne) {
-          nextSqrtPrice = tryGetNextSqrtPriceFromA(currentSqrtPrice, currentLiquidity, netAmountRemaining, true);
+          nextSqrtPrice = tryGetNextSqrtPriceFromA(currentSqrtPrice, currentLiquidity, amountForPriceCalc, true);
+          stepAmountIn = tryGetAmountDeltaA(nextSqrtPrice, currentSqrtPrice, currentLiquidity, true);
           stepAmountOut = tryGetAmountDeltaB(nextSqrtPrice, currentSqrtPrice, currentLiquidity, false);
         } else {
-          nextSqrtPrice = tryGetNextSqrtPriceFromB(currentSqrtPrice, currentLiquidity, netAmountRemaining, true);
+          nextSqrtPrice = tryGetNextSqrtPriceFromB(currentSqrtPrice, currentLiquidity, amountForPriceCalc, true);
+          stepAmountIn = tryGetAmountDeltaB(currentSqrtPrice, nextSqrtPrice, currentLiquidity, true);
           stepAmountOut = tryGetAmountDeltaA(currentSqrtPrice, nextSqrtPrice, currentLiquidity, false);
         }
 
+        const stepFee = amountRemaining > amountForPriceCalc ? amountRemaining - amountForPriceCalc : 0n;
         totalAmountOut += stepAmountOut;
+        totalFee += stepFee;
         currentSqrtPrice = nextSqrtPrice;
-        netAmountRemaining = 0n;
+        amountRemaining = 0n;
         break;
       }
     }
@@ -329,14 +452,12 @@ export class RaydiumClmmAdapter implements DexAdapter {
     // Realistic Price Impact Calculation
     // Compares post-fee actual output against instantaneous marginal output at starting spot price
     let priceImpactBps = 0;
-    if (netAmountIn > 0n && sqrtPrice > 0n) {
+    if (amountIn > 0n && sqrtPrice > 0n) {
       let idealOut = 0n;
       if (zeroForOne) {
-        // Token A -> Token B: idealOut = (netAmountIn * sqrtPrice^2) / 2^128
-        idealOut = (netAmountIn * sqrtPrice * sqrtPrice) / Q128;
+        idealOut = (amountIn * sqrtPrice * sqrtPrice) / Q128;
       } else {
-        // Token B -> Token A: idealOut = (netAmountIn * 2^128) / (sqrtPrice^2)
-        idealOut = (netAmountIn * Q128) / (sqrtPrice * sqrtPrice);
+        idealOut = (amountIn * Q128) / (sqrtPrice * sqrtPrice);
       }
 
       if (idealOut > 0n) {
@@ -378,7 +499,7 @@ export class RaydiumClmmAdapter implements DexAdapter {
         currentSqrtPrice: currentSqrtPrice.toString(),
         finalSqrtPrice: currentSqrtPrice.toString(),
         rawAmountOut: totalAmountOut.toString(),
-        effectiveFeePpm: feeRate
+        effectiveFeePpm: tradeFeeRate
       }
     };
   }

@@ -9,10 +9,17 @@ import {
 } from '@orca-so/whirlpools-core';
 import { RaydiumClmmAdapter } from '../src/dex/raydiumClmmAdapter.js';
 import {
+  RaydiumClmmAmmConfig,
+  decodeRaydiumClmmAmmConfig,
+  RAYDIUM_CLMM_AMM_CONFIG_SIZE,
+  RAYDIUM_CLMM_AMM_CONFIG_DISCRIMINATOR
+} from '../src/dex/raydiumClmmAmmConfig.js';
+import {
   deriveRaydiumClmmTickArrayPda,
   getRaydiumClmmArrayStartIndex,
   getRequiredRaydiumClmmTickArrayStartIndices,
   getSurroundingRaydiumClmmTickArrayStartIndices,
+  getBidirectionalRaydiumClmmTickArrayStartIndices,
   decodeRaydiumClmmTickArray,
   RaydiumClmmTickArray,
   RAYDIUM_CLMM_TICK_ARRAY_SIZE,
@@ -80,6 +87,31 @@ describe('Raydium CLMM Pricing Adapter & Protocol Parity Suite', () => {
     buf.writeBigUInt64LE(sqrt >> 64n, 261);
     // tick_current at 269..273 (i32 LE)
     buf.writeInt32LE(params.tickCurrent ?? -26151, 269);
+    return buf;
+  }
+
+  /**
+   * Helper to construct a mock 117-byte Raydium CLMM AmmConfig binary buffer.
+   */
+  function createMockAmmConfigBuffer(params: {
+    tradeFeeRate?: number;
+    tickSpacing?: number;
+    protocolFeeRate?: number;
+    fundFeeRate?: number;
+    index?: number;
+    discriminator?: string;
+    ownerPubkey?: string;
+  }): Buffer {
+    const buf = Buffer.alloc(RAYDIUM_CLMM_AMM_CONFIG_SIZE);
+    Buffer.from(params.discriminator ?? RAYDIUM_CLMM_AMM_CONFIG_DISCRIMINATOR, 'hex').copy(buf, 0);
+    buf.writeUInt8(255, 8); // bump
+    buf.writeUInt16LE(params.index ?? 6, 9);
+    new PublicKey(params.ownerPubkey ?? KNOWN_PROGRAM_IDS.RAYDIUM_CLMM).toBuffer().copy(buf, 11);
+    buf.writeUInt32LE(params.protocolFeeRate ?? 120000, 43);
+    buf.writeUInt32LE(params.tradeFeeRate ?? 200, 47);
+    buf.writeUInt16LE(params.tickSpacing ?? 1, 51);
+    buf.writeUInt32LE(params.fundFeeRate ?? 40000, 53);
+    new PublicKey('11111111111111111111111111111111').toBuffer().copy(buf, 57);
     return buf;
   }
 
@@ -163,7 +195,7 @@ describe('Raydium CLMM Pricing Adapter & Protocol Parity Suite', () => {
 
     it('Fails closed on non-allowlisted mints', () => {
       const badMintBuf = createMockPoolStateBuffer({
-        mint0: '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R' // Raydium mint (not in USDC/WSOL/USDT allowlist)
+        mint0: '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R'
       });
       const decoded = adapter.decodePoolState(badMintBuf, testPoolId, 250000000);
       expect(decoded).toBeNull();
@@ -178,15 +210,62 @@ describe('Raydium CLMM Pricing Adapter & Protocol Parity Suite', () => {
     });
   });
 
-  describe('2. Tick Array PDA Derivation & Layout Decoding', () => {
+  describe('2. On-Chain AmmConfig Layout & Validation', () => {
+    it('Decodes a valid 117-byte Raydium CLMM AmmConfig buffer', () => {
+      const rawConfig = createMockAmmConfigBuffer({
+        tradeFeeRate: 200, // 2 bps
+        tickSpacing: 1,
+        index: 6
+      });
+
+      const config = decodeRaydiumClmmAmmConfig(rawConfig, 'EdPxg8QaeFSrTYqdWJn6Kezwy9McWncTYueD9eMGCuzR', 250000000);
+      expect(config).not.toBeNull();
+      expect(config?.id).toBe('EdPxg8QaeFSrTYqdWJn6Kezwy9McWncTYueD9eMGCuzR');
+      expect(config?.tradeFeeRate).toBe(200);
+      expect(config?.tickSpacing).toBe(1);
+      expect(config?.index).toBe(6);
+      expect(config?.protocolFeeRate).toBe(120000);
+    });
+
+    it('Fails closed on AmmConfig buffer smaller than 117 bytes', () => {
+      const shortBuf = Buffer.alloc(100);
+      const config = decodeRaydiumClmmAmmConfig(shortBuf, 'config_id', 250000000);
+      expect(config).toBeNull();
+    });
+
+    it('Fails closed on invalid AmmConfig discriminator', () => {
+      const badDiscBuf = createMockAmmConfigBuffer({ discriminator: '0000000000000000' });
+      const config = decodeRaydiumClmmAmmConfig(badDiscBuf, 'config_id', 250000000);
+      expect(config).toBeNull();
+    });
+
+    it('Fails closed on owner mismatch when verifying program ownership', () => {
+      const rawConfig = createMockAmmConfigBuffer({});
+      const config = decodeRaydiumClmmAmmConfig(
+        rawConfig,
+        'config_id',
+        250000000,
+        Date.now(),
+        'WrongProgram1111111111111111111111111111111'
+      );
+      expect(config).toBeNull();
+    });
+
+    it('Fails closed on excessive tradeFeeRate (> 1,000,000)', () => {
+      const badFeeBuf = createMockAmmConfigBuffer({ tradeFeeRate: 1000001 });
+      const config = decodeRaydiumClmmAmmConfig(badFeeBuf, 'config_id', 250000000);
+      expect(config).toBeNull();
+    });
+  });
+
+  describe('3. Tick Array PDA Derivation & Layout Decoding', () => {
     it('Derives exact PDA matching program ID and seed formula [tick_array, pool_id, start_tick.toBE(4)]', () => {
       const pda = deriveRaydiumClmmTickArrayPda(testPoolId, -26160);
       expect(pda).toBeInstanceOf(PublicKey);
-      // Confirmed on-chain in live Solana mainnet verification
       expect(pda.toBase58()).toBe('DhzLeDuEfWAmBCrHNiChMcMGgER5vLcdoqPHVkuS9aE1');
     });
 
-    it('Calculates correct start tick indices and required 3-array sequence for both directions', () => {
+    it('Calculates correct start tick indices, directional 3-array sequence, and bidirectional 5-array sequence', () => {
       const tickCurrent = -26151;
       const tickSpacing = 1;
 
@@ -200,9 +279,9 @@ describe('Raydium CLMM Pricing Adapter & Protocol Parity Suite', () => {
       const bToAIndices = getRequiredRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing, 'B_TO_A');
       expect(bToAIndices).toEqual([-26160, -26100, -26040]);
 
-      // Surrounding indices for WebSocket hydration
-      const surrounding = getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing);
-      expect(surrounding).toEqual([-26220, -26160, -26100]);
+      // Bidirectional 5-array sequence resolving arrays needed for BOTH swap directions
+      const bidirectional = getBidirectionalRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing);
+      expect(bidirectional).toEqual([-26280, -26220, -26160, -26100, -26040]);
     });
 
     it('Decodes 10,240-byte TickArray account buffer with initialized ticks and signed liquidityNet', () => {
@@ -225,17 +304,15 @@ describe('Raydium CLMM Pricing Adapter & Protocol Parity Suite', () => {
     });
   });
 
-  describe('3. Exact CLMM Pricing & Protocol Parity', () => {
+  describe('4. Contract-Equivalent Reference Math & Multi-Tier Fee Parity', () => {
     function setupTestPool(feePpm: number = 2500): {
       pool: PoolState;
       tickArrays: Record<number, RaydiumClmmTickArray>;
     } {
       const tickCurrent = -26151;
       const tickSpacing = 1;
-      const startTick = -26160;
 
-      // Create 3 arrays for A_TO_B: -26160, -26220, -26280
-      // and 2 arrays for B_TO_A: -26100, -26040
+      // Setup 5 arrays: [-26280, -26220, -26160, -26100, -26040]
       const arr1 = decodeRaydiumClmmTickArray(createMockTickArrayBuffer(testPoolId, -26160, tickSpacing, [
         { tick: -26155, liquidityNet: 10000000000n, liquidityGross: 20000000000n }
       ]), testPoolId)!;
@@ -294,6 +371,7 @@ describe('Raydium CLMM Pricing Adapter & Protocol Parity Suite', () => {
           tickSpacing,
           liquidity: '567954298646',
           sqrtPrice: '4990017269699282904',
+          tradeFeeRate: feePpm,
           feeRate: feePpm,
           tickArrays,
           tickArrayReceivedAt,
@@ -304,34 +382,133 @@ describe('Raydium CLMM Pricing Adapter & Protocol Parity Suite', () => {
       return { pool, tickArrays };
     }
 
-    it('Calculates exact pool fee in parts per million (10^-6)', () => {
-      const { pool } = setupTestPool(2500); // 25 bps = 2500 ppm
-      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 1_000_000_000n); // 1 SOL
+    /**
+     * Pure contract-equivalent reference implementation for single-step swap computation.
+     */
+    function referenceComputeStep(
+      currentSqrtPrice: bigint,
+      targetSqrtPrice: bigint,
+      liquidity: bigint,
+      amountRemaining: bigint,
+      feeRatePpm: number,
+      zeroForOne: boolean
+    ) {
+      const feeRateBig = BigInt(feeRatePpm);
+      const DENOM = 1_000_000n;
+      const amountForPriceCalc = (amountRemaining * (DENOM - feeRateBig)) / DENOM;
+
+      const maxAmountIn = zeroForOne
+        ? tryGetAmountDeltaA(targetSqrtPrice, currentSqrtPrice, liquidity, true)
+        : tryGetAmountDeltaB(currentSqrtPrice, targetSqrtPrice, liquidity, true);
+
+      if (amountForPriceCalc >= maxAmountIn && maxAmountIn > 0n) {
+        const stepAmountOut = zeroForOne
+          ? tryGetAmountDeltaB(targetSqrtPrice, currentSqrtPrice, liquidity, false)
+          : tryGetAmountDeltaA(currentSqrtPrice, targetSqrtPrice, liquidity, false);
+        const stepFee = (maxAmountIn * feeRateBig + (DENOM - feeRateBig - 1n)) / (DENOM - feeRateBig);
+
+        return {
+          nextSqrtPrice: targetSqrtPrice,
+          stepAmountIn: maxAmountIn,
+          stepAmountOut,
+          stepFee,
+          reachedTarget: true
+        };
+      } else {
+        const nextSqrtPrice = zeroForOne
+          ? tryGetNextSqrtPriceFromA(currentSqrtPrice, liquidity, amountForPriceCalc, true)
+          : tryGetNextSqrtPriceFromB(currentSqrtPrice, liquidity, amountForPriceCalc, true);
+        const stepAmountIn = amountForPriceCalc;
+        const stepAmountOut = zeroForOne
+          ? tryGetAmountDeltaB(nextSqrtPrice, currentSqrtPrice, liquidity, false)
+          : tryGetAmountDeltaA(currentSqrtPrice, nextSqrtPrice, liquidity, false);
+        const stepFee = amountRemaining > amountForPriceCalc ? amountRemaining - amountForPriceCalc : 0n;
+
+        return {
+          nextSqrtPrice,
+          stepAmountIn,
+          stepAmountOut,
+          stepFee,
+          reachedTarget: false
+        };
+      }
+    }
+
+    it('Compares single-tick small swap against contract-equivalent reference with 0 rounding difference', () => {
+      const { pool } = setupTestPool(200); // 2 bps = 200 ppm
+      const smallAmountIn = 100_000_000n; // 0.1 SOL (completes within tick -26151 before reaching -26155)
+
+      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, smallAmountIn);
       expect(quote).not.toBeNull();
-      // 1,000,000,000 * 2500 / 1,000,000 = 2,500,000 fee
-      expect(quote?.feeAmount).toBe(2500000n);
+
+      // Compute contract-equivalent reference
+      const targetSqrtPrice = tickIndexToSqrtPrice(-26155);
+      const ref = referenceComputeStep(
+        4990017269699282904n,
+        targetSqrtPrice,
+        567954298646n,
+        smallAmountIn,
+        200,
+        true
+      );
+
+      expect(ref.reachedTarget).toBe(false);
+      // Expected fee: 100,000,000 * 200 / 1,000,000 = 20,000
+      expect(ref.stepFee).toBe(20000n);
+      expect(quote?.feeAmount).toBe(ref.stepFee);
+
+      // Verify conservative output matches floor(ref.stepAmountOut * 9985 / 10000)
+      const expectedConservative = (ref.stepAmountOut * 9985n) / 10000n;
+      expect(quote?.outAmount).toBe(expectedConservative);
+
+      // Rounding difference between reference and quote is exactly 0
+      const roundingDiff = (quote?.outAmount ?? 0n) - expectedConservative;
+      expect(roundingDiff).toBe(0n);
     });
 
-    it('Supports zeroForOne (A -> B: SOL -> USDC) with exact integer math and conservative haircut', () => {
+    it('Tests all official real fee tiers (1, 2, 5, 25, 100 bps) and records fee parity', () => {
+      const feeTiers = [
+        { bps: 1, ppm: 100, expectedFee: 10000n },
+        { bps: 2, ppm: 200, expectedFee: 20000n },
+        { bps: 5, ppm: 500, expectedFee: 50000n },
+        { bps: 25, ppm: 2500, expectedFee: 250000n },
+        { bps: 100, ppm: 10000, expectedFee: 1000000n }
+      ];
+
+      const smallAmountIn = 100_000_000n; // 0.1 SOL
+
+      for (const tier of feeTiers) {
+        const { pool } = setupTestPool(tier.ppm);
+        const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, smallAmountIn);
+
+        expect(quote).not.toBeNull();
+        expect(quote?.feeAmount).toBe(tier.expectedFee);
+        expect((quote?.rawRouteInfo as any)?.effectiveFeePpm).toBe(tier.ppm);
+      }
+    });
+
+    it('Supports zeroForOne (A -> B: SOL -> USDC) multi-tick traversal with exact integer step fees', () => {
       const { pool } = setupTestPool(100); // 1 bps = 100 ppm
-      const amountIn = 1_000_000_000n; // 1 SOL
+      const amountIn = 1_000_000_000n; // 1 SOL (crosses tick -26155 into second step)
       const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, amountIn);
 
       expect(quote).not.toBeNull();
       expect(quote?.inputMint).toBe(CANONICAL_WSOL_MINT);
       expect(quote?.outputMint).toBe(CANONICAL_USDC_MINT);
       expect(quote?.inAmount).toBe(amountIn);
-      expect(quote?.feeAmount).toBe(100000n); // 1,000,000,000 * 100 / 1,000,000 = 100,000 lamports
 
-      // Raw unadjusted output at ~73.13 USDC = 73,133,177 micro-units
-      // Conservative output (99.85%) = floor(73,133,177 * 9985 / 10000) = 73,023,477
+      // Multi-step fee across tick -26155:
+      // Step 1 to tick -26155: maxIn = 495,779,429; fee1 = ceil(495,779,429 * 100 / 999,900) = 49,583
+      // Step 2 remaining: 504,170,988; fee2 = 50,418
+      // Total fee: 49,583 + 50,418 = 100,001 (1-unit integer ceiling difference recorded)
+      expect(quote?.feeAmount).toBe(100001n);
       expect(Number(quote?.outAmount)).toBeGreaterThan(70_000_000);
       expect(Number(quote?.outAmount)).toBeLessThan(75_000_000);
       expect(quote?.priceImpactBps).toBeLessThan(10);
     });
 
     it('Supports oneForZero (B -> A: USDC -> SOL) with exact integer math', () => {
-      const { pool } = setupTestPool(100);
+      const { pool } = setupTestPool(100); // 1 bps = 100 ppm
       const amountIn = 100_000_000n; // 100 USDC
       const quote = adapter.quoteExactInput(pool, CANONICAL_USDC_MINT, amountIn);
 
@@ -339,62 +516,196 @@ describe('Raydium CLMM Pricing Adapter & Protocol Parity Suite', () => {
       expect(quote?.inputMint).toBe(CANONICAL_USDC_MINT);
       expect(quote?.outputMint).toBe(CANONICAL_WSOL_MINT);
       expect(quote?.inAmount).toBe(amountIn);
-      expect(quote?.feeAmount).toBe(10000n); // 100,000,000 * 100 / 1,000,000 = 10,000 micro-USDC
+      expect(quote?.feeAmount).toBe(10000n); // 100,000,000 * 100 / 1,000,000 = 10,000
 
       // 100 USDC yields ~1.36 SOL = ~1,365,000,000 lamports
       expect(Number(quote?.outAmount)).toBeGreaterThan(1_300_000_000);
       expect(Number(quote?.outAmount)).toBeLessThan(1_400_000_000);
     });
 
-    it('Traverses multiple initialized ticks and updates active liquidity correctly', () => {
+    it('Traverses negative liquidityNet tick crossing and adjusts active liquidity correctly', () => {
+      const { pool, tickArrays } = setupTestPool(100);
+
+      // Create a tick with negative liquidityNet: -10B
+      // Swapping zeroForOne (price falling) subtracts liquidityNet: L - (-10B) = L + 10B
+      tickArrays[-26160].ticks = tickArrays[-26160].ticks.map(t =>
+        t.tick === -26155 ? { ...t, liquidityNet: -10000000000n, liquidityGross: 10000000000n, initialized: true } : t
+      );
+
+      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 1_000_000_000n);
+      expect(quote).not.toBeNull();
+      // Liquidity increased after crossing -> higher output than base pool
+      expect(Number(quote?.outAmount)).toBeGreaterThan(70_000_000);
+    });
+
+    it('Traverses large swaps crossing multiple initialized ticks across tick arrays', () => {
       const { pool } = setupTestPool(100);
-      // Large swap: 10 SOL pushes price across initialized tick -26155
+      // Large swap: 10 SOL pushes price across initialized tick -26155 and -26174
       const amountIn = 10_000_000_000n;
       const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, amountIn);
 
       expect(quote).not.toBeNull();
       expect(quote?.inAmount).toBe(amountIn);
-      // Successfully traversed and crossed tick without error
       expect(Number(quote?.outAmount)).toBeGreaterThan(700_000_000);
     });
+  });
 
-    it('Fails closed on excessive price impact (> 200 bps)', () => {
-      const { pool } = setupTestPool(100);
-      // Set maxPriceImpactBps to 1 bps to test price impact threshold rejection within loaded tick arrays
-      (pool.extraData as any).maxPriceImpactBps = 1;
-      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 1_000_000_000n);
+  describe('5. Tick-Array Hydration Boundaries & Strict Freshness Gates', () => {
+    function setupTestPool(feePpm: number = 2500): PoolState {
+      const tickCurrent = -26151;
+      const tickSpacing = 1;
 
-      expect(quote).toBeNull();
-      expect(adapter.getLastFailureReason()).toBe('EXCESSIVE_PRICE_IMPACT');
+      const arr1 = decodeRaydiumClmmTickArray(createMockTickArrayBuffer(testPoolId, -26160, tickSpacing, [
+        { tick: -26155, liquidityNet: 10000000000n, liquidityGross: 20000000000n }
+      ]), testPoolId)!;
+
+      const arr2 = decodeRaydiumClmmTickArray(createMockTickArrayBuffer(testPoolId, -26220, tickSpacing, [
+        { tick: -26174, liquidityNet: 20563271491n, liquidityGross: 59815091953n }
+      ]), testPoolId)!;
+
+      const arr3 = decodeRaydiumClmmTickArray(createMockTickArrayBuffer(testPoolId, -26280, tickSpacing, []), testPoolId)!;
+
+      const now = Date.now();
+      return {
+        id: testPoolId,
+        dex: 'RAYDIUM_CLMM',
+        programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        tokenADecimals: 9,
+        tokenBDecimals: 6,
+        reserveA: 1000000000000n,
+        reserveB: 73000000000000n,
+        feeBps: Math.round(feePpm / 100),
+        slot: 250000000,
+        receivedAt: now,
+        liquidityUsd: 4000000,
+        feedHealth: 'HEALTHY',
+        extraData: {
+          tickCurrent,
+          tickSpacing,
+          liquidity: '567954298646',
+          sqrtPrice: '4990017269699282904',
+          tradeFeeRate: feePpm,
+          tickArrays: {
+            [-26160]: arr1,
+            [-26220]: arr2,
+            [-26280]: arr3
+          },
+          tickArrayReceivedAt: {
+            [-26160]: now,
+            [-26220]: now,
+            [-26280]: now
+          },
+          tickArraySlots: {
+            [-26160]: 250000000,
+            [-26220]: 250000000,
+            [-26280]: 250000000
+          }
+        }
+      };
+    }
+
+    it('Does not require unrelated tick arrays when swap finishes before reaching array boundary', () => {
+      const pool = setupTestPool(100);
+      // Delete downstream arrays -26220 and -26280
+      delete (pool.extraData as any).tickArrays[-26220];
+      delete (pool.extraData as any).tickArrays[-26280];
+
+      // 0.5 SOL completes inside current array -26160 without needing boundary crossing -> succeeds cleanly
+      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 500_000_000n);
+      expect(quote).not.toBeNull();
+      expect(quote?.inAmount).toBe(500_000_000n);
     });
 
-    it('Fails closed when required tick arrays are missing', () => {
-      const { pool } = setupTestPool(100);
-      // Delete required array -26220
+    it('Fails closed with MISSING_TICK_DATA when swap crosses array boundary into missing tick array', () => {
+      const pool = setupTestPool(100);
+      // Delete array -26220
       delete (pool.extraData as any).tickArrays[-26220];
 
-      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 1_000_000_000n);
+      // 1.2 SOL pushes past boundary -26160 and requires -26220 -> fails closed
+      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 1_200_000_000n);
       expect(quote).toBeNull();
       expect(adapter.getLastFailureReason()).toBe('MISSING_TICK_DATA');
     });
 
-    it('Fails closed on stale pool quote (> 2500ms)', () => {
-      const { pool } = setupTestPool(100);
-      pool.receivedAt = Date.now() - 3000; // 3 seconds ago
+    it('Fails closed immediately when initial tick array containing tickCurrent is missing', () => {
+      const pool = setupTestPool(100);
+      delete (pool.extraData as any).tickArrays[-26160];
 
-      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 1_000_000_000n);
+      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 100_000_000n);
+      expect(quote).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('MISSING_TICK_DATA');
+    });
+
+    it('Fails closed on missing fee configuration or unverified AmmConfig', () => {
+      const pool = setupTestPool(100);
+      delete (pool.extraData as any).tradeFeeRate;
+      delete (pool.extraData as any).feeRate;
+      pool.feeBps = 0;
+
+      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 100_000_000n);
+      expect(quote).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('QUOTE_UNVERIFIED');
+    });
+
+    it('Fails closed on stale pool state (> 2,500ms)', () => {
+      const pool = setupTestPool(100);
+      pool.receivedAt = Date.now() - 3000;
+
+      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 100_000_000n);
       expect(quote).toBeNull();
       expect(adapter.getLastFailureReason()).toBe('STALE_QUOTE');
     });
 
-    it('Fails closed on tick array slot mismatch (> 100 slots gap)', () => {
-      const { pool } = setupTestPool(100);
+    it('Fails closed on missing pool timestamp or slot', () => {
+      const pool = setupTestPool(100);
+      pool.receivedAt = 0;
+
+      expect(adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 100_000_000n)).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('STALE_QUOTE');
+
+      const poolNoSlot = setupTestPool(100);
+      poolNoSlot.slot = 0;
+      expect(adapter.quoteExactInput(poolNoSlot, CANONICAL_WSOL_MINT, 100_000_000n)).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('QUOTE_UNVERIFIED');
+    });
+
+    it('Fails closed on stale tick array (> 2,500ms)', () => {
+      const pool = setupTestPool(100);
+      (pool.extraData as any).tickArrayReceivedAt[-26160] = Date.now() - 3000;
+
+      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 100_000_000n);
+      expect(quote).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('STALE_QUOTE');
+    });
+
+    it('Fails closed on tick array slot mismatch (> 10 slots gap)', () => {
+      const pool = setupTestPool(100);
       pool.slot = 250000000;
-      (pool.extraData as any).tickArraySlots[-26160] = 250000150; // 150 slots gap
+      (pool.extraData as any).tickArraySlots[-26160] = 250000015; // 15 slots gap (> 10)
+
+      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 100_000_000n);
+      expect(quote).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('SLOT_MISMATCH');
+    });
+
+    it('Fails closed on missing tick array timestamp or slot metadata', () => {
+      const pool = setupTestPool(100);
+      delete (pool.extraData as any).tickArrayReceivedAt[-26160];
+
+      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 100_000_000n);
+      expect(quote).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('MISSING_TICK_DATA');
+    });
+
+    it('Fails closed on excessive price impact (> 200 bps)', () => {
+      const pool = setupTestPool(100);
+      (pool.extraData as any).maxPriceImpactBps = 1;
 
       const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 1_000_000_000n);
       expect(quote).toBeNull();
-      expect(adapter.getLastFailureReason()).toBe('SLOT_MISMATCH');
+      expect(adapter.getLastFailureReason()).toBe('EXCESSIVE_PRICE_IMPACT');
     });
   });
 });
