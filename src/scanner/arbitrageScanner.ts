@@ -2050,6 +2050,22 @@ export class ArbitrageScanner {
 
       if (poolsToRefresh.length === 0) return 0;
 
+      // Prioritize pools supporting the most valid 2-leg routes to maximize sustained READY route count
+      // and factor in staleness age to prevent starvation of lower-ranking pools.
+      poolsToRefresh.sort((a, b) => {
+        const routesA = this.routeIndex.getRoutesAffectedByPool(a.id, true).length;
+        const routesB = this.routeIndex.getRoutesAffectedByPool(b.id, true).length;
+        const stateA = this.stateCache.getPoolState(a.id);
+        const stateB = this.stateCache.getPoolState(b.id);
+        const ageA = now - (stateA?.receivedAt || 0);
+        const ageB = now - (stateB?.receivedAt || 0);
+
+        // Score based on route leverage (weight: 1000 per route) plus starvation age bonus
+        const scoreA = routesA * 1000 + Math.min(ageA, 10000);
+        const scoreB = routesB * 1000 + Math.min(ageB, 10000);
+        return scoreB - scoreA;
+      });
+
       // Bound batch size to respect RPC rate limits (max 20 pools per cycle)
       const batch = poolsToRefresh.slice(0, 20);
       const pubkeysToFetch: PublicKey[] = [];
@@ -2085,6 +2101,7 @@ export class ArbitrageScanner {
       const refreshedSlot = rpcRes.slot;
       const accounts = rpcRes.value;
       let refreshedCount = 0;
+      const refreshedPoolIds: string[] = [];
 
       let accIndex = 0;
       for (const p of batch) {
@@ -2250,9 +2267,26 @@ export class ArbitrageScanner {
           }
 
           this.stateCache.setPoolState(decoded);
-          this.evaluateAffectedRoutes(p.id, performance.now());
+          refreshedPoolIds.push(p.id);
           refreshedCount++;
         }
+      }
+
+      // Batch evaluation: collect all unique non-blocked routes affected by any refreshed pool
+      // and evaluate each once with all refreshed pool states already present in stateCache.
+      const affectedRoutesMap = new Map<string, IndexedDirectedRoute>();
+      for (const pid of refreshedPoolIds) {
+        const routes = this.routeIndex.getRoutesAffectedByPool(pid, true);
+        for (const r of routes) {
+          if (r.state !== 'BLOCKED') {
+            affectedRoutesMap.set(r.routeId, r);
+          }
+        }
+      }
+
+      const evalNow = performance.now();
+      for (const route of affectedRoutesMap.values()) {
+        this.evaluateIndexedRoute(route, evalNow);
       }
 
       return refreshedCount;

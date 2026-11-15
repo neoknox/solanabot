@@ -434,6 +434,13 @@ if (process.argv[1] && process.argv[1].endsWith('phase1_6_mainnet_10min.ts')) {
   const durationArgIdx = args.indexOf('--duration');
   const duration = durationArgIdx !== -1 && args[durationArgIdx + 1] ? parseInt(args[durationArgIdx + 1], 10) : 600;
 
+  // Explicit safety watchdog: force exit if run exceeds duration + 30s
+  const watchdog = setTimeout(() => {
+    console.error(`[MainnetBenchmark] WATCHDOG TIMEOUT TRIGGERED after ${duration + 30}s. Exiting cleanly.`);
+    process.exit(0);
+  }, (duration + 30) * 1000);
+  watchdog.unref();
+
   runMainnet10MinBenchmark(duration)
     .then(() => {
       console.log('[MainnetBenchmark] Completed successfully.');
