@@ -28,9 +28,9 @@ import { ArbitrageProfitCalculator } from '../profit/calculator.js';
 import { ProfitThresholdManager } from '../profit/profitThresholdManager.js';
 import { ArbitrageRepository } from '../storage/repository.js';
 import { CANONICAL_WSOL_MINT, CANONICAL_USDC_MINT } from '../config/index.js';
-import { RouteIndex, IndexedDirectedRoute } from './routeIndex.js';
+import { RouteIndex, IndexedDirectedRoute, PrevalidatedRouteConfig } from './routeIndex.js';
 import { BoundedEventQueue, QueuedAccountUpdate } from './eventQueue.js';
-import { LatencyTracker, LatencyReport } from '../telemetry/latencyTracker.js';
+import { LatencyTracker, LatencyReport, SurvivalStats } from '../telemetry/latencyTracker.js';
 import { TradeSizer, QuoterLeg } from '../profit/tradeSizer.js';
 import { CompetitorAnalyzer } from '../competition/analyzer.js';
 import { CompetitionScorer } from '../profit/competitionScorer.js';
@@ -129,6 +129,7 @@ export class ArbitrageScanner {
   private lastSolPriceTime = 0;
   private isRefreshingSharedPools = false;
   private lastSharedRefreshTime = 0;
+  private hasPendingDrain = false;
 
   constructor(
     config: AppConfig,
@@ -247,6 +248,7 @@ export class ArbitrageScanner {
     // Setup WS disconnect/reconnect hooks
     this.ws.onDisconnect(() => {
       this.stateCache.invalidateAll('DISCONNECTED');
+      this.routeIndex.invalidateAllPrevalidatedRoutes();
       const readyRoutes = this.routeIndex.getReadyRoutes();
       for (const r of readyRoutes) {
         this.routeIndex.setRouteStale(r.routeId, 'WS_DISCONNECTED');
@@ -263,6 +265,7 @@ export class ArbitrageScanner {
 
     this.ws.onReconnect(async () => {
       const reconnectStart = performance.now();
+      this.routeIndex.invalidateAllPrevalidatedRoutes();
       this.repository.logProviderEvent(
         'SolanaWs',
         'RECONNECTED',
@@ -355,9 +358,16 @@ export class ArbitrageScanner {
 
   private enqueueUpdate(update: QueuedAccountUpdate): void {
     this.eventQueue.enqueue(update);
-    if (!this.isDrainingQueue) {
-      setImmediate(() => this.drainEventQueue());
+    this.scheduleImmediateDrain();
+  }
+
+  private scheduleImmediateDrain(): void {
+    if (this.isDrainingQueue) {
+      this.hasPendingDrain = true;
+      return;
     }
+    this.hasPendingDrain = false;
+    queueMicrotask(() => this.drainEventQueue());
   }
 
   private async drainEventQueue(): Promise<void> {
@@ -365,48 +375,97 @@ export class ArbitrageScanner {
     this.isDrainingQueue = true;
 
     try {
-      while (!this.eventQueue.isEmpty()) {
+      // Process a bounded batch of updates (max 100 per drain to prevent CPU starvation)
+      const MAX_BATCH_UPDATES = 100;
+      let count = 0;
+      const modifiedPools = new Map<string, { t0: number; t1: number; t2: number }>();
+
+      while (!this.eventQueue.isEmpty() && count < MAX_BATCH_UPDATES) {
         const update = this.eventQueue.dequeue();
         if (!update) break;
+        count++;
 
+        let res: { poolId: string; t1: number; t2: number } | null = null;
         if (update.type === 'POOL_ACCOUNT') {
-          this.processPoolAccountUpdate(update);
+          res = this.processPoolAccountUpdate(update);
         } else if (update.type === 'VAULT_ACCOUNT') {
-          this.processVaultAccountUpdate(update);
+          res = this.processVaultAccountUpdate(update);
         } else if (update.type === 'OPENORDERS_ACCOUNT') {
-          this.processOpenOrdersAccountUpdate(update);
+          res = this.processOpenOrdersAccountUpdate(update);
         } else if (update.type === 'TICK_ARRAY_ACCOUNT') {
-          this.processTickArrayAccountUpdate(update);
+          res = this.processTickArrayAccountUpdate(update);
         } else if (update.type === 'AMM_CONFIG_ACCOUNT') {
-          this.processAmmConfigAccountUpdate(update);
+          res = this.processAmmConfigAccountUpdate(update);
+        }
+
+        if (res && res.poolId) {
+          const existing = modifiedPools.get(res.poolId);
+          if (!existing || update.monotonicReceiptTime < existing.t0) {
+            modifiedPools.set(res.poolId, {
+              t0: update.monotonicReceiptTime,
+              t1: res.t1,
+              t2: res.t2
+            });
+          }
+        }
+      }
+
+      // Deduplicated route evaluation: evaluate each affected non-blocked route once
+      if (modifiedPools.size > 0) {
+        const t3 = performance.now();
+        const affectedRoutes = new Map<string, { route: IndexedDirectedRoute; t0: number; t1: number; t2: number; t3: number }>();
+        for (const [poolId, meta] of modifiedPools.entries()) {
+          const routes = this.routeIndex.getRoutesAffectedByPool(poolId, true);
+          for (const r of routes) {
+            if (r.state === 'BLOCKED') continue;
+            const existing = affectedRoutes.get(r.routeId);
+            if (!existing || meta.t0 < existing.t0) {
+              affectedRoutes.set(r.routeId, {
+                route: r,
+                t0: meta.t0,
+                t1: meta.t1,
+                t2: meta.t2,
+                t3
+              });
+            }
+          }
+        }
+
+        for (const item of affectedRoutes.values()) {
+          this.evaluateIndexedRoute(item.route, item.t0, item.t1, item.t2, item.t3);
         }
       }
     } finally {
       this.isDrainingQueue = false;
+      if (this.hasPendingDrain || !this.eventQueue.isEmpty()) {
+        this.hasPendingDrain = false;
+        queueMicrotask(() => this.drainEventQueue());
+      }
     }
   }
 
-  private processPoolAccountUpdate(update: QueuedAccountUpdate): void {
+  private processPoolAccountUpdate(update: QueuedAccountUpdate): { poolId: string; t1: number; t2: number } | null {
     const now = Date.now();
     if (!update.slot || update.slot <= 0 || !update.receivedAtMs || update.receivedAtMs > now + 5000) {
-      return;
+      return null;
     }
 
     const poolConfig = this.poolRegistry.getPool(update.key);
-    if (!poolConfig) return;
+    if (!poolConfig) return null;
 
     const existing = this.stateCache.getPoolState(update.key);
     if (existing && existing.slot > update.slot) {
       // Reject out-of-order account updates
-      return;
+      return null;
     }
 
     const adapter = dexRegistry.getAdapter(poolConfig.dex);
-    if (!adapter) return;
+    if (!adapter) return null;
 
     const decodeStart = performance.now();
     const decoded = adapter.decodePoolState(update.data, update.key, update.slot);
-    const decodeDurationUs = (performance.now() - decodeStart) * 1000;
+    const t1 = performance.now();
+    const decodeDurationUs = (t1 - decodeStart) * 1000;
     this.latencyTracker.recordDecodeDuration(decodeDurationUs);
 
     if (decoded) {
@@ -605,32 +664,35 @@ export class ArbitrageScanner {
       }
 
       const { hasChanged } = this.stateCache.setPoolState(decoded);
+      const t2 = performance.now();
 
       // Reevaluate only routes affected by this pool update if quote-relevant state changed
       if (hasChanged && (decoded.dex !== 'RAYDIUM_AMM' || ((decoded.reserveA ?? 0n) > 0n && (decoded.reserveB ?? 0n) > 0n))) {
-        this.evaluateAffectedRoutes(update.key, update.monotonicReceiptTime);
+        return { poolId: update.key, t1, t2 };
       }
+      return null;
     }
+    return null;
   }
 
-  private processOpenOrdersAccountUpdate(update: QueuedAccountUpdate): void {
+  private processOpenOrdersAccountUpdate(update: QueuedAccountUpdate): { poolId: string; t1: number; t2: number } | null {
     const poolId = this.openOrdersToPool.get(update.key);
-    if (!poolId) return;
+    if (!poolId) return null;
 
     const pool = this.stateCache.getPoolState(poolId);
-    if (!pool || pool.dex !== 'RAYDIUM_AMM' || !pool.extraData) return;
+    if (!pool || pool.dex !== 'RAYDIUM_AMM' || !pool.extraData) return null;
 
     const extra = pool.extraData as any;
     if (extra.openOrdersSlot && update.slot < extra.openOrdersSlot) {
       // Reject out-of-order open orders updates
-      return;
+      return null;
     }
     if (update.data.length < 3228) {
       extra.openOrdersVerified = false;
       extra.unverifiedReason = 'OPENORDERS_LAYOUT_INVALID';
       this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_LAYOUT_INVALID');
       this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
-      return;
+      return null;
     }
 
     const market = new PublicKey(update.data.subarray(13, 45)).toBase58();
@@ -641,7 +703,7 @@ export class ArbitrageScanner {
       extra.unverifiedReason = 'OPENORDERS_MARKET_MISMATCH';
       this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_MARKET_MISMATCH');
       this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
-      return;
+      return null;
     }
 
     const expectedAuthority = '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
@@ -650,12 +712,12 @@ export class ArbitrageScanner {
       extra.unverifiedReason = 'OPENORDERS_AUTHORITY_MISMATCH';
       this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'OPENORDERS_AUTHORITY_MISMATCH');
       this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
-      return;
+      return null;
     }
 
     // Reject out-of-order notifications
     if (extra.lastAccountChangeSlot && update.slot < extra.lastAccountChangeSlot) {
-      return;
+      return null;
     }
 
     const baseTokenTotal = update.data.readBigUInt64LE(85);
@@ -679,30 +741,31 @@ export class ArbitrageScanner {
       extra.unverifiedReason = 'VAULT_RESERVES_UNHYDRATED';
       this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'VAULT_RESERVES_UNHYDRATED');
       this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
-      return;
+      return null;
     }
     if (!hasVaultMeta) {
       extra.openOrdersVerified = false;
       extra.unverifiedReason = 'MISSING_VAULT_METADATA';
       this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'MISSING_VAULT_METADATA');
       this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
-      return;
+      return null;
     }
     if (!vAFresh || !vBFresh) {
       extra.openOrdersVerified = false;
       extra.unverifiedReason = 'STALE_VAULT_SNAPSHOT';
       this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'STALE_VAULT_SNAPSHOT');
       this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
-      return;
+      return null;
     }
     if (vaultSlotGap > 100) {
       extra.openOrdersVerified = false;
       extra.unverifiedReason = 'INCONSISTENT_VAULT_SNAPSHOT';
       this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'INCONSISTENT_VAULT_SNAPSHOT');
       this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
-      return;
+      return null;
     }
 
+    const t1 = performance.now();
     extra.openOrdersVerified = true;
     extra.openOrdersBaseTokenTotal = baseTokenTotal.toString();
     extra.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
@@ -717,11 +780,13 @@ export class ArbitrageScanner {
 
     this.poolRegistry.updatePoolVerification(poolId, 'VERIFIED_DIRECT');
     this.routeIndex.updatePoolStatus(poolId, 'VERIFIED_DIRECT');
+    const { hasChanged } = this.stateCache.setPoolState(pool);
+    const t2 = performance.now();
 
-    this.evaluateAffectedRoutes(poolId, update.monotonicReceiptTime);
+    return { poolId, t1, t2 };
   }
 
-  private processVaultAccountUpdate(update: QueuedAccountUpdate): void {
+  private processVaultAccountUpdate(update: QueuedAccountUpdate): { poolId: string; t1: number; t2: number } | null {
     if (update.data.length >= 72) {
       try {
         const rawAmount = update.data.readBigUInt64LE(64);
@@ -733,7 +798,7 @@ export class ArbitrageScanner {
             const currentVaultSlot = mapping.isA ? (extra.vaultASlot || 0) : (extra.vaultBSlot || 0);
             if (update.slot < currentVaultSlot) {
               // Reject out-of-order vault updates
-              return;
+              return null;
             }
             if (mapping.isA) {
               pool.reserveA = rawAmount;
@@ -746,6 +811,7 @@ export class ArbitrageScanner {
             }
             pool.slot = update.slot;
             pool.receivedAt = update.receivedAtMs;
+            const t1 = performance.now();
 
             // Runtime recovery: If valid fresh vault data arrives, check if pool can be promoted back to VERIFIED_DIRECT
             if (pool.dex === 'RAYDIUM_AMM') {
@@ -773,42 +839,46 @@ export class ArbitrageScanner {
             }
 
             const { hasChanged } = this.stateCache.setPoolState(pool);
+            const t2 = performance.now();
 
             // Reevaluate only routes affected by this vault update if state changed
             if (hasChanged && (pool.dex !== 'RAYDIUM_AMM' || ((pool.reserveA ?? 0n) > 0n && (pool.reserveB ?? 0n) > 0n))) {
-              this.evaluateAffectedRoutes(mapping.poolId, update.monotonicReceiptTime);
+              return { poolId: mapping.poolId, t1, t2 };
             }
           }
         }
       } catch (fatalErr) {
-      console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
+        console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
+      }
     }
-    }
+    return null;
   }
 
-  private processTickArrayAccountUpdate(update: QueuedAccountUpdate): void {
+  private processTickArrayAccountUpdate(update: QueuedAccountUpdate): { poolId: string; t1: number; t2: number } | null {
     const now = Date.now();
     if (!update.slot || update.slot <= 0 || !update.receivedAtMs || update.receivedAtMs > now + 5000) {
-      return;
+      return null;
     }
 
     const mapping = this.tickArrayToPool.get(update.key);
-    if (!mapping) return;
+    if (!mapping) return null;
 
     const pool = this.stateCache.getPoolState(mapping.poolId);
-    if (!pool || (pool.dex !== 'ORCA_WHIRLPOOL' && pool.dex !== 'RAYDIUM_CLMM')) return;
+    if (!pool || (pool.dex !== 'ORCA_WHIRLPOOL' && pool.dex !== 'RAYDIUM_CLMM')) return null;
 
     const extra = (pool.extraData || {}) as any;
     const currentArraySlot = extra.tickArraySlots?.[mapping.startTickIndex] || 0;
     if (update.slot < currentArraySlot) {
       // Reject out-of-order account updates
-      return;
+      return null;
     }
 
     const decoded = pool.dex === 'RAYDIUM_CLMM' || mapping.isClmm
       ? decodeRaydiumClmmTickArray(update.data, mapping.poolId)
       : decodeTickArrayAccount(update.data, mapping.poolId);
-    if (!decoded) return;
+    if (!decoded) return null;
+
+    const t1 = performance.now();
 
     if (!extra.tickArrays) extra.tickArrays = {};
     if (!extra.tickArraySlots) extra.tickArraySlots = {};
@@ -848,15 +918,17 @@ export class ArbitrageScanner {
     }
 
     const { hasChanged } = this.stateCache.setPoolState(pool);
+    const t2 = performance.now();
     if (hasChanged) {
-      this.evaluateAffectedRoutes(mapping.poolId, update.monotonicReceiptTime);
+      return { poolId: mapping.poolId, t1, t2 };
     }
+    return null;
   }
 
-  private processAmmConfigAccountUpdate(update: QueuedAccountUpdate): void {
+  private processAmmConfigAccountUpdate(update: QueuedAccountUpdate): { poolId: string; t1: number; t2: number } | null {
     const now = Date.now();
     if (!update.slot || update.slot <= 0 || !update.receivedAtMs || update.receivedAtMs > now + 5000) {
-      return;
+      return null;
     }
 
     const decoded = decodeRaydiumClmmAmmConfig(
@@ -881,16 +953,18 @@ export class ArbitrageScanner {
             this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'UNSUPPORTED_AMM_CONFIG');
             this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
             this.stateCache.setPoolState(pool);
-            this.evaluateAffectedRoutes(poolId, update.monotonicReceiptTime);
           }
         }
       }
-      return;
+      return null;
     }
 
+    const t1 = performance.now();
     this.ammConfigCache.set(update.key, decoded);
 
     const linkedPools = this.ammConfigToPools.get(update.key);
+    let modifiedPoolId: string | null = null;
+    let t2 = performance.now();
     if (linkedPools) {
       for (const poolId of linkedPools) {
         const pool = this.stateCache.getPoolState(poolId);
@@ -901,12 +975,14 @@ export class ArbitrageScanner {
           pool.feeBps = Math.round(decoded.tradeFeeRate / 100);
           this.poolRegistry.updatePoolFee(poolId, pool.feeBps);
           const { hasChanged } = this.stateCache.setPoolState(pool);
+          t2 = performance.now();
           if (hasChanged) {
-            this.evaluateAffectedRoutes(poolId, update.monotonicReceiptTime);
+            modifiedPoolId = poolId;
           }
         }
       }
     }
+    return modifiedPoolId ? { poolId: modifiedPoolId, t1, t2 } : null;
   }
 
   private lastReconfirmationTime = new Map<string, number>();
@@ -1101,17 +1177,189 @@ export class ArbitrageScanner {
     return `${pool.id}@s${pool.slot}:rev${rev}:rA${pool.reserveA || 0}:rB${pool.reserveB || 0}`;
   }
 
-  private evaluateAffectedRoutes(poolId: string, monotonicReceiptTime?: number): void {
-    // Efficient Scaling: Skip BLOCKED routes on high-frequency evaluation path
-    const affectedRoutes = this.routeIndex.getRoutesAffectedByPool(poolId, true);
-    for (const route of affectedRoutes) {
-      if (route.state === 'BLOCKED') continue;
-      this.evaluateIndexedRoute(route, monotonicReceiptTime);
+  private ensurePrevalidatedRoute(route: IndexedDirectedRoute): PrevalidatedRouteConfig {
+    if (route.prevalidatedConfig) {
+      return route.prevalidatedConfig;
+    }
+
+    if (!route.legs || route.legs.length < 2) {
+      const cfg: PrevalidatedRouteConfig = {
+        isValid: false,
+        blockerReason: 'UNSUPPORTED_ROUTE',
+        leg0: {
+          poolId: '',
+          dex: 'RAYDIUM_AMM',
+          inputMint: '',
+          outputMint: '',
+          direction: 'A_TO_B',
+          slippageBps: this.config.SLIPPAGE_BPS_LEG1
+        },
+        leg1: {
+          poolId: '',
+          dex: 'RAYDIUM_AMM',
+          inputMint: '',
+          outputMint: '',
+          direction: 'A_TO_B',
+          slippageBps: this.config.SLIPPAGE_BPS_LEG2
+        },
+        requiresAtaSetup: false
+      };
+      route.prevalidatedConfig = cfg;
+      return cfg;
+    }
+
+    const leg0Def = route.legs[0];
+    const leg1Def = route.legs[1];
+
+    if (!this.poolRegistry.isVenueSupported(leg0Def.dex) || !this.poolRegistry.isVenueSupported(leg1Def.dex)) {
+      const cfg: PrevalidatedRouteConfig = {
+        isValid: false,
+        blockerReason: 'UNSUPPORTED_ROUTE',
+        leg0: {
+          poolId: leg0Def.poolId,
+          dex: leg0Def.dex,
+          inputMint: leg0Def.inputMint,
+          outputMint: leg0Def.outputMint,
+          direction: 'A_TO_B',
+          slippageBps: this.config.SLIPPAGE_BPS_LEG1
+        },
+        leg1: {
+          poolId: leg1Def.poolId,
+          dex: leg1Def.dex,
+          inputMint: leg1Def.inputMint,
+          outputMint: leg1Def.outputMint,
+          direction: 'A_TO_B',
+          slippageBps: this.config.SLIPPAGE_BPS_LEG2
+        },
+        requiresAtaSetup: false
+      };
+      route.prevalidatedConfig = cfg;
+      return cfg;
+    }
+
+    const poolConfig0 = this.poolRegistry.getPool(leg0Def.poolId);
+    const poolConfig1 = this.poolRegistry.getPool(leg1Def.poolId);
+
+    const dir0: 'A_TO_B' | 'B_TO_A' = (poolConfig0 && leg0Def.inputMint === poolConfig0.tokenAMint) ? 'A_TO_B' : 'B_TO_A';
+    const dir1: 'A_TO_B' | 'B_TO_A' = (poolConfig1 && leg1Def.inputMint === poolConfig1.tokenAMint) ? 'A_TO_B' : 'B_TO_A';
+
+    const requiresAtaSetup = route.legs.some(
+      l => l.inputMint === CANONICAL_WSOL_MINT || l.outputMint === CANONICAL_WSOL_MINT
+    );
+
+    const cfg: PrevalidatedRouteConfig = {
+      isValid: true,
+      leg0: {
+        poolId: leg0Def.poolId,
+        dex: leg0Def.dex,
+        inputMint: leg0Def.inputMint,
+        outputMint: leg0Def.outputMint,
+        direction: dir0,
+        slippageBps: this.config.SLIPPAGE_BPS_LEG1
+      },
+      leg1: {
+        poolId: leg1Def.poolId,
+        dex: leg1Def.dex,
+        inputMint: leg1Def.inputMint,
+        outputMint: leg1Def.outputMint,
+        direction: dir1,
+        slippageBps: this.config.SLIPPAGE_BPS_LEG2
+      },
+      requiresAtaSetup
+    };
+
+    route.prevalidatedConfig = cfg;
+    return cfg;
+  }
+
+  private immediateRevalidation(
+    candidate: ArbitrageCandidate,
+    legs: QuoterLeg[],
+    costs: CostBreakdown,
+    currentSlot: number,
+    t0: number
+  ): { isSurvived: boolean; reason?: string; conservativeNetVal: number } {
+    try {
+      const sizeUSDC = candidate.optimalSizeUSDC || Number(candidate.inputAmountUSDC) / 1e6;
+      const now = Date.now();
+      const monoNow = performance.now();
+
+      // Check quote expiration (> 2500ms since packet arrival)
+      if (t0 > 0 && (monoNow - t0) > 2500) {
+        return { isSurvived: false, reason: 'QUOTE_EXPIRED', conservativeNetVal: 0 };
+      }
+
+      // Re-fetch fresh pool states from stateCache
+      const freshQuoterLegs: QuoterLeg[] = [];
+      for (const leg of legs) {
+        const pool = this.stateCache.getPoolState(leg.pool.id);
+        if (!pool) {
+          return { isSurvived: false, reason: 'STATE_CACHE_MISS', conservativeNetVal: 0 };
+        }
+        if (now - pool.receivedAt > 2500) {
+          return { isSurvived: false, reason: 'QUOTE_EXPIRED', conservativeNetVal: 0 };
+        }
+        if (pool.slot && Math.abs(currentSlot - pool.slot) > this.config.MAX_SLOT_GAP) {
+          return { isSurvived: false, reason: 'SLOT_ADVANCED', conservativeNetVal: 0 };
+        }
+        freshQuoterLegs.push({
+          ...leg,
+          pool
+        });
+      }
+
+      const evalRes = this.tradeSizer.evaluateSize(sizeUSDC, freshQuoterLegs, costs, currentSlot);
+      const minHurdle = this.profitThresholdManager.getThresholdDecimal();
+
+      if (!evalRes.isViable) {
+        const reason = evalRes.rejectionReason || 'DEPLETED_LIQUIDITY';
+        return { isSurvived: false, reason, conservativeNetVal: 0 };
+      }
+
+      if (evalRes.conservativeNetUSDC.lt(minHurdle)) {
+        return { isSurvived: false, reason: 'POOL_PRICE_MOVED', conservativeNetVal: evalRes.conservativeNetUSDC.toNumber() };
+      }
+
+      return { isSurvived: true, conservativeNetVal: evalRes.conservativeNetUSDC.toNumber() };
+    } catch {
+      return { isSurvived: false, reason: 'REVALIDATION_EXCEPTION', conservativeNetVal: 0 };
     }
   }
 
-  private evaluateIndexedRoute(route: IndexedDirectedRoute, monotonicReceiptTime?: number): void {
+  private evaluateAffectedRoutes(poolId: string, monotonicReceiptTime?: number): void {
+    // Efficient Scaling: Skip BLOCKED routes on high-frequency evaluation path
+    const affectedRoutes = this.routeIndex.getRoutesAffectedByPool(poolId, true);
+    const nowMono = performance.now();
+    const t0 = monotonicReceiptTime ?? nowMono;
+    for (const route of affectedRoutes) {
+      if (route.state === 'BLOCKED') continue;
+      this.evaluateIndexedRoute(route, t0, nowMono, nowMono, nowMono);
+    }
+  }
+
+  private evaluateIndexedRoute(
+    route: IndexedDirectedRoute,
+    t0?: number,
+    t1?: number,
+    t2?: number,
+    t3?: number
+  ): void {
     if (route.state === 'BLOCKED') return;
+
+    const preval = this.ensurePrevalidatedRoute(route);
+    if (!preval.isValid) {
+      this.rejectedCount++;
+      this.auditMetrics.rejectedRoutes++;
+      const reason = (preval.blockerReason || 'UNSUPPORTED_ROUTE') as RejectionReasonCode;
+      this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
+      return;
+    }
+
+    const nowMono = performance.now();
+    const _t0 = t0 ?? nowMono;
+    const _t1 = t1 ?? _t0;
+    const _t2 = t2 ?? _t1;
+    const _t3 = t3 ?? nowMono;
 
     this.auditMetrics.configuredRouteCount = this.routeIndex.getAllRoutes().length;
 
@@ -1273,11 +1521,11 @@ export class ArbitrageScanner {
       return;
     }
 
-    // Calculate current execution costs
+    // Calculate current execution costs using prevalidated ATA flag
     const costResult = this.costModel.calculateCosts({
       solPriceUSDC: this.currentSolPriceUSDC,
       solPriceTimestamp: this.lastSolPriceTime,
-      requiresAtaSetup: route.legs.some(l => l.inputMint === CANONICAL_WSOL_MINT || l.outputMint === CANONICAL_WSOL_MINT)
+      requiresAtaSetup: preval.requiresAtaSetup
     });
 
     if (!costResult.isComplete || !costResult.breakdown) {
@@ -1292,10 +1540,11 @@ export class ArbitrageScanner {
     // Deterministic state fingerprint uniquely identifies verified account revisions and state snapshots
     const stateVersion = quoterLegs.map(l => this.computePoolFingerprint(l.pool)).join('|');
 
-    // Fast optimal trade sizing
+    // Fast optimal trade sizing (T3 -> T4)
     const quoteStart = performance.now();
     const sizerResult = this.tradeSizer.findOptimalSize(quoterLegs, costResult.breakdown, currentSlot);
-    const quoteDurationUs = (performance.now() - quoteStart) * 1000;
+    const t4 = performance.now();
+    const quoteDurationUs = (t4 - quoteStart) * 1000;
     this.latencyTracker.recordQuoteDuration(quoteDurationUs);
 
     this.quotesProducedCount += sizerResult.evaluatedSizesCount * route.legs.length;
@@ -1321,7 +1570,8 @@ export class ArbitrageScanner {
     // 3. QUOTE-VALID STAGE: Exact quotes successfully produced for all legs on both expected and conservative paths
     this.auditMetrics.quoteValidRouteCount = (this.auditMetrics.quoteValidRouteCount || 0) + 1;
 
-    const validationStart = performance.now();
+    // Conservative net profit calculation (T4 -> T5)
+    const calcStart = performance.now();
     const candidate = this.calculator.evaluateCandidate({
       initialAmountUSDC: BigInt(Math.floor(sizerResult.optimalSizeUSDC * 1e6)),
       leg1Quote: sizerResult.optimalQuotes[0],
@@ -1338,6 +1588,7 @@ export class ArbitrageScanner {
       topAlternatives: sizerResult.topAlternatives,
       stateVersion
     });
+    const t5 = performance.now();
 
     // Phase 1.4: Update route readiness in permanent library index & persistent repository (non-blocking)
     if (candidate.rejectionReasons.includes('STALE_QUOTE') || candidate.rejectionReasons.includes('SLOT_MISMATCH')) {
@@ -1377,12 +1628,14 @@ export class ArbitrageScanner {
     candidate.executionProbability = scoreResult.executionProbability;
     candidate.scoringBreakdown = scoreResult.breakdown;
 
-    const validationDurationUs = (performance.now() - validationStart) * 1000;
+    // Signal qualification timestamp (T5 -> T6)
+    const t6 = performance.now();
+    const validationDurationUs = (t6 - calcStart) * 1000;
     this.latencyTracker.recordValidationDuration(validationDurationUs);
 
     // Total detection-to-decision latency
-    if (monotonicReceiptTime) {
-      const decisionDurationUs = (performance.now() - monotonicReceiptTime) * 1000;
+    if (_t0 > 0) {
+      const decisionDurationUs = (t6 - _t0) * 1000;
       this.latencyTracker.recordDecisionDuration(decisionDurationUs);
     }
 
@@ -1420,14 +1673,44 @@ export class ArbitrageScanner {
       candidate.visibilityDurationMs = trackerRes.visibilityDurationMs;
       candidate.observedSnapshotsCount = trackerRes.observedSnapshotsCount;
 
-      // Real survival counting: only after a genuinely new independent market snapshot
+      // COMPONENT 4: Immediate Revalidation Gate (T6 -> T7)
+      const revalRes = this.immediateRevalidation(
+        candidate,
+        quoterLegs,
+        costResult.breakdown,
+        currentSlot,
+        _t0
+      );
+      const t7 = performance.now();
+
       this.auditMetrics.survivalCheckedCount = (this.auditMetrics.survivalCheckedCount || 0) + 1;
-      if (trackerRes.isSurvival) {
+      if (revalRes.isSurvived) {
         candidate.survivalStatus = 'SURVIVED';
         this.auditMetrics.survivalSurvivedCount = (this.auditMetrics.survivalSurvivedCount || 0) + 1;
       } else {
-        candidate.survivalStatus = 'UNCHECKED';
+        candidate.survivalStatus = 'DECAYED';
+        if (revalRes.reason) {
+          candidate.rejectionReasons.push(revalRes.reason as RejectionReasonCode);
+        }
       }
+
+      this.latencyTracker.recordSignalQualification(
+        true,
+        revalRes.isSurvived,
+        revalRes.conservativeNetVal,
+        revalRes.reason
+      );
+
+      this.latencyTracker.recordPipelineStages({
+        t0: _t0,
+        t1: _t1,
+        t2: _t2,
+        t3: _t3,
+        t4,
+        t5,
+        t6,
+        t7
+      });
     } else {
       this.rejectedCount++;
       this.auditMetrics.rejectedRoutes++;
@@ -1443,6 +1726,16 @@ export class ArbitrageScanner {
           this.auditMetrics.staleDataRejections++;
         }
       }
+
+      this.latencyTracker.recordPipelineStages({
+        t0: _t0,
+        t1: _t1,
+        t2: _t2,
+        t3: _t3,
+        t4,
+        t5,
+        t6
+      });
     }
 
     if (isDupe && candidate.status !== 'QUALIFIED_SHADOW') {
@@ -1456,6 +1749,10 @@ export class ArbitrageScanner {
     for (const listener of this.candidateListeners) {
       try { listener(candidate); } catch {}
     }
+  }
+
+  public getSurvivalStats(): SurvivalStats {
+    return this.latencyTracker.getSurvivalStats();
   }
 
   private recheckSurvivalSync(

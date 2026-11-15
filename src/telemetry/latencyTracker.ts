@@ -8,6 +8,25 @@ export interface PercentileStats {
   mean: number;
 }
 
+export interface PipelineStages {
+  t0: number; // WebSocket receipt monotonic timestamp
+  t1: number; // Decoded & validated monotonic timestamp
+  t2: number; // Shared stateCache updated monotonic timestamp
+  t3: number; // Affected 2-leg routes identified monotonic timestamp
+  t4: number; // Multi-leg quotes calculated monotonic timestamp
+  t5: number; // Conservative net profit calculated monotonic timestamp
+  t6: number; // Qualified shadow signal emitted monotonic timestamp
+  t7?: number; // Immediate revalidation completed monotonic timestamp
+}
+
+export interface SurvivalStats {
+  qualifiedSignalsCount: number;
+  revalidatedSignalsCount: number;
+  revalidationSurvivalPercentage: number;
+  accumulatedConservativeNetUSDC: number;
+  disappearanceReasons: Record<string, number>;
+}
+
 export interface LatencyReport {
   decodeLatencyUs: PercentileStats;
   quoteLatencyUs: PercentileStats;
@@ -18,6 +37,19 @@ export interface LatencyReport {
   lastReconnectDurationMs: number;
   eventLoopDelayMs: number;
   totalDecisionsMeasured: number;
+
+  // Hyperspeed Multi-Stage Telemetry (T0..T7)
+  t0ToT6TotalUs: PercentileStats;          // T0 -> T6: Total detection latency from WS packet to qualified signal
+  t0ToT1DecodeUs: PercentileStats;         // T0 -> T1: Account decode & format validation
+  t1ToT2CacheUs: PercentileStats;          // T1 -> T2: Shared state cache update
+  t2ToT3RoutesUs: PercentileStats;         // T2 -> T3: Affected routes identification
+  t3ToT4QuotingUs: PercentileStats;        // T3 -> T4: Multi-leg optimal sizing & quote calculation
+  t4ToT5CalcUs: PercentileStats;           // T4 -> T5: Conservative net profit calculation
+  t5ToT6SignalUs: PercentileStats;         // T5 -> T6: Scoring & signal emission
+  revalidationDurationUs: PercentileStats; // T6 -> T7: Immediate revalidation duration
+
+  // Survival intelligence
+  survivalStats: SurvivalStats;
 }
 
 export class LatencyTracker {
@@ -28,6 +60,22 @@ export class LatencyTracker {
   private validationSamplesUs: number[] = [];
   private decisionSamplesUs: number[] = [];
   private rpcSamplesMs: number[] = [];
+
+  // Multi-Stage Pipeline Samples (T0..T7)
+  private t0ToT6SamplesUs: number[] = [];
+  private t0ToT1SamplesUs: number[] = [];
+  private t1ToT2SamplesUs: number[] = [];
+  private t2ToT3SamplesUs: number[] = [];
+  private t3ToT4SamplesUs: number[] = [];
+  private t4ToT5SamplesUs: number[] = [];
+  private t5ToT6SamplesUs: number[] = [];
+  private revalidationSamplesUs: number[] = [];
+
+  // Survival tracking
+  private qualifiedSignalsCount = 0;
+  private revalidatedSignalsCount = 0;
+  private accumulatedConservativeNetUSDC = 0;
+  private disappearanceReasons: Record<string, number> = {};
 
   private lastSlotLag = 0;
   private lastReconnectDurationMs = 0;
@@ -82,6 +130,89 @@ export class LatencyTracker {
     this.lastReconnectDurationMs = durationMs;
   }
 
+  /**
+   * Records high-precision monotonic pipeline stages (T0 -> T6 -> T7)
+   */
+  public recordPipelineStages(stages: PipelineStages): void {
+    const { t0, t1, t2, t3, t4, t5, t6, t7 } = stages;
+
+    if (t0 > 0 && t6 >= t0) {
+      const totalDetectionUs = (t6 - t0) * 1000;
+      this.addSample(this.t0ToT6SamplesUs, totalDetectionUs);
+      this.addSample(this.decisionSamplesUs, totalDetectionUs);
+    }
+
+    if (t0 > 0 && t1 >= t0) {
+      this.addSample(this.t0ToT1SamplesUs, (t1 - t0) * 1000);
+      this.addSample(this.decodeSamplesUs, (t1 - t0) * 1000);
+    }
+
+    if (t1 > 0 && t2 >= t1) {
+      this.addSample(this.t1ToT2SamplesUs, (t2 - t1) * 1000);
+    }
+
+    if (t2 > 0 && t3 >= t2) {
+      this.addSample(this.t2ToT3SamplesUs, (t3 - t2) * 1000);
+    }
+
+    if (t3 > 0 && t4 >= t3) {
+      this.addSample(this.t3ToT4SamplesUs, (t4 - t3) * 1000);
+      this.addSample(this.quoteSamplesUs, (t4 - t3) * 1000);
+    }
+
+    if (t4 > 0 && t5 >= t4) {
+      this.addSample(this.t4ToT5SamplesUs, (t5 - t4) * 1000);
+    }
+
+    if (t5 > 0 && t6 >= t5) {
+      this.addSample(this.t5ToT6SamplesUs, (t6 - t5) * 1000);
+      this.addSample(this.validationSamplesUs, (t6 - t5) * 1000);
+    }
+
+    if (t6 > 0 && t7 !== undefined && t7 >= t6) {
+      this.addSample(this.revalidationSamplesUs, (t7 - t6) * 1000);
+    }
+  }
+
+  /**
+   * Tracks qualified signals and immediate revalidation outcome (T7)
+   */
+  public recordSignalQualification(
+    isQualified: boolean,
+    isRevalidated: boolean,
+    conservativeNetUSDC: number = 0,
+    disappearanceReason?: string
+  ): void {
+    if (!isQualified) return;
+
+    this.qualifiedSignalsCount++;
+
+    if (isRevalidated) {
+      this.revalidatedSignalsCount++;
+      this.accumulatedConservativeNetUSDC += Math.max(0, conservativeNetUSDC);
+    } else if (disappearanceReason) {
+      this.disappearanceReasons[disappearanceReason] = (this.disappearanceReasons[disappearanceReason] || 0) + 1;
+    }
+  }
+
+  public recordOpportunityDisappearance(reason: string): void {
+    this.disappearanceReasons[reason] = (this.disappearanceReasons[reason] || 0) + 1;
+  }
+
+  public getSurvivalStats(): SurvivalStats {
+    const survivalPct = this.qualifiedSignalsCount > 0
+      ? Number(((this.revalidatedSignalsCount / this.qualifiedSignalsCount) * 100).toFixed(2))
+      : 0;
+
+    return {
+      qualifiedSignalsCount: this.qualifiedSignalsCount,
+      revalidatedSignalsCount: this.revalidatedSignalsCount,
+      revalidationSurvivalPercentage: survivalPct,
+      accumulatedConservativeNetUSDC: Number(this.accumulatedConservativeNetUSDC.toFixed(4)),
+      disappearanceReasons: { ...this.disappearanceReasons }
+    };
+  }
+
   private addSample(array: number[], val: number): void {
     if (val < 0 || isNaN(val)) return;
     if (array.length >= LatencyTracker.MAX_SAMPLES) {
@@ -127,7 +258,19 @@ export class LatencyTracker {
       lastSlotLag: this.lastSlotLag,
       lastReconnectDurationMs: Number(this.lastReconnectDurationMs.toFixed(2)),
       eventLoopDelayMs: Number(this.currentEventLoopDelayMs.toFixed(2)),
-      totalDecisionsMeasured: this.decisionSamplesUs.length
+      totalDecisionsMeasured: this.decisionSamplesUs.length,
+
+      // Hyperspeed Multi-Stage Telemetry (T0..T7)
+      t0ToT6TotalUs: this.calculatePercentiles(this.t0ToT6SamplesUs),
+      t0ToT1DecodeUs: this.calculatePercentiles(this.t0ToT1SamplesUs),
+      t1ToT2CacheUs: this.calculatePercentiles(this.t1ToT2SamplesUs),
+      t2ToT3RoutesUs: this.calculatePercentiles(this.t2ToT3SamplesUs),
+      t3ToT4QuotingUs: this.calculatePercentiles(this.t3ToT4SamplesUs),
+      t4ToT5CalcUs: this.calculatePercentiles(this.t4ToT5SamplesUs),
+      t5ToT6SignalUs: this.calculatePercentiles(this.t5ToT6SamplesUs),
+      revalidationDurationUs: this.calculatePercentiles(this.revalidationSamplesUs),
+
+      survivalStats: this.getSurvivalStats()
     };
   }
 }

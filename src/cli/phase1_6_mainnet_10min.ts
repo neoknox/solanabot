@@ -95,6 +95,29 @@ export interface Phase16BenchmarkResult {
     rejectionBreakdownSummary: Record<string, number>;
     configuredBlockersSummary: Record<string, number>;
     verifiedBottlenecksSummary: Record<string, number>;
+    // Hyperspeed Multi-Stage & Survival Telemetry
+    hyperspeedLatency?: {
+      t0ToT6TotalUs: { p50: number; p95: number; p99: number };
+      stagesUs: {
+        t0ToT1Decode: { p50: number; p95: number; p99: number };
+        t1ToT2Cache: { p50: number; p95: number; p99: number };
+        t2ToT3Routes: { p50: number; p95: number; p99: number };
+        t3ToT4Quoting: { p50: number; p95: number; p99: number };
+        t4ToT5Calc: { p50: number; p95: number; p99: number };
+        t5ToT6Signal: { p50: number; p95: number; p99: number };
+        revalidationDuration: { p50: number; p95: number; p99: number };
+      };
+      survival: {
+        qualifiedSignalsCount: number;
+        revalidatedSignalsCount: number;
+        revalidationSurvivalPercentage: number;
+        accumulatedConservativeNetUSDC: number;
+        signalsPerMinute: number;
+        revalidatedPerMinute: number;
+        netUSDCPerMinute: number;
+        disappearanceReasons: Record<string, number>;
+      };
+    };
   };
   samples: SecondSample[];
 }
@@ -349,7 +372,61 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
       peakMemoryRssMb: peakMemRss,
       rejectionBreakdownSummary: { ...finalConfiguredBlockers },
       configuredBlockersSummary: { ...finalConfiguredBlockers },
-      verifiedBottlenecksSummary: { ...finalVerifiedBottlenecks }
+      verifiedBottlenecksSummary: { ...finalVerifiedBottlenecks },
+      hyperspeedLatency: {
+        t0ToT6TotalUs: {
+          p50: Number((finalLatency.t0ToT6TotalUs?.p50 || 0).toFixed(1)),
+          p95: Number((finalLatency.t0ToT6TotalUs?.p95 || 0).toFixed(1)),
+          p99: Number((finalLatency.t0ToT6TotalUs?.p99 || 0).toFixed(1))
+        },
+        stagesUs: {
+          t0ToT1Decode: {
+            p50: Number((finalLatency.t0ToT1DecodeUs?.p50 || 0).toFixed(1)),
+            p95: Number((finalLatency.t0ToT1DecodeUs?.p95 || 0).toFixed(1)),
+            p99: Number((finalLatency.t0ToT1DecodeUs?.p99 || 0).toFixed(1))
+          },
+          t1ToT2Cache: {
+            p50: Number((finalLatency.t1ToT2CacheUs?.p50 || 0).toFixed(1)),
+            p95: Number((finalLatency.t1ToT2CacheUs?.p95 || 0).toFixed(1)),
+            p99: Number((finalLatency.t1ToT2CacheUs?.p99 || 0).toFixed(1))
+          },
+          t2ToT3Routes: {
+            p50: Number((finalLatency.t2ToT3RoutesUs?.p50 || 0).toFixed(1)),
+            p95: Number((finalLatency.t2ToT3RoutesUs?.p95 || 0).toFixed(1)),
+            p99: Number((finalLatency.t2ToT3RoutesUs?.p99 || 0).toFixed(1))
+          },
+          t3ToT4Quoting: {
+            p50: Number((finalLatency.t3ToT4QuotingUs?.p50 || 0).toFixed(1)),
+            p95: Number((finalLatency.t3ToT4QuotingUs?.p95 || 0).toFixed(1)),
+            p99: Number((finalLatency.t3ToT4QuotingUs?.p99 || 0).toFixed(1))
+          },
+          t4ToT5Calc: {
+            p50: Number((finalLatency.t4ToT5CalcUs?.p50 || 0).toFixed(1)),
+            p95: Number((finalLatency.t4ToT5CalcUs?.p95 || 0).toFixed(1)),
+            p99: Number((finalLatency.t4ToT5CalcUs?.p99 || 0).toFixed(1))
+          },
+          t5ToT6Signal: {
+            p50: Number((finalLatency.t5ToT6SignalUs?.p50 || 0).toFixed(1)),
+            p95: Number((finalLatency.t5ToT6SignalUs?.p95 || 0).toFixed(1)),
+            p99: Number((finalLatency.t5ToT6SignalUs?.p99 || 0).toFixed(1))
+          },
+          revalidationDuration: {
+            p50: Number((finalLatency.revalidationDurationUs?.p50 || 0).toFixed(1)),
+            p95: Number((finalLatency.revalidationDurationUs?.p95 || 0).toFixed(1)),
+            p99: Number((finalLatency.revalidationDurationUs?.p99 || 0).toFixed(1))
+          }
+        },
+        survival: {
+          qualifiedSignalsCount: finalLatency.survivalStats.qualifiedSignalsCount,
+          revalidatedSignalsCount: finalLatency.survivalStats.revalidatedSignalsCount,
+          revalidationSurvivalPercentage: finalLatency.survivalStats.revalidationSurvivalPercentage,
+          accumulatedConservativeNetUSDC: finalLatency.survivalStats.accumulatedConservativeNetUSDC,
+          signalsPerMinute: Number((finalLatency.survivalStats.qualifiedSignalsCount / (durationSeconds / 60)).toFixed(2)),
+          revalidatedPerMinute: Number((finalLatency.survivalStats.revalidatedSignalsCount / (durationSeconds / 60)).toFixed(2)),
+          netUSDCPerMinute: Number((finalLatency.survivalStats.accumulatedConservativeNetUSDC / (durationSeconds / 60)).toFixed(4)),
+          disappearanceReasons: { ...finalLatency.survivalStats.disappearanceReasons }
+        }
+      }
     },
     samples
   };
@@ -388,6 +465,28 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
   console.log(`    Event Queue Drops:            ${result.summary.queueDropsTotal}`);
   console.log(`    Persistence Errors:           ${result.summary.persistenceErrorsTotal}`);
   console.log(`    Peak RSS Memory:              ${result.summary.peakMemoryRssMb} MB`);
+  console.log('----------------------------------------------------------------');
+  console.log('  PROJECT HYPERSPEED — MULTI-STAGE LATENCY & SURVIVAL TELEMETRY:');
+  const hs = result.summary.hyperspeedLatency;
+  if (hs) {
+    console.log(`    T0 -> T6 Total Detection:  p50: ${hs.t0ToT6TotalUs.p50} μs | p95: ${hs.t0ToT6TotalUs.p95} μs | p99: ${hs.t0ToT6TotalUs.p99} μs`);
+    console.log(`    Stage T0 -> T1 (Decode):   p50: ${hs.stagesUs.t0ToT1Decode.p50} μs | p95: ${hs.stagesUs.t0ToT1Decode.p95} μs`);
+    console.log(`    Stage T1 -> T2 (Cache):    p50: ${hs.stagesUs.t1ToT2Cache.p50} μs | p95: ${hs.stagesUs.t1ToT2Cache.p95} μs`);
+    console.log(`    Stage T2 -> T3 (Routes):   p50: ${hs.stagesUs.t2ToT3Routes.p50} μs | p95: ${hs.stagesUs.t2ToT3Routes.p95} μs`);
+    console.log(`    Stage T3 -> T4 (Quoting):  p50: ${hs.stagesUs.t3ToT4Quoting.p50} μs | p95: ${hs.stagesUs.t3ToT4Quoting.p95} μs`);
+    console.log(`    Stage T4 -> T5 (Net Calc): p50: ${hs.stagesUs.t4ToT5Calc.p50} μs | p95: ${hs.stagesUs.t4ToT5Calc.p95} μs`);
+    console.log(`    Stage T5 -> T6 (Signal):   p50: ${hs.stagesUs.t5ToT6Signal.p50} μs | p95: ${hs.stagesUs.t5ToT6Signal.p95} μs`);
+    console.log(`    Stage T6 -> T7 (Reval):    p50: ${hs.stagesUs.revalidationDuration.p50} μs | p95: ${hs.stagesUs.revalidationDuration.p95} μs`);
+    console.log('  --------------------------------------------------------------');
+    console.log(`    Qualified Shadow Signals:       ${hs.survival.qualifiedSignalsCount} (${hs.survival.signalsPerMinute} / min)`);
+    console.log(`    Revalidated Profitable Signals: ${hs.survival.revalidatedSignalsCount} (${hs.survival.revalidatedPerMinute} / min)`);
+    console.log(`    Revalidation Survival Rate:     ${hs.survival.revalidationSurvivalPercentage}%`);
+    console.log(`    Accumulated Net Profit (USDC):  $${hs.survival.accumulatedConservativeNetUSDC} ($${hs.survival.netUSDCPerMinute} / min)`);
+    console.log('    Disappearance Reasons:');
+    for (const [reason, count] of Object.entries(hs.survival.disappearanceReasons)) {
+      console.log(`      ${reason.padEnd(28)}: ${count}`);
+    }
+  }
   console.log('----------------------------------------------------------------');
   console.log('  CHECKPOINTS STATUS:');
   console.log(`    Verified Routes 250:   ${result.checkpoints.verifiedRoutes['250'].reached ? `REACHED at T+${result.checkpoints.verifiedRoutes['250'].reachedAtSecond}s` : 'NOT REACHED'}`);

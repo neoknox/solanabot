@@ -22,6 +22,23 @@ export interface RouteLegInfo {
   outputMint: string;
 }
 
+export interface PrevalidatedLegConfig {
+  poolId: string;
+  dex: DexType;
+  inputMint: string;
+  outputMint: string;
+  direction: 'A_TO_B' | 'B_TO_A';
+  slippageBps: number;
+}
+
+export interface PrevalidatedRouteConfig {
+  isValid: boolean;
+  blockerReason?: string;
+  leg0: PrevalidatedLegConfig;
+  leg1: PrevalidatedLegConfig;
+  requiresAtaSetup: boolean;
+}
+
 export interface IndexedDirectedRoute {
   routeId: string;
   cycleType: CycleType;
@@ -59,6 +76,9 @@ export interface IndexedDirectedRoute {
   // Phase 1.6 Uptime & Readiness metrics additions
   readyDurationMs?: number;
   lastBecameReadyAt?: number;
+
+  // Hyperspeed Prevalidated Dependencies Cache
+  prevalidatedConfig?: PrevalidatedRouteConfig;
 }
 
 export interface RouteBottleneckBreakdown {
@@ -161,6 +181,7 @@ export class RouteIndex {
     const changedRoutes: IndexedDirectedRoute[] = [];
     const affectedRoutes = this.poolToRoutes.get(poolId) || [];
     for (const route of affectedRoutes) {
+      route.prevalidatedConfig = undefined; // Hyperspeed: clear cached prevalidation
       const prevState = route.state;
       const prevDirect = route.isDirectToDirect;
 
@@ -573,6 +594,12 @@ export class RouteIndex {
       return routes.filter(r => r.state !== 'BLOCKED');
     }
     return routes;
+  }
+
+  public invalidateAllPrevalidatedRoutes(): void {
+    for (const route of this.allRoutes) {
+      route.prevalidatedConfig = undefined;
+    }
   }
 
   public getAllRoutes(): IndexedDirectedRoute[] {
