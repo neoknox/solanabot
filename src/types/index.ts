@@ -276,6 +276,7 @@ export interface ArbitrageCandidate {
 export interface ScanHealthStatus {
   connectedRpc: boolean;
   connectedWs: boolean;
+  wsConnectionState?: 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED' | 'FAILED';
   jupiterStatus: 'OK' | 'RATE_LIMITED' | 'UNAVAILABLE' | 'DISABLED';
   currentSlot: number;
   lastSlotUpdateTime: number;

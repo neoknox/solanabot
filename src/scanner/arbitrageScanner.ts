@@ -96,6 +96,7 @@ export class ArbitrageScanner {
   private poolLastRpcRefreshTime = new Map<string, number>();
 
   private isRunning = false;
+  private isManualReconnecting = false;
   private scanTimer: NodeJS.Timeout | null = null;
   private candidateListeners: CandidateListener[] = [];
   private vaultToPool = new Map<string, { poolId: string; isA: boolean }>();
@@ -2824,6 +2825,9 @@ export class ArbitrageScanner {
     return {
       connectedRpc: this.rpc.getStats().requestsFailed === 0 || this.rpc.getStats().requestsTotal > 0,
       connectedWs: wsStats.connected,
+      wsConnectionState: this.isManualReconnecting
+        ? 'RECONNECTING'
+        : (wsStats.connectionState || (wsStats.connected ? 'CONNECTED' : 'DISCONNECTED')),
       jupiterStatus: jupStats.rateLimitHits > 0 ? 'RATE_LIMITED' : 'OK',
       currentSlot: wsStats.lastSlot,
       lastSlotUpdateTime: wsStats.lastMessageTime,
@@ -3439,6 +3443,56 @@ export class ArbitrageScanner {
 
   public getScoutMetrics(): ScoutMetricsSummary {
     return this.automaticScout.getMetrics();
+  }
+
+  public async reconnectWebSocket(timeoutMs = 12000): Promise<{
+    success: boolean;
+    status: 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED' | 'FAILED';
+    error?: string;
+    slot?: number;
+    durationMs?: number;
+  }> {
+    const start = performance.now();
+    if (this.isManualReconnecting) {
+      return {
+        success: false,
+        status: 'RECONNECTING',
+        error: 'WebSocket reconnection already in progress'
+      };
+    }
+
+    this.isManualReconnecting = true;
+    try {
+      // 1. Manually reconnect WebSocket (safely closes old connection, cancels timers, resubscribes)
+      const connected = await this.ws.manualReconnect(timeoutMs);
+      if (!connected) {
+        return {
+          success: false,
+          status: 'FAILED',
+          error: 'WebSocket connection failed to establish or timed out',
+          durationMs: performance.now() - start
+        };
+      }
+
+      // 2. Refresh all pool states and revalidate routes
+      await this.refreshAllPoolStates();
+
+      return {
+        success: true,
+        status: 'CONNECTED',
+        slot: this.ws.getCurrentSlot(),
+        durationMs: performance.now() - start
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        status: 'FAILED',
+        error: err?.message || String(err),
+        durationMs: performance.now() - start
+      };
+    } finally {
+      this.isManualReconnecting = false;
+    }
   }
 
   public stop(): void {

@@ -17,6 +17,7 @@ export class ProfitHudServer {
   private host: string;
   private boundPort: number | null = null;
   private silent: boolean;
+  private isWsReconnecting = false;
 
   constructor(
     thresholdManager: ProfitThresholdManager,
@@ -294,6 +295,19 @@ export class ProfitHudServer {
       const activeOpportunities = tracker ? tracker.getAllActiveOpportunities() : [];
       const qualifiedActiveShadow = activeOpportunities.filter(o => o.status === 'QUALIFIED_SHADOW');
 
+      let wsStatus: 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED' | 'FAILED' | 'STANDBY' = 'STANDBY';
+      if (isScannerPresent) {
+        if (this.isWsReconnecting || health?.wsConnectionState === 'RECONNECTING') {
+          wsStatus = 'RECONNECTING';
+        } else if (health?.wsConnectionState) {
+          wsStatus = health.wsConnectionState;
+        } else if (health?.connectedWs) {
+          wsStatus = 'CONNECTED';
+        } else {
+          wsStatus = 'DISCONNECTED';
+        }
+      }
+
       const payload = {
         success: true,
         mode: 'READ-ONLY / SHADOW MODE',
@@ -303,8 +317,8 @@ export class ProfitHudServer {
         thresholdCents: this.thresholdManager.getThresholdCents(),
         formatted: this.thresholdManager.getFormattedThreshold(),
         solanaSlot: health ? health.currentSlot : null,
-        wsConnected: health ? health.connectedWs : false,
-        wsStatus: isScannerPresent ? (health && health.connectedWs ? 'CONNECTED' : 'DISCONNECTED') : 'STANDBY',
+        wsConnected: wsStatus === 'CONNECTED',
+        wsStatus,
         rpcStatus: isScannerPresent ? (health && health.connectedRpc ? 'ACTIVE' : 'DEGRADED') : 'STANDBY',
         qualifiedCount: health ? health.qualifiedCount : 0,
         rejectedCount: health ? health.rejectedCount : 0,
@@ -372,7 +386,78 @@ export class ProfitHudServer {
       return;
     }
 
-    // 5. GET / (Minimal localhost HTML control page)
+    // 5. POST /api/ws/reconnect (Manual WebSocket reconnect trigger)
+    if (pathname === '/api/ws/reconnect' && method === 'POST') {
+      if (!this.isValidOriginAndHost(req)) {
+        res.writeHead(403, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': defaultOrigin
+        });
+        res.end(JSON.stringify({
+          success: false,
+          error: 'Forbidden: State-changing requests restricted strictly to 127.0.0.1 / localhost Origin and Host'
+        }));
+        return;
+      }
+
+      if (!this.scanner) {
+        res.writeHead(503, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': corsOrigin
+        });
+        res.end(JSON.stringify({
+          success: false,
+          wsStatus: 'STANDBY',
+          error: 'Scanner not connected'
+        }));
+        return;
+      }
+
+      if (this.isWsReconnecting) {
+        res.writeHead(409, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': corsOrigin
+        });
+        res.end(JSON.stringify({
+          success: false,
+          wsStatus: 'RECONNECTING',
+          error: 'WebSocket reconnection already in progress'
+        }));
+        return;
+      }
+
+      this.isWsReconnecting = true;
+      try {
+        const outcome = await this.scanner.reconnectWebSocket();
+        const statusCode = outcome.success ? 200 : 502;
+        res.writeHead(statusCode, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': corsOrigin
+        });
+        res.end(JSON.stringify({
+          success: outcome.success,
+          wsStatus: outcome.status,
+          slot: outcome.slot,
+          durationMs: outcome.durationMs,
+          error: outcome.error
+        }));
+      } catch (err: any) {
+        res.writeHead(500, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': corsOrigin
+        });
+        res.end(JSON.stringify({
+          success: false,
+          wsStatus: 'FAILED',
+          error: err?.message || String(err)
+        }));
+      } finally {
+        this.isWsReconnecting = false;
+      }
+      return;
+    }
+
+    // 6. GET / (Minimal localhost HTML control page)
     if (pathname === '/' && method === 'GET') {
       const html = this.renderHtmlDashboard();
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -603,6 +688,30 @@ export class ProfitHudServer {
       color: #8b949e;
       cursor: not-allowed;
     }
+    .btn-ws {
+      background-color: #21262d;
+      color: #c9d1d9;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+      cursor: pointer;
+      transition: background-color 0.2s, border-color 0.2s, color 0.2s;
+      white-space: nowrap;
+    }
+    .btn-ws:hover {
+      background-color: #30363d;
+      border-color: #8b949e;
+      color: #ffffff;
+    }
+    .btn-ws:disabled {
+      background-color: #161b22;
+      border-color: #21262d;
+      color: #484f58;
+      cursor: not-allowed;
+    }
     .info-footer {
       font-size: 12px;
       color: #8b949e;
@@ -637,9 +746,15 @@ export class ProfitHudServer {
           <div class="telemetry-label">Solana Slot</div>
           <div class="telemetry-value" id="telemetrySlot">STANDBY</div>
         </div>
-        <div class="telemetry-item">
-          <div class="telemetry-label">RPC / WebSocket</div>
-          <div class="telemetry-value" id="telemetryNetwork">STANDBY / STANDBY</div>
+        <div class="telemetry-item" style="display: flex; flex-direction: column; justify-content: space-between;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+            <div class="telemetry-label" style="margin-bottom: 0;">RPC / WebSocket</div>
+            <span id="telemetryWsBadge" class="status-badge status-standby">STANDBY</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+            <div class="telemetry-value" id="telemetryNetwork">STANDBY / STANDBY</div>
+            <button id="btnReconnectWs" class="btn-ws" type="button" title="Reconnect Solana RPC WebSocket feed">RECONNECT WEBSOCKET</button>
+          </div>
         </div>
         <div class="telemetry-item">
           <div class="telemetry-label">Active Shadow Signals</div>
@@ -654,6 +769,7 @@ export class ProfitHudServer {
           <div class="telemetry-value" id="telemetryThreshold">$${currentUSDC} USDC</div>
         </div>
       </div>
+      <div id="wsAlert" class="alert" style="margin-top: 14px;"></div>
     </div>
 
     <!-- Automatic Scout & Route Expansion Card -->
@@ -746,6 +862,9 @@ export class ProfitHudServer {
       const telemetryScanner = document.getElementById('telemetryScannerStatus');
       const telemetrySlot = document.getElementById('telemetrySlot');
       const telemetryNetwork = document.getElementById('telemetryNetwork');
+      const telemetryWsBadge = document.getElementById('telemetryWsBadge');
+      const btnReconnectWs = document.getElementById('btnReconnectWs');
+      const wsAlert = document.getElementById('wsAlert');
       const telemetrySignals = document.getElementById('telemetrySignals');
       const telemetryCapital = document.getElementById('telemetryCapital');
       const telemetryThreshold = document.getElementById('telemetryThreshold');
@@ -762,6 +881,23 @@ export class ProfitHudServer {
       let activeConfirmed = parseFloat(slider.value);
       let isUpdating = false;
       let isDragging = false;
+      let isWsReconnecting = false;
+
+      function updateWsBadge(status) {
+        if (!telemetryWsBadge) return;
+        telemetryWsBadge.textContent = status;
+        if (status === 'CONNECTED') {
+          telemetryWsBadge.className = 'status-badge status-online';
+        } else if (status === 'RECONNECTING') {
+          telemetryWsBadge.className = 'status-badge status-standby';
+        } else if (status === 'FAILED') {
+          telemetryWsBadge.className = 'status-badge status-offline';
+        } else if (status === 'DISCONNECTED') {
+          telemetryWsBadge.className = 'status-badge status-offline';
+        } else {
+          telemetryWsBadge.className = 'status-badge status-standby';
+        }
+      }
 
       function showAlert(msg, isError) {
         alertBox.textContent = msg;
@@ -794,7 +930,12 @@ export class ProfitHudServer {
             : 'STANDBY';
 
           // Network RPC / WS
-          telemetryNetwork.textContent = (data.rpcStatus || 'STANDBY') + ' / ' + (data.wsStatus || 'STANDBY');
+          const rpcStr = data.rpcStatus || 'STANDBY';
+          const wsStr = data.wsStatus || 'STANDBY';
+          telemetryNetwork.textContent = rpcStr + ' / ' + wsStr;
+          if (!isWsReconnecting) {
+            updateWsBadge(wsStr);
+          }
 
           // Signals
           telemetrySignals.textContent = String(data.activeShadowSignalsCount || 0);
@@ -851,6 +992,9 @@ export class ProfitHudServer {
           telemetryScanner.textContent = 'OFFLINE';
           telemetryScanner.className = 'status-badge status-offline';
           telemetryNetwork.textContent = 'UNREACHABLE';
+          if (!isWsReconnecting) {
+            updateWsBadge('DISCONNECTED');
+          }
         }
       }
 
@@ -942,6 +1086,52 @@ export class ProfitHudServer {
           } finally {
             btnTriggerScout.disabled = false;
             btnTriggerScout.textContent = 'Trigger Scout Discovery';
+          }
+        });
+      }
+
+      if (btnReconnectWs) {
+        btnReconnectWs.addEventListener('click', async function() {
+          if (isWsReconnecting) return;
+          isWsReconnecting = true;
+          btnReconnectWs.disabled = true;
+          btnReconnectWs.textContent = 'RECONNECTING...';
+          updateWsBadge('RECONNECTING');
+          if (wsAlert) wsAlert.style.display = 'none';
+
+          try {
+            const res = await fetch('/api/ws/reconnect', { method: 'POST' });
+            const data = await res.json();
+            if (res.ok && data.success) {
+              updateWsBadge('CONNECTED');
+              telemetryNetwork.textContent = (data.rpcStatus || 'ACTIVE') + ' / CONNECTED';
+              if (wsAlert) {
+                const duration = data.durationMs ? ' (' + Math.round(data.durationMs) + 'ms)' : '';
+                const slotInfo = data.slot ? ' at slot ' + data.slot : '';
+                wsAlert.textContent = 'WebSocket reconnected successfully' + slotInfo + duration + '. Pool snapshots and routes revalidated.';
+                wsAlert.className = 'alert alert-success';
+                wsAlert.style.display = 'block';
+              }
+              fetchTelemetry();
+            } else {
+              updateWsBadge('FAILED');
+              if (wsAlert) {
+                wsAlert.textContent = 'WebSocket reconnection failed: ' + (data.error || 'Server error');
+                wsAlert.className = 'alert alert-error';
+                wsAlert.style.display = 'block';
+              }
+            }
+          } catch (err) {
+            updateWsBadge('FAILED');
+            if (wsAlert) {
+              wsAlert.textContent = 'Error contacting WebSocket reconnect endpoint: ' + (err.message || String(err));
+              wsAlert.className = 'alert alert-error';
+              wsAlert.style.display = 'block';
+            }
+          } finally {
+            btnReconnectWs.disabled = false;
+            btnReconnectWs.textContent = 'RECONNECT WEBSOCKET';
+            isWsReconnecting = false;
           }
         });
       }
