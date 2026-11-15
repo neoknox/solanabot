@@ -5,9 +5,9 @@ import { ArbitrageProfitCalculator } from '../src/profit/calculator.js';
 import { loadConfig } from '../src/config/index.js';
 import { SwapQuote } from '../src/types/index.js';
 
-describe('Test Matrix 5, 6, 7, 9: Cost Modeling, Deductions, and $0.50 Net Profit Boundary', () => {
+describe('Test Matrix 5, 6, 7, 9: Cost Modeling, Deductions, and $0.10 Net Profit Boundary', () => {
   const config = loadConfig({
-    MIN_NET_PROFIT_USDC: '0.50',
+    MIN_NET_PROFIT_USDC: '0.10',
     SAFETY_BUFFER_USDC: '0.25'
   });
   const costModel = new CostModel(config);
@@ -123,7 +123,7 @@ describe('Test Matrix 5, 6, 7, 9: Cost Modeling, Deductions, and $0.50 Net Profi
     expect(candidate.rejectionReasons).toContain('MISSING_COST_ESTIMATE');
   });
 
-  it('Matrix 9.1: Exact threshold test: $0.49 net rejected, $0.50 accepted, $0.51 accepted', () => {
+  it('Matrix 9.1: Exact threshold test: $0.09 net rejected, $0.10 accepted, $0.11 accepted', () => {
     const costs = costModel.calculateCosts({ solPriceUSDC: new Decimal(125.0), solPriceTimestamp: Date.now() }).breakdown!;
     const totalCosts = new Decimal(costs.totalCostsUSDC);
     const buffer = new Decimal(costs.safetyBufferUSDC);
@@ -134,46 +134,46 @@ describe('Test Matrix 5, 6, 7, 9: Cost Modeling, Deductions, and $0.50 Net Profi
       return BigInt(Math.ceil(rawNeeded.toNumber()));
     };
 
-    // Test $0.49 net -> MUST BE REJECTED (LOW_CONSERVATIVE_NET)
-    const outFor49 = calcNeededOut(0.49);
-    const cand49 = calculator.evaluateCandidate({
+    // Test $0.09 net -> MUST BE REJECTED (LOW_CONSERVATIVE_NET)
+    const outFor09 = calcNeededOut(0.09);
+    const cand09 = calculator.evaluateCandidate({
       initialAmountUSDC: 100000000n,
       leg1Quote,
-      leg2Quote: baseQuote(outFor49),
+      leg2Quote: baseQuote(outFor09),
       costs,
       currentSlot: 468500000,
       wsConnected: true
     });
-    expect(parseFloat(cand49.minConservativeNetUSDC)).toBeLessThan(0.50);
-    expect(cand49.status).toBe('CANDIDATE'); // Expected net is positive, but below $0.50 hurdle
-    expect(cand49.rejectionReasons).toContain('LOW_CONSERVATIVE_NET');
+    expect(parseFloat(cand09.minConservativeNetUSDC)).toBeLessThan(0.10);
+    expect(cand09.status).toBe('CANDIDATE'); // Expected net is positive, but below $0.10 hurdle
+    expect(cand09.rejectionReasons).toContain('LOW_CONSERVATIVE_NET');
 
-    // Test $0.50 net -> MUST QUALIFY (QUALIFIED_SHADOW)
-    const outFor50 = calcNeededOut(0.50);
-    const cand50 = calculator.evaluateCandidate({
+    // Test $0.10 net -> MUST QUALIFY (QUALIFIED_SHADOW)
+    const outFor10 = calcNeededOut(0.10);
+    const cand10 = calculator.evaluateCandidate({
       initialAmountUSDC: 100000000n,
       leg1Quote,
-      leg2Quote: baseQuote(outFor50),
+      leg2Quote: baseQuote(outFor10),
       costs,
       currentSlot: 468500000,
       wsConnected: true
     });
-    expect(parseFloat(cand50.minConservativeNetUSDC)).toBeGreaterThanOrEqual(0.50);
-    expect(cand50.status).toBe('QUALIFIED_SHADOW');
-    expect(cand50.rejectionReasons).toHaveLength(0);
+    expect(parseFloat(cand10.minConservativeNetUSDC)).toBeGreaterThanOrEqual(0.10);
+    expect(cand10.status).toBe('QUALIFIED_SHADOW');
+    expect(cand10.rejectionReasons).toHaveLength(0);
 
-    // Test $0.51 net -> MUST QUALIFY (QUALIFIED_SHADOW)
-    const outFor51 = calcNeededOut(0.51);
-    const cand51 = calculator.evaluateCandidate({
+    // Test $0.11 net -> MUST QUALIFY (QUALIFIED_SHADOW)
+    const outFor11 = calcNeededOut(0.11);
+    const cand11 = calculator.evaluateCandidate({
       initialAmountUSDC: 100000000n,
       leg1Quote,
-      leg2Quote: baseQuote(outFor51),
+      leg2Quote: baseQuote(outFor11),
       costs,
       currentSlot: 468500000,
       wsConnected: true
     });
-    expect(parseFloat(cand51.minConservativeNetUSDC)).toBeGreaterThanOrEqual(0.50);
-    expect(cand51.status).toBe('QUALIFIED_SHADOW');
-    expect(cand51.rejectionReasons).toHaveLength(0);
+    expect(parseFloat(cand11.minConservativeNetUSDC)).toBeGreaterThanOrEqual(0.10);
+    expect(cand11.status).toBe('QUALIFIED_SHADOW');
+    expect(cand11.rejectionReasons).toHaveLength(0);
   });
 });

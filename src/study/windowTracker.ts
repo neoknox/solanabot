@@ -51,7 +51,7 @@ export function formatQatarHour(epochMs: number): string {
 export interface OpportunityWindowTrackerOptions {
   sessionId?: string;
   targetDurationMs?: number; // Default 24 hours (86,400,000 ms)
-  profitHurdleUSDC?: number; // Default 0.50 USDC
+  profitHurdleUSDC?: number; // Default 0.10 USDC
   quoteExpiryMs?: number;    // Default 2500 ms
   repository?: ArbitrageRepository;
 }
@@ -97,7 +97,7 @@ export class OpportunityWindowTracker {
   constructor(options?: OpportunityWindowTrackerOptions) {
     this.sessionId = options?.sessionId || `study_${Date.now()}`;
     this.targetDurationMs = options?.targetDurationMs ?? 24 * 60 * 60 * 1000;
-    this.profitHurdleUSDC = options?.profitHurdleUSDC ?? 0.50;
+    this.profitHurdleUSDC = options?.profitHurdleUSDC ?? 0.10;
     this.quoteExpiryMs = options?.quoteExpiryMs ?? 2500;
     this.repository = options?.repository;
 

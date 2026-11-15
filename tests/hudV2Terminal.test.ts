@@ -279,7 +279,7 @@ describe('SOLANABOT — HUD V2 Professional Trading Terminal Suite', () => {
       expect(data.rejectionAnalysis.mostCommonBlocker).toBeDefined();
 
       // Section 8: Target Control
-      expect(data.thresholdUSDC).toBe(0.50);
+      expect(data.thresholdUSDC).toBe(0.10);
       expect(data.safetyBufferUSDC).toBe(0.25);
       expect(data.sharedVirtualCapitalUSDC).toBe(1000);
 

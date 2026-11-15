@@ -3569,7 +3569,7 @@ export class ArbitrageScanner {
     const grossSpreadPct = inputUSDCNum > 0 ? ((leg2ExpectedOutNum - inputUSDCNum) / inputUSDCNum * 100) : 0;
     const expNet = parseFloat(candidate.expectedNetUSDC) || 0;
     const consNet = parseFloat(candidate.minConservativeNetUSDC) || 0;
-    const activeTarget = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.50;
+    const activeTarget = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.10;
     const shortfall = Math.max(0, activeTarget - consNet);
 
     if (consNet > this.bestConservativeNetUSDC) {
@@ -3651,7 +3651,7 @@ export class ArbitrageScanner {
 
     if (items.length === 0) {
       const routes = this.routeIndex.getAllRoutes().slice(0, limit);
-      const activeTarget = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.50;
+      const activeTarget = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.10;
       items = routes.map((r, idx) => {
         const token = KNOWN_TOKENS[r.intermediateMint]?.symbol || (r.intermediateMint ? r.intermediateMint.slice(0, 4) + '..' + r.intermediateMint.slice(-4) : 'WSOL');
         const buyDex = r.legs[0]?.dex || 'ORCA_WHIRLPOOL';
@@ -3869,7 +3869,7 @@ export class ArbitrageScanner {
     const unvalidatedRoutes = this.routeIndex.getRouteCountByState('UNVALIDATED');
     const uptimeReport = this.routeIndex.getRouteUptimeReport(Date.now() - this.sessionStartTime);
 
-    const activeThreshold = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.50;
+    const activeThreshold = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.10;
     const totalEval = this.auditMetrics.totalEvaluated;
     const quoteValidPct = totalEval > 0 ? Number((this.quoteValidEvaluationsCount / totalEval * 100).toFixed(1)) : 0;
 

@@ -238,14 +238,14 @@ Qualified 2-Leg Windows:     ${telemetry.totalQualifiedWindows}
 Completed Market Windows:    ${closed.length}
 Censored / Interrupted:      ${censored.length}
 Still Open at Shutdown:      ${telemetry.openQualifiedWindows}
-Near Misses (Net > 0 <$0.50):${telemetry.nearMissesCount}
+Near Misses (Net > 0 <$0.10):${telemetry.nearMissesCount}
 Revalidation Survival Rate:  ${telemetry.revalidationSuccessPct.toFixed(1)}%
 
 ================================================================================
 SECTION C: PROFITABILITY DISTRIBUTION & UNIT ECONOMICS
 ================================================================================
 Best Conservative Net Profit:  $${telemetry.bestConservativeNetUSDC.toFixed(4)} USDC
-Profit Hurdle Threshold:       $0.5000 USDC net
+Profit Hurdle Threshold:       $0.1000 USDC net
 Safety Contingency Buffer:     $0.2500 USDC deducted per trade
 DEX Fees & Priority Costs:     Fully deducted before qualification
 
@@ -373,7 +373,7 @@ SECTION F: ECONOMIC FEASIBILITY & STRATEGY RECOMMENDATIONS
    Each atomic swap requires available USDC in the trading wallet.
 
 4. Recommendation:
-   Maintain strictly 2-leg atomic routes. Do not lower the $0.50 USDC safety hurdle.
+   Maintain strictly 2-leg atomic routes. Do not lower the $0.10 USDC safety hurdle.
 ================================================================================
 `;
 

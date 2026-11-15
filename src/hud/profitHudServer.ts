@@ -358,7 +358,7 @@ export class ProfitHudServer {
         thresholdUSDC: this.thresholdManager.getThresholdUSDC(),
         thresholdCents: this.thresholdManager.getThresholdCents(),
         formatted: this.thresholdManager.getFormattedThreshold(),
-        minUSDC: 0.20,
+        minUSDC: 0.10,
         maxUSDC: 0.70,
         stepUSDC: 0.05,
         allowedStepsUSDC: VALID_PROFIT_THRESHOLDS_CENTS.map(c => c / 100)
@@ -1844,7 +1844,7 @@ export class ProfitHudServer {
       <section class="card">
         <div class="card-header">
           <div class="card-title">PROFIT TARGET CONTROL</div>
-          <div class="card-subtitle">Adjust minimum conservative net profit floor ($0.20 - $0.70 USDC)</div>
+          <div class="card-subtitle">Adjust minimum conservative net profit floor ($0.10 - $0.70 USDC)</div>
         </div>
 
         <div style="text-align: center; margin: 10px 0;">
@@ -1856,17 +1856,18 @@ export class ProfitHudServer {
           <input 
             type="range" 
             id="thresholdSlider" 
-            min="0.20" 
+            min="0.10" 
             max="0.70" 
             step="0.05" 
             value="${currentUSDC}" 
             aria-label="Minimum Conservative Net Profit"
           >
           <div class="ticks">
+            <span>$0.10 (Default)</span>
             <span>$0.20</span>
             <span>$0.30</span>
             <span>$0.40</span>
-            <span>$0.50 (Default)</span>
+            <span>$0.50</span>
             <span>$0.60</span>
             <span>$0.70</span>
           </div>
@@ -2172,7 +2173,7 @@ export class ProfitHudServer {
           html += '<td>$' + item.tradeSizeUSDC.toFixed(2) + '</td>';
           html += '<td style="color:' + (item.grossSpreadPercent > 0 ? 'var(--green)' : 'var(--text-muted)') + ';">' + spreadStr + '</td>';
           html += '<td>' + expNetStr + '</td>';
-          html += '<td style="font-weight:700; color:' + (item.conservativeNetUSDC >= 0.50 ? 'var(--green)' : (item.conservativeNetUSDC > 0 ? 'var(--amber)' : 'var(--red)')) + ';">' + consNetStr + '</td>';
+          html += '<td style="font-weight:700; color:' + (item.conservativeNetUSDC >= (activeConfirmed || 0.10) ? 'var(--green)' : (item.conservativeNetUSDC > 0 ? 'var(--amber)' : 'var(--red)')) + ';">' + consNetStr + '</td>';
           html += '<td>' + shortfallStr + '</td>';
           html += '<td style="color:var(--text-muted);">' + ageSec + '</td>';
           html += '<td><span class="' + badgeClass + '">' + item.status + '</span></td>';

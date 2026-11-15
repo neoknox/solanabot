@@ -49,7 +49,7 @@ describe('Phase 1.2 Acceptance: Cost Engine, Downside Accounting & Quality Label
     expect(parseFloat(bd.potentialLossOnFailureUSDC || '0')).toBeLessThan(parseFloat(bd.totalCostsUSDC));
   });
 
-  it('Matrix 1.2-F: Exact $0.50 Profit Boundary Hurdle Enforcement', () => {
+  it('Matrix 1.2-F: Exact $0.10 Profit Boundary Hurdle Enforcement', () => {
     const quote1 = createDummyQuote({
       poolId: 'pool-A',
       inputMint: CANONICAL_USDC_MINT,
@@ -57,14 +57,14 @@ describe('Phase 1.2 Acceptance: Cost Engine, Downside Accounting & Quality Label
       outAmount: 606060606n
     });
 
-    // Test Case 1: Exactly $0.4999 conservative net (fails hurdle)
-    // Target conservative out = 100 + 0.021875 (costs) + 0.25 (buffer) + 0.4999 = 100.771775 USDC
-    // With 10 bps slippage, outAmount = 100.771775 / 0.999 = 100.872647 USDC -> 100872647n
+    // Test Case 1: Exactly $0.0999 conservative net (fails hurdle)
+    // Target conservative out = 100 + 0.021875 (costs) + 0.25 (buffer) + 0.0999 = 100.371775 USDC
+    // With 10 bps slippage, outAmount = 100.371775 / 0.999 = 100.472247 USDC -> 100472247n
     const quote2Fail = createDummyQuote({
       poolId: 'pool-B',
       inputMint: CANONICAL_WSOL_MINT,
       outputMint: CANONICAL_USDC_MINT,
-      outAmount: 100872647n
+      outAmount: 100472247n
     });
 
     const costBreakdown: CostBreakdown = {
@@ -95,14 +95,14 @@ describe('Phase 1.2 Acceptance: Cost Engine, Downside Accounting & Quality Label
     expect(candidateFail.qualityLabel).toBe('INVALID');
     expect(candidateFail.rejectionReasons).toContain('LOW_CONSERVATIVE_NET');
 
-    // Test Case 2: Exactly $0.5001 conservative net (passes hurdle)
-    // Target conservative out = 100 + 0.021875 + 0.25 + 0.5001 = 100.771975 USDC
-    // With 10 bps slippage, outAmount = 100.771975 / 0.999 = 100.872847 USDC -> 100873000n
+    // Test Case 2: Exactly $0.1001 conservative net (passes hurdle)
+    // Target conservative out = 100 + 0.021875 + 0.25 + 0.1001 = 100.371975 USDC
+    // With 10 bps slippage, outAmount = 100.371975 / 0.999 = 100.472447 USDC -> 100473000n
     const quote2Pass = createDummyQuote({
       poolId: 'pool-B',
       inputMint: CANONICAL_WSOL_MINT,
       outputMint: CANONICAL_USDC_MINT,
-      outAmount: 100873000n
+      outAmount: 100473000n
     });
 
     const candidatePass = calculator.evaluateCandidate({
@@ -117,7 +117,7 @@ describe('Phase 1.2 Acceptance: Cost Engine, Downside Accounting & Quality Label
     expect(candidatePass.status).toBe('QUALIFIED_SHADOW');
     expect(candidatePass.qualityLabel).toBe('SHADOW_QUALIFIED');
     expect(candidatePass.rejectionReasons.length).toBe(0);
-    expect(parseFloat(candidatePass.minConservativeNetUSDC)).toBeGreaterThanOrEqual(0.50);
+    expect(parseFloat(candidatePass.minConservativeNetUSDC)).toBeGreaterThanOrEqual(0.10);
   });
 
   it('Matrix 1.2-G: Opportunity Quality Labels: INVALID, INDICATIVE_ONLY, SHADOW_QUALIFIED', () => {

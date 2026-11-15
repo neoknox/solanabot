@@ -129,13 +129,13 @@ describe('Profit-First Opportunity Management Algorithm Acceptance', () => {
     }
   });
 
-  it('4. Minimum Conservative Profit Hurdle ($0.50 USDC)', () => {
+  it('4. Minimum Conservative Profit Hurdle ($0.10 USDC)', () => {
     const calc = new ArbitrageProfitCalculator(config);
 
-    // Case A: Net profit $0.45 (< $0.50 hurdle)
+    // Case A: Net profit $0.05 (< $0.10 hurdle)
     const quoteIn = { inAmount: 100000000n, outAmount: 666666666n, poolId: poolA.id, dex: poolA.dex, slot: 1000, timestamp: Date.now() } as SwapQuote;
-    // Produces $100.45 conservative output -> conservative net = $0.4475 (minus $0.0025 costs)
-    const quoteOutSubHurdle = { inAmount: 666666666n, outAmount: 100450000n, poolId: poolB.id, dex: poolB.dex, slot: 1000, timestamp: Date.now() } as SwapQuote;
+    // Produces $100.05 conservative output -> conservative net = $0.0475 (minus $0.0025 costs)
+    const quoteOutSubHurdle = { inAmount: 666666666n, outAmount: 100050000n, poolId: poolB.id, dex: poolB.dex, slot: 1000, timestamp: Date.now() } as SwapQuote;
 
     const resSub = calc.evaluateCandidate({
       initialAmountUSDC: 100000000n,
@@ -152,7 +152,7 @@ describe('Profit-First Opportunity Management Algorithm Acceptance', () => {
     expect(resSub.qualityLabel).toBe('INVALID');
     expect(resSub.rejectionReasons).toContain('LOW_CONSERVATIVE_NET');
 
-    // Case B: Net profit $1.50 (>= $0.50 hurdle)
+    // Case B: Net profit $1.50 (>= $0.10 hurdle)
     const quoteOutSuperHurdle = { inAmount: 666666666n, outAmount: 101550000n, poolId: poolB.id, dex: poolB.dex, slot: 1000, timestamp: Date.now() } as SwapQuote;
     const resSuper = calc.evaluateCandidate({
       initialAmountUSDC: 100000000n,
@@ -167,7 +167,7 @@ describe('Profit-First Opportunity Management Algorithm Acceptance', () => {
 
     expect(resSuper.status).toBe('QUALIFIED_SHADOW');
     expect(resSuper.executionStatus).toBe('EXECUTION_UNVERIFIED');
-    expect(Number(resSuper.minConservativeNetUSDC)).toBeGreaterThanOrEqual(0.50);
+    expect(Number(resSuper.minConservativeNetUSDC)).toBeGreaterThanOrEqual(0.10);
   });
 
   it('5. State-Version Deduplication & Persistence across new snapshots only', () => {

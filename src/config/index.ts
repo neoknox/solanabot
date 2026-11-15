@@ -73,7 +73,7 @@ const rawConfigSchema = z.object({
   SCAN_TOKENS: z.string().default('SOL,USDC,USDT'),
   TRADE_SIZES_USDC: z.string().default('25,50,100,250,500,1000'),
   VIRTUAL_CAPITAL_USDC: z.coerce.number().positive().default(1000),
-  MIN_NET_PROFIT_USDC: z.coerce.number().min(0.01).default(0.50),
+  MIN_NET_PROFIT_USDC: z.coerce.number().min(0.01).default(0.10),
   SAFETY_BUFFER_USDC: z.coerce.number().min(0).default(0.25),
   SLIPPAGE_BPS_LEG1: z.coerce.number().min(0).max(500).default(10),
   SLIPPAGE_BPS_LEG2: z.coerce.number().min(0).max(500).default(10),

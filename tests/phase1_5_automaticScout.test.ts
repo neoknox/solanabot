@@ -32,7 +32,7 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
     DB_PATH: testDbPath,
     DISCOVERED_POOLS_FILE: testDiscoveryFile,
     PROFIT_THRESHOLD_FILE: testThresholdFile,
-    MIN_NET_PROFIT_USDC: '0.50'
+    MIN_NET_PROFIT_USDC: '0.10'
   });
 
   function createMockWhirlpoolBuffer(options: {
@@ -621,7 +621,7 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
   it('exposes accurate Scout metrics via HUD status endpoint and supports manual trigger', async () => {
     vi.unstubAllGlobals();
     const mockRpc: any = { getAccountInfo: vi.fn() };
-    const thresholdManager = new ProfitThresholdManager({ initialThresholdUSDC: 0.50 });
+    const thresholdManager = new ProfitThresholdManager({ initialThresholdUSDC: 0.10 });
     const scout = new AutomaticScout(
       poolRegistry,
       routeIndex,

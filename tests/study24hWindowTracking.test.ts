@@ -110,7 +110,7 @@ describe('24-Hour Profitability & Opportunity Window Study Suite', () => {
   it('Requirement 1: Opens a new opportunity window on qualified survived candidate', () => {
     const tracker = new OpportunityWindowTracker({
       sessionId: 'test_session_1',
-      profitHurdleUSDC: 0.50,
+      profitHurdleUSDC: 0.10,
       repository: testRepo
     });
 
@@ -147,7 +147,7 @@ describe('24-Hour Profitability & Opportunity Window Study Suite', () => {
   it('Requirement 2: Continuous qualified evaluations update existing window without creating duplicates', () => {
     const tracker = new OpportunityWindowTracker({
       sessionId: 'test_session_2',
-      profitHurdleUSDC: 0.50,
+      profitHurdleUSDC: 0.10,
       repository: testRepo
     });
 
@@ -185,7 +185,7 @@ describe('24-Hour Profitability & Opportunity Window Study Suite', () => {
   it('Requirement 3: Deduplication ignores unchanged market snapshot', () => {
     const tracker = new OpportunityWindowTracker({
       sessionId: 'test_session_3',
-      profitHurdleUSDC: 0.50,
+      profitHurdleUSDC: 0.10,
       repository: testRepo
     });
 
@@ -209,7 +209,7 @@ describe('24-Hour Profitability & Opportunity Window Study Suite', () => {
   it('Requirement 4: Closes window with natural market reason when profitability drops', () => {
     const tracker = new OpportunityWindowTracker({
       sessionId: 'test_session_4',
-      profitHurdleUSDC: 0.50,
+      profitHurdleUSDC: 0.10,
       repository: testRepo
     });
 
@@ -217,11 +217,11 @@ describe('24-Hour Profitability & Opportunity Window Study Suite', () => {
     tracker.recordEvaluation(createMockCandidate({ minConservativeNetUSDC: '0.9000' }), undefined, 100);
     expect(tracker.getAllOpenWindows().length).toBe(1);
 
-    // 2. Net drops below hurdle ($0.30 < $0.50) while expected net remains positive
+    // 2. Net drops below hurdle ($0.05 < $0.10) while expected net remains positive
     const dropCandidate = createMockCandidate({
       status: 'REJECTED',
-      minConservativeNetUSDC: '0.3000',
-      expectedNetUSDC: '0.4500',
+      minConservativeNetUSDC: '0.0500',
+      expectedNetUSDC: '0.1500',
       rejectionReasons: []
     });
     tracker.recordEvaluation(dropCandidate, undefined, 101);
@@ -234,13 +234,13 @@ describe('24-Hour Profitability & Opportunity Window Study Suite', () => {
     expect(closed.status).toBe('CLOSED');
     expect(closed.closureReason).toBe(WindowClosureReason.TARGET_SHORTFALL);
     expect(closed.isCensored).toBe(false);
-    expect(closed.netProfitClosingUSDC).toBe(0.30);
+    expect(closed.netProfitClosingUSDC).toBe(0.05);
   });
 
   it('Requirement 5: Identifies SPREAD_COMPRESSION when expected net turns non-positive', () => {
     const tracker = new OpportunityWindowTracker({
       sessionId: 'test_session_5',
-      profitHurdleUSDC: 0.50
+      profitHurdleUSDC: 0.10
     });
 
     tracker.recordEvaluation(createMockCandidate({ minConservativeNetUSDC: '0.9000' }), undefined, 100);
@@ -396,13 +396,13 @@ describe('24-Hour Profitability & Opportunity Window Study Suite', () => {
   it('Requirement 10: Records near misses without classifying as qualified windows', () => {
     const tracker = new OpportunityWindowTracker({
       sessionId: 'test_session_10',
-      profitHurdleUSDC: 0.50
+      profitHurdleUSDC: 0.10
     });
 
     const nearMissCandidate = createMockCandidate({
       status: 'REJECTED',
-      expectedNetUSDC: '0.4200',
-      minConservativeNetUSDC: '0.2800', // Positive but below $0.50 hurdle
+      expectedNetUSDC: '0.1200',
+      minConservativeNetUSDC: '0.0500', // Positive but below $0.10 hurdle
       rejectionReasons: []
     });
 
@@ -411,8 +411,8 @@ describe('24-Hour Profitability & Opportunity Window Study Suite', () => {
     expect(tracker.getAllOpenWindows().length).toBe(0);
     const nearMisses = tracker.getNearMisses();
     expect(nearMisses.length).toBe(1);
-    expect(nearMisses[0].conservativeNetUSDC).toBe(0.28);
-    expect(nearMisses[0].shortfallUSDC).toBeCloseTo(0.22, 2);
+    expect(nearMisses[0].conservativeNetUSDC).toBe(0.05);
+    expect(nearMisses[0].shortfallUSDC).toBeCloseTo(0.05, 2);
   });
 
   it('Requirement 11: Accurately accumulates healthy uptime vs feed downtime', () => {
@@ -485,7 +485,7 @@ describe('24-Hour Profitability & Opportunity Window Study Suite', () => {
   it('Requirement 14: Clear separation of observedDurationMs vs closureIntervalMs', () => {
     const tracker = new OpportunityWindowTracker({
       sessionId: 'test_session_14',
-      profitHurdleUSDC: 0.50,
+      profitHurdleUSDC: 0.10,
       repository: testRepo
     });
 
@@ -506,8 +506,8 @@ describe('24-Hour Profitability & Opportunity Window Study Suite', () => {
     const t2 = t1 + 200;
     const dropCand = createMockCandidate({
       status: 'REJECTED',
-      minConservativeNetUSDC: '0.2000',
-      expectedNetUSDC: '0.3000',
+      minConservativeNetUSDC: '0.0500',
+      expectedNetUSDC: '0.0800',
       rejectionReasons: []
     });
     tracker.recordEvaluation(dropCand, undefined, 102, true, true, t2);

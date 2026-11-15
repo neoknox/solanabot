@@ -34,7 +34,7 @@ export async function runStudy(options: StudyRunnerOptions = {}): Promise<void> 
   const windowTracker = new OpportunityWindowTracker({
     sessionId,
     targetDurationMs,
-    profitHurdleUSDC: customConfig.MIN_NET_PROFIT_USDC || 0.50,
+    profitHurdleUSDC: customConfig.MIN_NET_PROFIT_USDC || 0.10,
     quoteExpiryMs: customConfig.MAX_QUOTE_AGE_MS || 2500,
     repository
   });

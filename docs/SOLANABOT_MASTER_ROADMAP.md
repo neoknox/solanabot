@@ -31,7 +31,7 @@ Build a persistent and expanding network of technically verified Solana arbitrag
 - **Initial token allowlist:** WSOL, USDC, USDT. Expand conservatively to established liquid tokens after correct mint, decimals, transfer behavior, valuation and protocol support are demonstrated.
 - **Initial virtual capital:** 1,000 USDC shared across simultaneous shadow opportunities, NOT 1,000 USDC per route.
 - **Default candidate trade sizes:** 25, 50, 100, 250, 500, 1,000 USDC. The existing trade sizer finds a viable size.
-- **User-controlled conservative net-profit signal threshold:** 0.20-0.70 USDC in 0.05 increments, default 0.50. This threshold filters fresh opportunities only, never route discovery or storage.
+- **User-controlled conservative net-profit signal threshold:** 0.10-0.70 USDC in 0.05 increments, default 0.10. This threshold filters fresh opportunities only, never route discovery or storage.
 - **Current code is a read-only scanner.** Future live capital remains unapproved. A real executor will need separate SOL fee balance and transaction profitability safeguards.
 
 ---

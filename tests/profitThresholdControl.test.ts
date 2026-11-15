@@ -69,22 +69,22 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
   }
 
   // 1. Initial State & Defaults
-  it('initializes to authoritative default $0.50 USDC (50 cents) on clean start', () => {
+  it('initializes to authoritative default $0.10 USDC (10 cents) on clean start', () => {
     const manager = new ProfitThresholdManager({ filePath: testFile, silent: true });
-    expect(manager.getThresholdUSDC()).toBe(0.50);
-    expect(manager.getThresholdCents()).toBe(50);
-    expect(manager.getThresholdDecimal().equals(new Decimal(0.50))).toBe(true);
-    expect(manager.getFormattedThreshold()).toBe('$0.50 USDC');
+    expect(manager.getThresholdUSDC()).toBe(0.10);
+    expect(manager.getThresholdCents()).toBe(10);
+    expect(manager.getThresholdDecimal().equals(new Decimal(0.10))).toBe(true);
+    expect(manager.getFormattedThreshold()).toBe('$0.10 USDC');
     expect(fs.existsSync(testFile)).toBe(true);
 
     const saved = JSON.parse(fs.readFileSync(testFile, 'utf-8'));
-    expect(saved.thresholdUSDC).toBe(0.50);
-    expect(saved.cents).toBe(50);
+    expect(saved.thresholdUSDC).toBe(0.10);
+    expect(saved.cents).toBe(10);
     expect(saved.mode).toBe('READ-ONLY / SHADOW MODE');
   });
 
-  // 2. Acceptance of all 11 valid steps
-  it('accepts each valid $0.05 step between $0.20 and $0.70 USDC (integer cents 20..70)', () => {
+  // 2. Acceptance of all 13 valid steps
+  it('accepts each valid $0.05 step between $0.10 and $0.70 USDC (integer cents 10..70)', () => {
     const manager = new ProfitThresholdManager({ filePath: testFile, silent: true });
 
     for (const cents of VALID_PROFIT_THRESHOLDS_CENTS) {
@@ -100,13 +100,14 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
   });
 
   // 3. Strict rejection of invalid values
-  it('strictly rejects $0.19, $0.21, $0.71, negative, fractional and malformed payloads without altering running setting', () => {
+  it('strictly rejects $0.09, $0.11, $0.71, negative, fractional and malformed payloads without altering running setting', () => {
     const manager = new ProfitThresholdManager({ filePath: testFile, silent: true });
-    expect(manager.getThresholdUSDC()).toBe(0.50);
+    expect(manager.getThresholdUSDC()).toBe(0.10);
 
     const invalidInputs = [
-      0.19,             // below min $0.20
-      0.21,             // non-step increment ($0.01)
+      0.09,             // below min $0.10
+      0.11,             // non-step increment ($0.01)
+      0.19,             // non-step increment
       0.71,             // above max $0.70
       0.49,             // non-step increment
       0.555,            // fractional cents
@@ -127,14 +128,14 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
       const res = manager.setThreshold(invalid as any);
       expect(res.success).toBe(false);
       expect(res.error).toBeDefined();
-      // Running setting remains completely unchanged at 0.50
-      expect(manager.getThresholdUSDC()).toBe(0.50);
-      expect(manager.getThresholdCents()).toBe(50);
+      // Running setting remains completely unchanged at 0.10
+      expect(manager.getThresholdUSDC()).toBe(0.10);
+      expect(manager.getThresholdCents()).toBe(10);
     }
   });
 
-  // 4. Exact boundary qualification: $0.40 fails at $0.50, qualifies at $0.40, qualifies at $0.20
-  it('demonstrates exact boundary qualification: conservative net $0.40 fails at $0.50 but qualifies at $0.40 and $0.20', () => {
+  // 4. Exact boundary qualification: $0.40 fails at $0.50, qualifies at $0.40, qualifies at $0.10
+  it('demonstrates exact boundary qualification: conservative net $0.40 fails at $0.50 but qualifies at $0.40 and $0.10', () => {
     const config = loadConfig();
     const manager = new ProfitThresholdManager({ filePath: testFile, silent: true });
     const calculator = new ArbitrageProfitCalculator(config, manager);
@@ -166,7 +167,7 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
     });
     const costs = createValidCosts();
 
-    // A) At default $0.50 hurdle: $0.40 is strictly less than $0.50 -> REJECTED (LOW_CONSERVATIVE_NET)
+    // A) At $0.50 hurdle: $0.40 is strictly less than $0.50 -> REJECTED (LOW_CONSERVATIVE_NET)
     manager.setThreshold(0.50);
     const candidateAt50 = calculator.evaluateCandidate({
       initialAmountUSDC: 100_000_000n,
@@ -199,9 +200,9 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
     expect(candidateAt40.rejectionReasons).toHaveLength(0);
     expect(candidateAt40.evaluatedMinNetProfitUSDC).toBe(0.40);
 
-    // C) At $0.20 hurdle: $0.4000 >= $0.20 -> QUALIFIED_SHADOW
-    manager.setThreshold(0.20);
-    const candidateAt20 = calculator.evaluateCandidate({
+    // C) At $0.10 hurdle: $0.4000 >= $0.10 -> QUALIFIED_SHADOW
+    manager.setThreshold(0.10);
+    const candidateAt10 = calculator.evaluateCandidate({
       initialAmountUSDC: 100_000_000n,
       leg1Quote: leg1,
       leg2Quote: leg2,
@@ -210,8 +211,8 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
       currentSlot: 1000,
       wsConnected: true
     });
-    expect(candidateAt20.status).toBe('QUALIFIED_SHADOW');
-    expect(candidateAt20.evaluatedMinNetProfitUSDC).toBe(0.20);
+    expect(candidateAt10.status).toBe('QUALIFIED_SHADOW');
+    expect(candidateAt10.evaluatedMinNetProfitUSDC).toBe(0.10);
   });
 
   // 5. Shared authoritative owner between Calculator and Scanner without restart
@@ -220,7 +221,7 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
     const manager = new ProfitThresholdManager({ filePath: testFile, silent: true });
     const scanner = new ArbitrageScanner(config, undefined, undefined, undefined, undefined, manager);
 
-    expect(scanner.getProfitThresholdManager().getThresholdUSDC()).toBe(0.50);
+    expect(scanner.getProfitThresholdManager().getThresholdUSDC()).toBe(0.10);
 
     // Update threshold to $0.35 via manager
     manager.setThreshold(0.35);
@@ -231,7 +232,7 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
   });
 
   // 6. Persistence across restarts and corrupt file recovery
-  it('persists selection across restarts, and safely recovers to $0.50 with warning on corrupt file', () => {
+  it('persists selection across restarts, and safely recovers to $0.10 with warning on corrupt file', () => {
     // Session 1: change to $0.65
     const session1 = new ProfitThresholdManager({ filePath: testFile, silent: true });
     session1.setThreshold(0.65);
@@ -245,10 +246,10 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
     // Corrupt file simulation: write invalid JSON
     fs.writeFileSync(testFile, '{"thresholdUSDC": 999, "invalid": true', 'utf-8');
 
-    // Session 3: corrupt file triggers fallback to $0.50 default
+    // Session 3: corrupt file triggers fallback to $0.10 default
     const session3 = new ProfitThresholdManager({ filePath: testFile, silent: true });
-    expect(session3.getThresholdUSDC()).toBe(0.50);
-    expect(session3.getThresholdCents()).toBe(50);
+    expect(session3.getThresholdUSDC()).toBe(0.10);
+    expect(session3.getThresholdCents()).toBe(10);
   });
 
   // 7. Active shadow signal invalidation / clearance on threshold elevation
@@ -304,15 +305,15 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
       expect(getHtmlRes.statusCode).toBe(200);
       expect(getHtmlRes.body).toContain('READ-ONLY / SHADOW MODE');
       expect(getHtmlRes.body).toContain('thresholdSlider');
-      expect(getHtmlRes.body).toContain('$0.50 USDC');
+      expect(getHtmlRes.body).toContain('$0.10 USDC');
 
       // B) GET /api/threshold returns active setting
       const getApiRes = await makeHttpRequest(`http://127.0.0.1:${port}/api/threshold`, 'GET');
       expect(getApiRes.statusCode).toBe(200);
       const thresholdJson = JSON.parse(getApiRes.body);
       expect(thresholdJson.success).toBe(true);
-      expect(thresholdJson.thresholdUSDC).toBe(0.50);
-      expect(thresholdJson.thresholdCents).toBe(50);
+      expect(thresholdJson.thresholdUSDC).toBe(0.10);
+      expect(thresholdJson.thresholdCents).toBe(10);
       expect(thresholdJson.mode).toBe('READ-ONLY / SHADOW MODE');
 
       // C) POST /api/threshold with foreign Origin is REJECTED with 403 Forbidden
@@ -323,7 +324,7 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
         { 'Origin': 'http://malicious-site.com', 'Content-Type': 'application/json' }
       );
       expect(foreignPostRes.statusCode).toBe(403);
-      expect(manager.getThresholdUSDC()).toBe(0.50); // unchanged
+      expect(manager.getThresholdUSDC()).toBe(0.10); // unchanged
 
       // D) POST /api/threshold with local Origin succeeds and updates live setting
       const localPostRes = await makeHttpRequest(
@@ -360,7 +361,7 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
   it('confirms lowering the threshold NEVER bypasses safety buffer, excessive price impact or unverified routes', () => {
     const config = loadConfig();
     const manager = new ProfitThresholdManager({ filePath: testFile, silent: true });
-    manager.setThreshold(0.20); // lowest allowed threshold
+    manager.setThreshold(0.10); // lowest allowed threshold
     const calculator = new ArbitrageProfitCalculator(config, manager);
 
     // Excessive price impact quote (e.g. 500 bps > MAX_PRICE_IMPACT_BPS 200)

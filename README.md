@@ -93,7 +93,7 @@ npm run export:csv
 | `SCAN_TOKENS` | `SOL,USDC` | Token allowlist (canonical WSOL & USDC only) |
 | `TRADE_SIZES_USDC` | `25,50,100,250,500,1000` | Simulated trade sizes in USDC |
 | `VIRTUAL_CAPITAL_USDC` | `1000` | Upper bound virtual capital filter |
-| `MIN_NET_PROFIT_USDC` | `0.50` | Minimum net profit hurdle in USDC after all variable fees |
+| `MIN_NET_PROFIT_USDC` | `0.10` | Minimum net profit hurdle in USDC after all variable fees |
 | `SAFETY_BUFFER_USDC` | `0.25` | Additional conservative safety buffer deducted before qualification |
 | `SLIPPAGE_BPS_LEG1` | `10` | Conservative downside slippage allowance on leg 1 (0.10%) |
 | `SLIPPAGE_BPS_LEG2` | `10` | Conservative downside slippage allowance on leg 2 (0.10%) |
@@ -108,8 +108,8 @@ npm run export:csv
 
 - **`OBSERVED`**: Raw pool state updated on-chain; quotes not yet matched.
 - **`PRICED`**: Both legs quoted; time and slot synchronization checks passed.
-- **`CANDIDATE`**: Full cost model applied; expected quote net > $0, but conservative net < $0.50.
-- **`QUALIFIED_SHADOW`**: Conservative net profit $\ge \$0.50$ after all network fees, priority fees, tips, slippage, and safety buffer.
+- **`CANDIDATE`**: Full cost model applied; expected quote net > $0, but conservative net < authoritative hurdle ($0.10 default).
+- **`QUALIFIED_SHADOW`**: Conservative net profit $\ge \$0.10$ after all network fees, priority fees, tips, slippage, and safety buffer.
 - **`REJECTED`**: Violated profit hurdle, price impact, or freshness rules. Includes explicit rejection code.
 - **`STALE` / `DEGRADED`**: Quote age exceeded or WebSocket disconnected.
 - **`EXECUTABLE_VERIFIED`**: **RESERVED FOR FUTURE PHASES**. Never emitted in Phase 1.

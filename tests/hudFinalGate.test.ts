@@ -114,7 +114,7 @@ describe('Phase 1.3: HUD Final Gate & Telemetry Verification Suite', () => {
   it('on persistence write failure: keeps previous confirmed threshold, returns actionable error, and leaves listener unchanged', () => {
     const { thresholdFile } = getUniqueTestFiles();
     const manager = new ProfitThresholdManager({ filePath: thresholdFile, silent: true });
-    expect(manager.getThresholdUSDC()).toBe(0.50);
+    expect(manager.getThresholdUSDC()).toBe(0.10);
 
     let listenerCallCount = 0;
     manager.onThresholdChange(() => {
@@ -135,11 +135,11 @@ describe('Phase 1.3: HUD Final Gate & Telemetry Verification Suite', () => {
     expect(result.error).toContain('EACCES');
 
     // Must retain previous confirmed threshold
-    expect(result.thresholdUSDC).toBe(0.50);
-    expect(result.thresholdCents).toBe(50);
-    expect(manager.getThresholdUSDC()).toBe(0.50);
-    expect(manager.getThresholdCents()).toBe(50);
-    expect(manager.getFormattedThreshold()).toBe('$0.50 USDC');
+    expect(result.thresholdUSDC).toBe(0.10);
+    expect(result.thresholdCents).toBe(10);
+    expect(manager.getThresholdUSDC()).toBe(0.10);
+    expect(manager.getThresholdCents()).toBe(10);
+    expect(manager.getFormattedThreshold()).toBe('$0.10 USDC');
 
     // Change listeners must NOT be called
     expect(listenerCallCount).toBe(0);
@@ -227,7 +227,7 @@ describe('Phase 1.3: HUD Final Gate & Telemetry Verification Suite', () => {
       expect(dataA.rpcStatus).toBe('STANDBY');
       expect(dataA.wsStatus).toBe('STANDBY');
       expect(dataA.solanaSlot).toBeNull();
-      expect(dataA.thresholdUSDC).toBe(0.50);
+      expect(dataA.thresholdUSDC).toBe(0.10);
     } finally {
       await hudWithoutScanner.stop();
     }
@@ -245,7 +245,7 @@ describe('Phase 1.3: HUD Final Gate & Telemetry Verification Suite', () => {
       expect(resB.statusCode).toBe(200);
       const dataB = JSON.parse(resB.body);
       expect(dataB.scannerStatus).toBe('ONLINE');
-      expect(dataB.thresholdUSDC).toBe(0.50);
+      expect(dataB.thresholdUSDC).toBe(0.10);
       expect(dataB.activeShadowSignalsCount).toBe(0);
       expect(dataB.activeAllocatedCapitalUSDC).toBe(0);
 
@@ -368,7 +368,7 @@ describe('Phase 1.3: HUD Final Gate & Telemetry Verification Suite', () => {
       );
       expect(foreignPostRes.statusCode).toBe(403);
       expect(foreignPostRes.headers['access-control-allow-origin']).not.toBe('http://attacker-site.com');
-      expect(manager.getThresholdUSDC()).toBe(0.50); // Unchanged
+      expect(manager.getThresholdUSDC()).toBe(0.10); // Unchanged
 
       // C) Mismatched Host header: 403 Forbidden
       const badHostRes = await makeHttpRequest(
@@ -378,7 +378,7 @@ describe('Phase 1.3: HUD Final Gate & Telemetry Verification Suite', () => {
         { 'Host': 'evil.com', 'Origin': `http://127.0.0.1:${port}`, 'Content-Type': 'application/json' }
       );
       expect(badHostRes.statusCode).toBe(403);
-      expect(manager.getThresholdUSDC()).toBe(0.50); // Unchanged
+      expect(manager.getThresholdUSDC()).toBe(0.10); // Unchanged
 
       // D) Valid local Origin & Host: 200 OK
       const validPostRes = await makeHttpRequest(

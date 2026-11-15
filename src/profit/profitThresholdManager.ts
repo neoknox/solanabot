@@ -2,13 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import Decimal from 'decimal.js';
 
-export const VALID_PROFIT_THRESHOLDS_CENTS = [20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70] as const;
+export const VALID_PROFIT_THRESHOLDS_CENTS = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70] as const;
 export type ValidProfitThresholdCents = typeof VALID_PROFIT_THRESHOLDS_CENTS[number];
 
 export const VALID_CENTS_SET = new Set<number>(VALID_PROFIT_THRESHOLDS_CENTS);
 
-export const DEFAULT_PROFIT_THRESHOLD_CENTS: ValidProfitThresholdCents = 50; // $0.50 USDC
-export const MIN_PROFIT_THRESHOLD_USDC = 0.20;
+export const DEFAULT_PROFIT_THRESHOLD_CENTS: ValidProfitThresholdCents = 10; // $0.10 USDC
+export const MIN_PROFIT_THRESHOLD_USDC = 0.10;
 export const MAX_PROFIT_THRESHOLD_USDC = 0.70;
 export const STEP_PROFIT_THRESHOLD_USDC = 0.05;
 
@@ -35,7 +35,7 @@ export interface ProfitThresholdManagerOptions {
  * - Integer cents representation (20, 25, ..., 70) eliminates floating-point drift.
  * - Precise Decimal conversions for mathematical comparisons in pricing and rechecks.
  * - Safe atomic local JSON persistence (write to temp file then rename).
- * - Startup validation with automatic fallback to $0.50 USDC on missing or corrupt files.
+ * - Startup validation with automatic fallback to $0.10 USDC on missing or corrupt files.
  * - Event listener support for immediate updates without restarting the scanner.
  */
 export class ProfitThresholdManager {
@@ -67,14 +67,14 @@ export class ProfitThresholdManager {
         } else {
           if (!this.silent) {
             console.warn(
-              `[ProfitThresholdManager] WARNING: Corrupt or non-compliant threshold payload in "${this.filePath}". Falling back to default $0.50 USDC.`
+              `[ProfitThresholdManager] WARNING: Corrupt or non-compliant threshold payload in "${this.filePath}". Falling back to default $0.10 USDC.`
             );
           }
         }
       } catch (err) {
         if (!this.silent) {
           console.warn(
-            `[ProfitThresholdManager] WARNING: Failed to parse threshold file "${this.filePath}". Falling back to default $0.50 USDC. (${err instanceof Error ? err.message : String(err)})`
+            `[ProfitThresholdManager] WARNING: Failed to parse threshold file "${this.filePath}". Falling back to default $0.10 USDC. (${err instanceof Error ? err.message : String(err)})`
           );
         }
       }
@@ -151,7 +151,7 @@ export class ProfitThresholdManager {
    * Validates a candidate value (number or string representation of USDC or cents).
    * Strict validation:
    * - Must be numeric, non-empty, finite.
-   * - Must be between $0.20 and $0.70 USDC in exact $0.05 increments (integer cents 20, 25, ..., 70).
+   * - Must be between $0.10 and $0.70 USDC in exact $0.05 increments (integer cents 10, 15, ..., 70).
    * - Rejects NaN, non-numeric strings, negative numbers, out-of-range, and non-multiples of $0.05.
    */
   public validateCandidateValue(input: unknown): { valid: boolean; cents?: number; error?: string } {
@@ -177,9 +177,9 @@ export class ProfitThresholdManager {
       return { valid: false, error: 'Threshold must be a valid finite number' };
     }
 
-    // Determine if input is provided as cents integer (e.g. 20, 50, 70) or decimal USDC (0.20, 0.50, 0.70)
+    // Determine if input is provided as cents integer (e.g. 10, 20, 50, 70) or decimal USDC (0.10, 0.20, 0.50, 0.70)
     let cents: number;
-    if (Number.isInteger(num) && num >= 20 && num <= 70 && VALID_CENTS_SET.has(num)) {
+    if (Number.isInteger(num) && num >= 10 && num <= 70 && VALID_CENTS_SET.has(num)) {
       cents = num;
     } else {
       // Range check for USDC dollars
@@ -203,7 +203,7 @@ export class ProfitThresholdManager {
     if (!VALID_CENTS_SET.has(cents)) {
       return {
         valid: false,
-        error: `Invalid threshold step. Must be an exact multiple of $0.05 USDC between $0.20 and $0.70. Received: $${(cents / 100).toFixed(2)}`
+        error: `Invalid threshold step. Must be an exact multiple of $0.05 USDC between $0.10 and $0.70. Received: $${(cents / 100).toFixed(2)}`
       };
     }
 
