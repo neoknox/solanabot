@@ -13,7 +13,13 @@ import {
   VerifiedPoolRecord,
   RouteSummaryStats,
   ScoutMetricsSummary,
-  HotActivationOutcome
+  HotActivationOutcome,
+  ProfitWatchItem,
+  RejectionCategoryStats,
+  RejectionAnalysisReport,
+  HistoricalVsSessionReport,
+  ScannerDiagnostics,
+  HudV2Payload
 } from '../types/index.js';
 import { AutomaticScout, ScoutCycleResult } from './automaticScout.js';
 import { SolanaRpcProvider } from '../providers/solanaRpc.js';
@@ -27,7 +33,7 @@ import { CostModel } from '../profit/costModel.js';
 import { ArbitrageProfitCalculator } from '../profit/calculator.js';
 import { ProfitThresholdManager } from '../profit/profitThresholdManager.js';
 import { ArbitrageRepository } from '../storage/repository.js';
-import { CANONICAL_WSOL_MINT, CANONICAL_USDC_MINT } from '../config/index.js';
+import { CANONICAL_WSOL_MINT, CANONICAL_USDC_MINT, KNOWN_TOKENS } from '../config/index.js';
 import { RouteIndex, IndexedDirectedRoute, PrevalidatedRouteConfig } from './routeIndex.js';
 import { BoundedEventQueue, QueuedAccountUpdate } from './eventQueue.js';
 import { LatencyTracker, LatencyReport, SurvivalStats } from '../telemetry/latencyTracker.js';
@@ -112,6 +118,21 @@ export class ArbitrageScanner {
   private quotesProducedCount = 0;
   private lastQuoteCountResetTime = Date.now();
   private currentQuotesPerSec = 0;
+
+  // HUD V2 Telemetry & Real-Time Aggregates
+  private sessionStartTime = Date.now();
+  private evaluationsProducedCount = 0;
+  private currentEvaluationsPerSec = 0;
+  private quoteValidEvaluationsCount = 0;
+  private accountUpdatesCount = 0;
+  private currentAccountUpdatesPerSec = 0;
+  private lastEventLoopTime = performance.now();
+  private eventLoopDelayMs = 0;
+  private bestConservativeNetUSDC = 0;
+  private wsLastReconnectTime: number | null = null;
+  private profitWatchBuffer = new Map<string, ProfitWatchItem>();
+  private rollingQualifiedNetProfit: Array<{ timestamp: number; conservativeNetUSDC: number }> = [];
+  private rollingRejections: Array<{ timestamp: number; reason: string }> = [];
 
   private auditMetrics: AuditMetrics = {
     totalEvaluated: 0,
@@ -277,6 +298,7 @@ export class ArbitrageScanner {
     });
 
     this.ws.onReconnect(async () => {
+      this.wsLastReconnectTime = Date.now();
       const reconnectStart = performance.now();
       this.routeIndex.invalidateAllPrevalidatedRoutes();
       this.repository.logProviderEvent(
@@ -336,11 +358,19 @@ export class ArbitrageScanner {
       const elapsed = (now - this.lastQuoteCountResetTime) / 1000;
       if (elapsed >= 1.0) {
         this.currentQuotesPerSec = Math.round(this.quotesProducedCount / elapsed);
+        this.currentEvaluationsPerSec = Math.round(this.evaluationsProducedCount / elapsed);
+        this.currentAccountUpdatesPerSec = Math.round(this.accountUpdatesCount / elapsed);
         this.quotesProducedCount = 0;
+        this.evaluationsProducedCount = 0;
+        this.accountUpdatesCount = 0;
         this.lastQuoteCountResetTime = now;
       }
 
       // Check event loop delay
+      const perfNow = performance.now();
+      const delta = perfNow - this.lastEventLoopTime;
+      this.eventLoopDelayMs = Math.max(0, Math.round(delta - scanInterval));
+      this.lastEventLoopTime = perfNow;
       this.latencyTracker.measureEventLoopDelay();
 
       // Drain queued WebSocket account updates
@@ -370,6 +400,7 @@ export class ArbitrageScanner {
   }
 
   private enqueueUpdate(update: QueuedAccountUpdate): void {
+    this.accountUpdatesCount++;
     this.eventQueue.enqueue(update);
     this.scheduleImmediateDrain(true);
   }
@@ -1444,6 +1475,7 @@ export class ArbitrageScanner {
 
     // 1. TOTAL ATTEMPTS EVALUATED: Every candidate route evaluation entering the pipeline
     this.auditMetrics.totalEvaluated++;
+    this.evaluationsProducedCount++;
     this.auditMetrics.twoLegEvaluated = (this.auditMetrics.twoLegEvaluated || 0) + 1;
     if (route.isIntraDex) {
       this.auditMetrics.intraDexEvaluated = (this.auditMetrics.intraDexEvaluated || 0) + 1;
@@ -1649,6 +1681,7 @@ export class ArbitrageScanner {
       this.auditMetrics.rejectedRoutes++;
       const reason = (sizerResult.allEvaluations[0]?.rejectionReason || 'INSUFFICIENT_LIQUIDITY') as RejectionReasonCode;
       this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
+      this.rollingRejections.push({ timestamp: Date.now(), reason });
       if (reason === 'QUOTE_UNVERIFIED' || reason === 'MISSING_TICK_DATA' || reason === 'TICK_BOUNDARY_EXCEEDED') {
         this.auditMetrics.quoteValidationFailures++;
       }
@@ -1661,6 +1694,7 @@ export class ArbitrageScanner {
 
     // 3. QUOTE-VALID STAGE: Exact quotes successfully produced for all legs on both expected and conservative paths
     this.auditMetrics.quoteValidRouteCount = (this.auditMetrics.quoteValidRouteCount || 0) + 1;
+    this.quoteValidEvaluationsCount++;
 
     // Conservative net profit calculation (T4 -> T5)
     const calcStart = performance.now();
@@ -1794,6 +1828,9 @@ export class ArbitrageScanner {
         revalRes.reason
       );
 
+      const consVal = parseFloat(candidate.minConservativeNetUSDC) || 0;
+      this.rollingQualifiedNetProfit.push({ timestamp: Date.now(), conservativeNetUSDC: consVal });
+
       this.latencyTracker.recordPipelineStages({
         t0: _t0,
         tDequeue: _tDequeue,
@@ -1815,6 +1852,7 @@ export class ArbitrageScanner {
       this.auditMetrics.rejectedRoutes++;
       for (const reason of candidate.rejectionReasons) {
         this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
+        this.rollingRejections.push({ timestamp: Date.now(), reason });
         if (reason === 'QUOTE_UNVERIFIED' || reason === 'MISSING_TICK_DATA') {
           this.auditMetrics.quoteValidationFailures++;
         }
@@ -1839,6 +1877,9 @@ export class ArbitrageScanner {
         isQualified: false
       });
     }
+
+    // Always update profit watch buffer with genuine fresh evaluation
+    this.recordProfitWatchEvaluation(candidate, route);
 
     if (isDupe) {
       return;
@@ -3493,6 +3534,393 @@ export class ArbitrageScanner {
     } finally {
       this.isManualReconnecting = false;
     }
+  }
+
+  private recordProfitWatchEvaluation(candidate: ArbitrageCandidate, route: IndexedDirectedRoute): void {
+    const tokenSymbol = KNOWN_TOKENS[route.intermediateMint]?.symbol ||
+      (route.intermediateMint ? route.intermediateMint.slice(0, 4) + '..' + route.intermediateMint.slice(-4) : 'UNKNOWN');
+
+    const inputUSDCNum = Number(candidate.inputAmountUSDC) / 1e6;
+    const leg2ExpectedOutNum = Number(candidate.leg2ExpectedOutUSDC) / 1e6;
+    const grossSpreadPct = inputUSDCNum > 0 ? ((leg2ExpectedOutNum - inputUSDCNum) / inputUSDCNum * 100) : 0;
+    const expNet = parseFloat(candidate.expectedNetUSDC) || 0;
+    const consNet = parseFloat(candidate.minConservativeNetUSDC) || 0;
+    const activeTarget = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.50;
+    const shortfall = Math.max(0, activeTarget - consNet);
+
+    if (consNet > this.bestConservativeNetUSDC) {
+      this.bestConservativeNetUSDC = consNet;
+    }
+
+    let classification: 'QUALIFIED' | 'NEAR_MISS' | 'REJECTED' = 'REJECTED';
+    if (candidate.status === 'QUALIFIED_SHADOW' && candidate.survivalStatus === 'SURVIVED') {
+      classification = 'QUALIFIED';
+    } else if (consNet > 0 || expNet > 0) {
+      classification = 'NEAR_MISS';
+    }
+
+    const watchItem: ProfitWatchItem = {
+      rank: 0,
+      candidateId: candidate.candidateId,
+      token: tokenSymbol,
+      buyDex: candidate.leg1Quote.dex,
+      sellDex: candidate.leg2Quote.dex,
+      tradeSizeUSDC: candidate.optimalSizeUSDC || inputUSDCNum,
+      grossSpreadPercent: Number(grossSpreadPct.toFixed(3)),
+      expectedNetUSDC: Number(expNet.toFixed(4)),
+      conservativeNetUSDC: Number(consNet.toFixed(4)),
+      shortfallToTargetUSDC: Number(shortfall.toFixed(4)),
+      quoteAgeMs: candidate.quoteAgeMs,
+      status: candidate.status === 'QUALIFIED_SHADOW'
+        ? (candidate.survivalStatus === 'SURVIVED' ? 'SURVIVED' : 'QUALIFIED_SHADOW')
+        : (candidate.rejectionReasons[0] || candidate.status),
+      classification,
+      leg1PoolId: candidate.leg1Quote.poolId,
+      leg2PoolId: candidate.leg2Quote.poolId,
+      leg1Direction: `${KNOWN_TOKENS[candidate.leg1Quote.inputMint]?.symbol || 'USDC'} -> ${tokenSymbol}`,
+      leg2Direction: `${tokenSymbol} -> ${KNOWN_TOKENS[candidate.leg2Quote.outputMint]?.symbol || 'USDC'}`,
+      leg1FeeBps: this.poolRegistry.getPool(candidate.leg1Quote.poolId)?.feeBps ?? 25,
+      leg2FeeBps: this.poolRegistry.getPool(candidate.leg2Quote.poolId)?.feeBps ?? 25,
+      priceImpactBps: Math.max(candidate.leg1Quote.priceImpactBps || 0, candidate.leg2Quote.priceImpactBps || 0),
+      slippageBps: 50,
+      networkFeeUSDC: candidate.costs.networkFeeUSDC,
+      priorityFeeUSDC: candidate.costs.priorityFeeUSDC,
+      jitoTipUSDC: candidate.costs.jitoTipUSDC,
+      safetyBufferUSDC: candidate.costs.safetyBufferUSDC,
+      totalCostsUSDC: candidate.costs.totalCostsUSDC,
+      slotGap: candidate.slotGap,
+      revalidationStatus: candidate.survivalStatus || 'UNCHECKED',
+      timestamp: candidate.timestamp || Date.now()
+    };
+
+    const bufferKey = `${route.routeId}:${inputUSDCNum}`;
+    this.profitWatchBuffer.set(bufferKey, watchItem);
+    if (this.profitWatchBuffer.size > 100) {
+      const oldestKey = this.profitWatchBuffer.keys().next().value;
+      if (oldestKey) this.profitWatchBuffer.delete(oldestKey);
+    }
+  }
+
+  public getProfitWatchTable(limit = 10): ProfitWatchItem[] {
+    const now = Date.now();
+    let items = Array.from(this.profitWatchBuffer.values())
+      .filter(i => now - i.timestamp <= 60000);
+
+    if (items.length < limit) {
+      items = Array.from(this.profitWatchBuffer.values())
+        .filter(i => now - i.timestamp <= 300000);
+    }
+
+    items.sort((a, b) => {
+      const classRank = { QUALIFIED: 0, NEAR_MISS: 1, REJECTED: 2 };
+      if (classRank[a.classification] !== classRank[b.classification]) {
+        return classRank[a.classification] - classRank[b.classification];
+      }
+      if (a.classification === 'QUALIFIED') {
+        return b.conservativeNetUSDC - a.conservativeNetUSDC;
+      }
+      if (a.classification === 'NEAR_MISS') {
+        return a.shortfallToTargetUSDC - b.shortfallToTargetUSDC;
+      }
+      return b.expectedNetUSDC - a.expectedNetUSDC;
+    });
+
+    if (items.length === 0) {
+      const routes = this.routeIndex.getAllRoutes().slice(0, limit);
+      const activeTarget = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.50;
+      items = routes.map((r, idx) => {
+        const token = KNOWN_TOKENS[r.intermediateMint]?.symbol || (r.intermediateMint ? r.intermediateMint.slice(0, 4) + '..' + r.intermediateMint.slice(-4) : 'WSOL');
+        const buyDex = r.legs[0]?.dex || 'ORCA_WHIRLPOOL';
+        const sellDex = r.legs[1]?.dex || 'RAYDIUM_AMM';
+        return {
+          rank: idx + 1,
+          candidateId: `INIT-${r.routeId}`,
+          token,
+          buyDex,
+          sellDex,
+          tradeSizeUSDC: 100,
+          grossSpreadPercent: 0,
+          expectedNetUSDC: 0,
+          conservativeNetUSDC: 0,
+          shortfallToTargetUSDC: activeTarget,
+          quoteAgeMs: 0,
+          status: r.state === 'READY' ? 'READY' : (r.state || 'UNVALIDATED'),
+          classification: 'NEAR_MISS',
+          leg1PoolId: r.legs[0]?.poolId || 'N/A',
+          leg2PoolId: r.legs[1]?.poolId || 'N/A',
+          leg1Direction: `USDC -> ${token}`,
+          leg2Direction: `${token} -> USDC`,
+          leg1FeeBps: 25,
+          leg2FeeBps: 25,
+          priceImpactBps: 0,
+          slippageBps: 50,
+          networkFeeUSDC: '0.001000',
+          priorityFeeUSDC: '0.002000',
+          jitoTipUSDC: '0.000000',
+          safetyBufferUSDC: '0.250000',
+          totalCostsUSDC: '0.023000',
+          slotGap: 0,
+          revalidationStatus: 'INITIALIZING',
+          timestamp: now
+        };
+      });
+    }
+
+    const top = items.slice(0, limit);
+    top.forEach((item, idx) => {
+      item.rank = idx + 1;
+      item.quoteAgeMs = Math.max(0, Date.now() - item.timestamp);
+    });
+    return top;
+  }
+
+  public getRejectionAnalysis(): RejectionAnalysisReport {
+    const now = Date.now();
+    this.rollingRejections = this.rollingRejections.filter(item => now - item.timestamp <= 60000);
+
+    const categories: Array<'EXCESSIVE_PRICE_IMPACT' | 'SLOT_MISMATCH' | 'STALE_QUOTE' | 'WS_DISCONNECTED' | 'LOW_CONSERVATIVE_NET' | 'INSUFFICIENT_LIQUIDITY' | 'OTHER'> = [
+      'EXCESSIVE_PRICE_IMPACT',
+      'SLOT_MISMATCH',
+      'STALE_QUOTE',
+      'WS_DISCONNECTED',
+      'LOW_CONSERVATIVE_NET',
+      'INSUFFICIENT_LIQUIDITY',
+      'OTHER'
+    ];
+
+    const sessionCounts: Record<string, number> = {
+      EXCESSIVE_PRICE_IMPACT: 0,
+      SLOT_MISMATCH: 0,
+      STALE_QUOTE: 0,
+      WS_DISCONNECTED: 0,
+      LOW_CONSERVATIVE_NET: 0,
+      INSUFFICIENT_LIQUIDITY: 0,
+      OTHER: 0
+    };
+
+    const rollingCounts: Record<string, number> = {
+      EXCESSIVE_PRICE_IMPACT: 0,
+      SLOT_MISMATCH: 0,
+      STALE_QUOTE: 0,
+      WS_DISCONNECTED: 0,
+      LOW_CONSERVATIVE_NET: 0,
+      INSUFFICIENT_LIQUIDITY: 0,
+      OTHER: 0
+    };
+
+    const mapReasonToCategory = (r: string): 'EXCESSIVE_PRICE_IMPACT' | 'SLOT_MISMATCH' | 'STALE_QUOTE' | 'WS_DISCONNECTED' | 'LOW_CONSERVATIVE_NET' | 'INSUFFICIENT_LIQUIDITY' | 'OTHER' => {
+      if (r === 'EXCESSIVE_PRICE_IMPACT' || r === 'TICK_BOUNDARY_EXCEEDED') return 'EXCESSIVE_PRICE_IMPACT';
+      if (r === 'SLOT_MISMATCH' || r === 'SLOT_ADVANCED') return 'SLOT_MISMATCH';
+      if (r === 'STALE_QUOTE' || r === 'QUOTE_EXPIRED' || r === 'OBSERVATION_EXPIRED' || r === 'PRICE_CONVERSION_STALE' || r === 'STALE_VAULT_SNAPSHOT') return 'STALE_QUOTE';
+      if (r === 'WS_DISCONNECTED' || r === 'SUBSCRIPTION_LOSS') return 'WS_DISCONNECTED';
+      if (r === 'LOW_CONSERVATIVE_NET' || r === 'SPREAD_PREFILTER_REJECTED') return 'LOW_CONSERVATIVE_NET';
+      if (r === 'INSUFFICIENT_LIQUIDITY' || r === 'DEPLETED_LIQUIDITY' || r === 'VAULT_RESERVES_UNHYDRATED') return 'INSUFFICIENT_LIQUIDITY';
+      return 'OTHER';
+    };
+
+    let totalSession = 0;
+    for (const [reason, count] of Object.entries(this.rejectionBreakdown)) {
+      const cat = mapReasonToCategory(reason);
+      sessionCounts[cat] += count;
+      totalSession += count;
+    }
+
+    let totalRolling = 0;
+    for (const item of this.rollingRejections) {
+      const cat = mapReasonToCategory(item.reason);
+      rollingCounts[cat]++;
+      totalRolling++;
+    }
+
+    let mostCommonBlocker = 'NONE';
+    let maxBlockerCount = 0;
+
+    const stats: RejectionCategoryStats[] = categories.map(cat => {
+      const sCount = sessionCounts[cat];
+      const rCount = rollingCounts[cat];
+      const pct = totalSession > 0 ? Number((sCount / totalSession * 100).toFixed(1)) : 0;
+      if (sCount > maxBlockerCount) {
+        maxBlockerCount = sCount;
+        mostCommonBlocker = cat;
+      }
+      return {
+        category: cat,
+        sessionCount: sCount,
+        sessionPercentage: pct,
+        rolling60sCount: rCount
+      };
+    });
+
+    return {
+      categories: stats,
+      mostCommonBlocker: maxBlockerCount > 0 ? mostCommonBlocker : 'NONE',
+      totalSessionRejections: totalSession,
+      totalRolling60sRejections: totalRolling
+    };
+  }
+
+  public getHistoricalVsSession(): HistoricalVsSessionReport {
+    let totalStoredPools: number | string = 'N/A';
+    let verifiedStoredPools: number | string = 'N/A';
+    let unverifiedStoredPools: number | string = 'N/A';
+    let totalStoredRoutes: number | string = 'N/A';
+    let lastCompletedScoutRun = 'N/A';
+
+    try {
+      const stats = this.repository.getRouteSummaryStats();
+      if (stats) {
+        totalStoredPools = stats.totalStoredPoolCount > 0 ? stats.totalStoredPoolCount : 'N/A';
+        verifiedStoredPools = stats.verifiedDirectPoolCount > 0 ? stats.verifiedDirectPoolCount : 'N/A';
+        unverifiedStoredPools = stats.unverifiedPoolCount >= 0 ? stats.unverifiedPoolCount : 'N/A';
+        totalStoredRoutes = stats.totalRoutes > 0 ? stats.totalRoutes : 'N/A';
+      }
+      const lastScout = this.repository.getLastScoutRun();
+      if (lastScout && lastScout.completedAt) {
+        lastCompletedScoutRun = new Date(lastScout.completedAt).toLocaleTimeString() + ` (${lastScout.status})`;
+      }
+    } catch {}
+
+    const scoutMetrics = this.automaticScout.getMetrics();
+    return {
+      historical: {
+        totalStoredPools,
+        verifiedStoredPools,
+        unverifiedStoredPools,
+        totalStoredRoutes,
+        lastCompletedScoutRun
+      },
+      session: {
+        sessionStartTime: this.sessionStartTime,
+        sessionUptimeMs: Date.now() - this.sessionStartTime,
+        newUniquePoolsDiscovered: scoutMetrics.totalDiscoveredPools || 0,
+        newVerifiedPools: scoutMetrics.totalVerifiedPools || 0,
+        rejectedPoolCandidates: scoutMetrics.totalRejectedPools || 0,
+        newUniqueRoutesGenerated: scoutMetrics.newlyAddedRoutesCount || 0,
+        scoutStatus: scoutMetrics.scoutStatus || 'IDLE',
+        scoutLatestResult: scoutMetrics.lastScoutResult || 'IDLE'
+      }
+    };
+  }
+
+  public getDiagnostics(): ScannerDiagnostics {
+    const wsStats = this.ws.getStats();
+    const rpcStats = this.rpc.getStats();
+    const mem = process.memoryUsage();
+
+    return {
+      wsReconnectAttempts: wsStats.reconnectCount,
+      lastMessageAgeMs: wsStats.lastMessageTime ? Math.max(0, Date.now() - wsStats.lastMessageTime) : 0,
+      lastSuccessfulReconnectTime: this.wsLastReconnectTime,
+      rpcFailures: rpcStats.requestsFailed,
+      persistenceErrors: this.repository.getPersistenceErrorsCount(),
+      lastPersistenceError: this.repository.getLastPersistenceError(),
+      eventLoopDelayMs: this.eventLoopDelayMs,
+      processMemory: {
+        rssMb: Number((mem.rss / 1048576).toFixed(1)),
+        heapUsedMb: Number((mem.heapUsed / 1048576).toFixed(1)),
+        heapTotalMb: Number((mem.heapTotal / 1048576).toFixed(1))
+      },
+      sessionUptimeSeconds: Math.floor((Date.now() - this.sessionStartTime) / 1000)
+    };
+  }
+
+  public getHudV2Data(): HudV2Payload {
+    const health = this.getHealthStatus();
+    const latencyReport = this.latencyTracker.getReport();
+    const now = Date.now();
+    this.rollingQualifiedNetProfit = this.rollingQualifiedNetProfit.filter(item => now - item.timestamp <= 60000);
+    const shadowNetUSDCPerMin = this.rollingQualifiedNetProfit.reduce((sum, item) => sum + item.conservativeNetUSDC, 0);
+
+    const uptimeSec = Math.floor((now - this.sessionStartTime) / 1000);
+    const hours = Math.floor(uptimeSec / 3600).toString().padStart(2, '0');
+    const mins = Math.floor((uptimeSec % 3600) / 60).toString().padStart(2, '0');
+    const secs = (uptimeSec % 60).toString().padStart(2, '0');
+    const sessionUptimeFormatted = `${hours}:${mins}:${secs}`;
+
+    const totalRoutes = this.routeIndex.getAllRoutes().length;
+    const verifiedRoutes = this.routeIndex.getRouteCountByState('VERIFIED');
+    const readyRoutes = this.routeIndex.getRouteCountByState('READY');
+    const staleRoutes = this.routeIndex.getRouteCountByState('STALE');
+    const blockedRoutes = this.routeIndex.getRouteCountByState('BLOCKED');
+    const unvalidatedRoutes = this.routeIndex.getRouteCountByState('UNVALIDATED');
+    const uptimeReport = this.routeIndex.getRouteUptimeReport(Date.now() - this.sessionStartTime);
+
+    const activeThreshold = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.50;
+    const totalEval = this.auditMetrics.totalEvaluated;
+    const quoteValidPct = totalEval > 0 ? Number((this.quoteValidEvaluationsCount / totalEval * 100).toFixed(1)) : 0;
+
+    let scannerStatus: 'RUNNING' | 'DEGRADED' | 'OFFLINE' | 'STANDBY' = 'RUNNING';
+    if (!this.isRunning) {
+      scannerStatus = 'OFFLINE';
+    } else if (!health.connectedWs || !health.connectedRpc) {
+      scannerStatus = 'DEGRADED';
+    }
+
+    const wsStatus: 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED' | 'FAILED' | 'STANDBY' =
+      this.isManualReconnecting ? 'RECONNECTING' : (health.wsConnectionState || (health.connectedWs ? 'CONNECTED' : 'DISCONNECTED'));
+
+    const rpcStatus: 'ACTIVE' | 'DEGRADED' | 'FAILED' | 'STANDBY' =
+      health.connectedRpc ? 'ACTIVE' : 'DEGRADED';
+
+    return {
+      success: true,
+      mode: 'READ-ONLY / SHADOW MODE',
+      scannerStatus,
+      scannerOnline: this.isRunning,
+      solanaSlot: health.currentSlot,
+      wsConnected: wsStatus === 'CONNECTED',
+      wsStatus,
+      rpcStatus,
+      sessionUptimeFormatted,
+      lastSuccessfulUpdateTimestamp: now,
+      thresholdUSDC: activeThreshold,
+      thresholdCents: Math.round(activeThreshold * 100),
+      formattedThreshold: this.profitThresholdManager ? this.profitThresholdManager.getFormattedThreshold() : `$${activeThreshold.toFixed(2)} USDC`,
+      safetyBufferUSDC: this.config.SAFETY_BUFFER_USDC || 0.25,
+      sharedVirtualCapitalUSDC: this.config.VIRTUAL_CAPITAL_USDC || 1000,
+      profitMonitor: {
+        grossPositiveOpportunities: this.auditMetrics.candidatesGrossPositive || 0,
+        netPositiveOpportunities: this.auditMetrics.candidatesConservativeQualified || 0,
+        qualifiedShadowSignals: this.auditMetrics.candidatesConservativeQualified || 0,
+        revalidatedSurvivingSignals: this.auditMetrics.survivalSurvivedCount || 0,
+        bestConservativeNetUSDC: Number(this.bestConservativeNetUSDC.toFixed(4)),
+        shadowNetUSDCPerMinute: Number(shadowNetUSDCPerMin.toFixed(4)),
+        realizedProfitUSDC: 0.00
+      },
+      profitWatchTable: this.getProfitWatchTable(10),
+      performance: {
+        routeEvaluationsPerSec: this.currentEvaluationsPerSec,
+        quoteCalculationsPerSec: this.currentQuotesPerSec,
+        totalEvaluationsSession: this.auditMetrics.totalEvaluated,
+        quoteValidEvaluations: this.quoteValidEvaluationsCount,
+        quoteValidPercentage: quoteValidPct,
+        accountUpdatesPerSec: this.currentAccountUpdatesPerSec,
+        eventQueueDepth: this.eventQueue.size(),
+        eventQueueDrops: this.eventQueue.getStats().droppedCount,
+        queueWaitP95Us: latencyReport.queueWaitUs?.p95 || 0,
+        quoteCalculationP95Us: latencyReport.quoteLatencyUs?.p95 || 0,
+        rpcLatencyP95Ms: latencyReport.rpcLatencyMs?.p95 || 0
+      },
+      routeHealth: {
+        totalStoredUniquePools: this.poolRegistry.getAllPools().length,
+        verifiedDirectPools: this.poolRegistry.getAllPools().filter(p => p.verificationStatus === 'VERIFIED_DIRECT').length,
+        totalUnique2LegRoutes: totalRoutes,
+        verifiedRoutes,
+        readyRoutes,
+        staleRoutes,
+        blockedRoutes,
+        unvalidatedRoutes,
+        readyRouteUptimePercent: Number(uptimeReport.averageUptimePercent.toFixed(1))
+      },
+      historicalVsSession: this.getHistoricalVsSession(),
+      rejectionAnalysis: this.getRejectionAnalysis(),
+      diagnostics: this.getDiagnostics(),
+      scout: this.automaticScout.getMetrics()
+    };
+  }
+
+  public isScannerRunning(): boolean {
+    return this.isRunning;
   }
 
   public stop(): void {

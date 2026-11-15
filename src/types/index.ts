@@ -501,3 +501,146 @@ export interface ScoutMetricsSummary {
   queueDrops?: number;
   persistenceErrors?: number;
 }
+
+// ========================================
+// HUD V2 Professional Terminal Types
+// ========================================
+
+export interface ProfitWatchItem {
+  rank: number;
+  candidateId: string;
+  token: string;
+  buyDex: string;
+  sellDex: string;
+  tradeSizeUSDC: number;
+  grossSpreadPercent: number;
+  expectedNetUSDC: number;
+  conservativeNetUSDC: number;
+  shortfallToTargetUSDC: number;
+  quoteAgeMs: number;
+  status: string;
+  classification: 'QUALIFIED' | 'NEAR_MISS' | 'REJECTED';
+  leg1PoolId: string;
+  leg2PoolId: string;
+  leg1Direction: string;
+  leg2Direction: string;
+  leg1FeeBps: number;
+  leg2FeeBps: number;
+  priceImpactBps: number;
+  slippageBps: number;
+  networkFeeUSDC: string;
+  priorityFeeUSDC: string;
+  jitoTipUSDC: string;
+  safetyBufferUSDC: string;
+  totalCostsUSDC: string;
+  slotGap: number;
+  revalidationStatus: string;
+  timestamp: number;
+}
+
+export interface RejectionCategoryStats {
+  category: 'EXCESSIVE_PRICE_IMPACT' | 'SLOT_MISMATCH' | 'STALE_QUOTE' | 'WS_DISCONNECTED' | 'LOW_CONSERVATIVE_NET' | 'INSUFFICIENT_LIQUIDITY' | 'OTHER';
+  sessionCount: number;
+  sessionPercentage: number;
+  rolling60sCount: number;
+}
+
+export interface RejectionAnalysisReport {
+  categories: RejectionCategoryStats[];
+  mostCommonBlocker: string;
+  totalSessionRejections: number;
+  totalRolling60sRejections: number;
+}
+
+export interface HistoricalVsSessionReport {
+  historical: {
+    totalStoredPools: number | string;
+    verifiedStoredPools: number | string;
+    unverifiedStoredPools: number | string;
+    totalStoredRoutes: number | string;
+    lastCompletedScoutRun: string;
+  };
+  session: {
+    sessionStartTime: number;
+    sessionUptimeMs: number;
+    newUniquePoolsDiscovered: number;
+    newVerifiedPools: number;
+    rejectedPoolCandidates: number;
+    newUniqueRoutesGenerated: number;
+    scoutStatus: string;
+    scoutLatestResult: string;
+  };
+}
+
+export interface ScannerDiagnostics {
+  wsReconnectAttempts: number;
+  lastMessageAgeMs: number;
+  lastSuccessfulReconnectTime: number | null;
+  rpcFailures: number;
+  persistenceErrors: number;
+  lastPersistenceError?: { operation: string; error: string; timestamp: number };
+  eventLoopDelayMs: number;
+  processMemory: {
+    rssMb: number;
+    heapUsedMb: number;
+    heapTotalMb: number;
+  };
+  sessionUptimeSeconds: number;
+}
+
+export interface HudV2Payload {
+  success: boolean;
+  mode: string;
+  scannerStatus: 'RUNNING' | 'DEGRADED' | 'OFFLINE' | 'STANDBY';
+  scannerOnline: boolean;
+  solanaSlot: number | null;
+  wsConnected: boolean;
+  wsStatus: 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED' | 'FAILED' | 'STANDBY';
+  rpcStatus: 'ACTIVE' | 'DEGRADED' | 'FAILED' | 'STANDBY';
+  sessionUptimeFormatted: string;
+  lastSuccessfulUpdateTimestamp: number;
+  thresholdUSDC: number;
+  thresholdCents: number;
+  formattedThreshold: string;
+  safetyBufferUSDC: number;
+  sharedVirtualCapitalUSDC: number;
+  profitMonitor: {
+    grossPositiveOpportunities: number;
+    netPositiveOpportunities: number;
+    qualifiedShadowSignals: number;
+    revalidatedSurvivingSignals: number;
+    bestConservativeNetUSDC: number;
+    shadowNetUSDCPerMinute: number;
+    realizedProfitUSDC: number;
+  };
+  profitWatchTable: ProfitWatchItem[];
+  performance: {
+    routeEvaluationsPerSec: number;
+    quoteCalculationsPerSec: number;
+    totalEvaluationsSession: number;
+    quoteValidEvaluations: number;
+    quoteValidPercentage: number;
+    accountUpdatesPerSec: number;
+    eventQueueDepth: number;
+    eventQueueDrops: number;
+    queueWaitP95Us: number;
+    quoteCalculationP95Us: number;
+    rpcLatencyP95Ms: number;
+  };
+  routeHealth: {
+    totalStoredUniquePools: number;
+    verifiedDirectPools: number;
+    totalUnique2LegRoutes: number;
+    verifiedRoutes: number;
+    readyRoutes: number;
+    staleRoutes: number;
+    blockedRoutes: number;
+    unvalidatedRoutes: number;
+    readyRouteUptimePercent: number;
+  };
+  historicalVsSession: HistoricalVsSessionReport;
+  rejectionAnalysis: RejectionAnalysisReport;
+  diagnostics: ScannerDiagnostics;
+  scout: ScoutMetricsSummary | null;
+}
+
