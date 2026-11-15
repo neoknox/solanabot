@@ -328,6 +328,11 @@ export class ProfitHudServer {
     // CORS & Security Headers (Restricted to localhost)
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
+    // Prevent an old HUD page or stale telemetry being reused by browser/proxy caches.
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('X-Solanabot-HUD-Version', 'V2');
 
     if (method === 'OPTIONS') {
       if (originHeader && !allowedOrigins.has(originHeader.toLowerCase())) {
