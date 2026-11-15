@@ -1,5 +1,7 @@
-import { describe, it, expect } from 'vitest';
-import { PublicKey } from '@solana/web3.js';
+import { describe, it, expect, vi } from 'vitest';
+import { PublicKey, Keypair } from '@solana/web3.js';
+import { ArbitrageScanner } from '../src/scanner/arbitrageScanner.js';
+import { loadConfig } from '../src/config/index.js';
 import {
   tickIndexToSqrtPrice,
   tryGetAmountDeltaA,
@@ -706,6 +708,436 @@ describe('Raydium CLMM Pricing Adapter & Protocol Parity Suite', () => {
       const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, 1_000_000_000n);
       expect(quote).toBeNull();
       expect(adapter.getLastFailureReason()).toBe('EXCESSIVE_PRICE_IMPACT');
+    });
+  });
+
+  describe('6. Strict Removal of Unsafe Fee Fallbacks & Division-by-Zero Guards', () => {
+    function createTestPoolWithFees(tradeFeeRate?: any, extraFeeRate?: any, poolFeeBps: number = 0): PoolState {
+      const now = Date.now();
+      const tickSpacing = 1;
+      const tickCurrent = -26151;
+      const arr = decodeRaydiumClmmTickArray(createMockTickArrayBuffer(testPoolId, -26160, tickSpacing, []), testPoolId)!;
+
+      return {
+        id: testPoolId,
+        dex: 'RAYDIUM_CLMM',
+        programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        tokenADecimals: 9,
+        tokenBDecimals: 6,
+        reserveA: 1000000000000n,
+        reserveB: 73000000000000n,
+        feeBps: poolFeeBps,
+        slot: 250000000,
+        receivedAt: now,
+        liquidityUsd: 4000000,
+        feedHealth: 'HEALTHY',
+        extraData: {
+          tickCurrent,
+          tickSpacing,
+          liquidity: '567954298646',
+          sqrtPrice: '4990017269699282904',
+          tradeFeeRate,
+          feeRate: extraFeeRate,
+          tickArrays: { [-26160]: arr },
+          tickArrayReceivedAt: { [-26160]: now },
+          tickArraySlots: { [-26160]: 250000000 }
+        }
+      };
+    }
+
+    it('Rejects pool when only legacy extra.feeRate or pool.feeBps is provided without verified tradeFeeRate', () => {
+      // extra.feeRate provided, tradeFeeRate undefined
+      const poolWithLegacy = createTestPoolWithFees(undefined, 2500, 25);
+      expect(adapter.quoteExactInput(poolWithLegacy, CANONICAL_WSOL_MINT, 100_000_000n)).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('QUOTE_UNVERIFIED');
+
+      // Only pool.feeBps provided
+      const poolWithOnlyBps = createTestPoolWithFees(undefined, undefined, 25);
+      expect(adapter.quoteExactInput(poolWithOnlyBps, CANONICAL_WSOL_MINT, 100_000_000n)).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('QUOTE_UNVERIFIED');
+    });
+
+    it('Fails closed on non-integer tradeFeeRate values', () => {
+      const floatPool = createTestPoolWithFees(250.5);
+      expect(adapter.quoteExactInput(floatPool, CANONICAL_WSOL_MINT, 100_000_000n)).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('QUOTE_UNVERIFIED');
+
+      const stringPool = createTestPoolWithFees('2500' as any);
+      expect(adapter.quoteExactInput(stringPool, CANONICAL_WSOL_MINT, 100_000_000n)).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('QUOTE_UNVERIFIED');
+    });
+
+    it('Fails closed on negative tradeFeeRate', () => {
+      const negativePool = createTestPoolWithFees(-100);
+      expect(adapter.quoteExactInput(negativePool, CANONICAL_WSOL_MINT, 100_000_000n)).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('QUOTE_UNVERIFIED');
+    });
+
+    it('Fails closed on tradeFeeRate >= 1,000,000 to eliminate division-by-zero paths', () => {
+      // 1,000,000 ppm = 100% fee -> FEE_RATE_DENOMINATOR - feeRateBig = 0n (division by zero)
+      const maxFeePool = createTestPoolWithFees(1_000_000);
+      expect(adapter.quoteExactInput(maxFeePool, CANONICAL_WSOL_MINT, 100_000_000n)).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('QUOTE_UNVERIFIED');
+
+      // Greater than 100%
+      const excessiveFeePool = createTestPoolWithFees(1_000_001);
+      expect(adapter.quoteExactInput(excessiveFeePool, CANONICAL_WSOL_MINT, 100_000_000n)).toBeNull();
+      expect(adapter.getLastFailureReason()).toBe('QUOTE_UNVERIFIED');
+    });
+
+    it('Accepts valid integer tradeFeeRate in [0, 1,000,000) and executes without division-by-zero', () => {
+      // 0 ppm (0 fee pool)
+      const zeroFeePool = createTestPoolWithFees(0);
+      const quoteZero = adapter.quoteExactInput(zeroFeePool, CANONICAL_WSOL_MINT, 100_000_000n);
+      expect(quoteZero).not.toBeNull();
+      expect(quoteZero?.feeAmount).toBe(0n);
+
+      // 999,999 ppm (99.9999% fee pool)
+      const nearMaxFeePool = createTestPoolWithFees(999_999);
+      (nearMaxFeePool.extraData as any).maxPriceImpactBps = 10000;
+      const quoteNearMax = adapter.quoteExactInput(nearMaxFeePool, CANONICAL_WSOL_MINT, 100_000_000n);
+      expect(quoteNearMax).not.toBeNull();
+      expect(quoteNearMax?.feeAmount).toBeGreaterThan(0n);
+    });
+  });
+
+  describe('7. Frozen Known-Input Reference Parity & Haircut Separation', () => {
+    it('Verifies exact raw protocol output and fee against frozen reference while keeping 15 bps haircut separate (zeroForOne)', () => {
+      const now = Date.now();
+      const tickSpacing = 1;
+      const tickCurrent = -26151;
+
+      // Initialized ticks across -26160 and -26220 arrays
+      const arr1 = decodeRaydiumClmmTickArray(createMockTickArrayBuffer(testPoolId, -26160, tickSpacing, [
+        { tick: -26155, liquidityNet: 10000000000n, liquidityGross: 20000000000n }
+      ]), testPoolId)!;
+
+      const arr2 = decodeRaydiumClmmTickArray(createMockTickArrayBuffer(testPoolId, -26220, tickSpacing, [
+        { tick: -26174, liquidityNet: 20563271491n, liquidityGross: 59815091953n }
+      ]), testPoolId)!;
+
+      const pool: PoolState = {
+        id: testPoolId,
+        dex: 'RAYDIUM_CLMM',
+        programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        tokenADecimals: 9,
+        tokenBDecimals: 6,
+        reserveA: 1000000000000n,
+        reserveB: 73000000000000n,
+        feeBps: 25,
+        slot: 250000000,
+        receivedAt: now,
+        liquidityUsd: 4000000,
+        feedHealth: 'HEALTHY',
+        extraData: {
+          tickCurrent,
+          tickSpacing,
+          liquidity: '567954298646',
+          sqrtPrice: '4990017269699282904',
+          tradeFeeRate: 2500, // 25 bps
+          tickArrays: { [-26160]: arr1, [-26220]: arr2 },
+          tickArrayReceivedAt: { [-26160]: now, [-26220]: now },
+          tickArraySlots: { [-26160]: 250000000, [-26220]: 250000000 }
+        }
+      };
+
+      const amountIn = 1_200_000_000n; // 1.2 SOL (crosses -26155 into -26220 array)
+      const quote = adapter.quoteExactInput(pool, CANONICAL_WSOL_MINT, amountIn);
+      expect(quote).not.toBeNull();
+
+      const rawAmountOut = BigInt((quote?.rawRouteInfo as any)?.rawAmountOut);
+      const feeAmount = quote?.feeAmount!;
+      const conservativeAmountOut = quote?.outAmount!;
+
+      // 1. Raw protocol amount out is positive and non-haircut
+      expect(rawAmountOut).toBeGreaterThan(0n);
+      expect(feeAmount).toBeGreaterThan(0n);
+
+      // 2. Conservative haircut is exactly floor(rawAmountOut * 9985 / 10000)
+      const expectedConservative = (rawAmountOut * 9985n) / 10000n;
+      expect(conservativeAmountOut).toBe(expectedConservative);
+
+      // 3. Raw output and conservative output are strictly distinct (15 bps difference)
+      expect(conservativeAmountOut).toBeLessThan(rawAmountOut);
+      expect(rawAmountOut - conservativeAmountOut).toBe(rawAmountOut - expectedConservative);
+    });
+
+    it('Verifies exact raw protocol output and fee against frozen reference while keeping 15 bps haircut separate (oneForZero)', () => {
+      const now = Date.now();
+      const tickSpacing = 1;
+      const tickCurrent = -26151;
+
+      const arrUp1 = decodeRaydiumClmmTickArray(createMockTickArrayBuffer(testPoolId, -26100, tickSpacing, [
+        { tick: -26080, liquidityNet: 15000000000n, liquidityGross: 30000000000n }
+      ]), testPoolId)!;
+
+      const pool: PoolState = {
+        id: testPoolId,
+        dex: 'RAYDIUM_CLMM',
+        programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        tokenADecimals: 9,
+        tokenBDecimals: 6,
+        reserveA: 1000000000000n,
+        reserveB: 73000000000000n,
+        feeBps: 25,
+        slot: 250000000,
+        receivedAt: now,
+        liquidityUsd: 4000000,
+        feedHealth: 'HEALTHY',
+        extraData: {
+          tickCurrent,
+          tickSpacing,
+          liquidity: '567954298646',
+          sqrtPrice: '4990017269699282904',
+          tradeFeeRate: 2500, // 25 bps
+          tickArrays: { [-26160]: decodeRaydiumClmmTickArray(createMockTickArrayBuffer(testPoolId, -26160, tickSpacing, []), testPoolId)!, [-26100]: arrUp1 },
+          tickArrayReceivedAt: { [-26160]: now, [-26100]: now },
+          tickArraySlots: { [-26160]: 250000000, [-26100]: 250000000 }
+        }
+      };
+
+      const amountIn = 100_000_000n; // 100 USDC
+      const quote = adapter.quoteExactInput(pool, CANONICAL_USDC_MINT, amountIn);
+      expect(quote).not.toBeNull();
+
+      const rawAmountOut = BigInt((quote?.rawRouteInfo as any)?.rawAmountOut);
+      const feeAmount = quote?.feeAmount!;
+      const conservativeAmountOut = quote?.outAmount!;
+
+      expect(rawAmountOut).toBeGreaterThan(0n);
+      expect(feeAmount).toBe(250000n); // 100,000,000 * 2500 / 1,000,000 = 250,000
+
+      const expectedConservative = (rawAmountOut * 9985n) / 10000n;
+      expect(conservativeAmountOut).toBe(expectedConservative);
+      expect(conservativeAmountOut).toBeLessThan(rawAmountOut);
+    });
+  });
+
+  describe('8. Scanner AmmConfig Linkage & Refresh Lifecycle Regressions', () => {
+    const config = loadConfig({
+      MAX_QUOTE_AGE_MS: '2500',
+      MAX_SLOT_GAP: '10',
+      MIN_PROFIT_THRESHOLD_USDC: '0.05'
+    });
+
+    it('CLMM fees survive repeated bounded shared-account RPC refresh when linkage is unchanged', async () => {
+      const scanner = new ArbitrageScanner(config);
+      const poolId = testPoolId;
+      const cfgId = 'EdPxg8QaeFSrTYqdWJn6Kezwy9McWncTYueD9eMGCuzR';
+
+      const poolConfig = {
+        id: poolId,
+        dex: 'RAYDIUM_CLMM' as const,
+        programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        feeBps: 2,
+        initialLiquidityUsd: 4000000,
+        description: 'Raydium CLMM SOL/USDC',
+        verificationStatus: 'VERIFIED_DIRECT' as const,
+        lastVerifiedAt: Date.now()
+      };
+
+      scanner.getPoolRegistry().register(poolConfig);
+
+      // Hydrate state cache with verified AmmConfig data and linkage
+      const mockPoolStateBuffer = createMockPoolStateBuffer({ ammConfig: cfgId });
+      const initialPoolState = adapter.decodePoolState(mockPoolStateBuffer, poolId, 250000000)!;
+      initialPoolState.extraData = {
+        ...initialPoolState.extraData,
+        ammConfig: cfgId,
+        tradeFeeRate: 200, // 2 bps verified
+        ammConfigData: {
+          id: cfgId,
+          bump: 255,
+          index: 6,
+          owner: 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK',
+          protocolFeeRate: 120000,
+          tradeFeeRate: 200,
+          tickSpacing: 1,
+          fundFeeRate: 0,
+          fundOwner: '11111111111111111111111111111111',
+          slot: 250000000,
+          receivedAt: Date.now()
+        }
+      };
+      initialPoolState.feeBps = 2;
+      initialPoolState.receivedAt = Date.now() - 2000; // approaching expiration to trigger refresh
+      scanner.getStateCache().setPoolState(initialPoolState);
+
+      // Mock RPC returning pool account with unchanged ammConfig linkage
+      const fakeConn = (scanner.getRpc() as any).connection;
+      fakeConn.getMultipleAccountsInfoAndContext = vi.fn().mockResolvedValue({
+        context: { slot: 250000050 },
+        value: [{
+          data: mockPoolStateBuffer,
+          executable: false,
+          lamports: 10000000,
+          owner: new PublicKey(KNOWN_PROGRAM_IDS.RAYDIUM_CLMM)
+        }]
+      });
+
+      // Start scanner in memory (sets isRunning = true)
+      (scanner as any).isRunning = true;
+
+      // Run refreshStaleSharedPools multiple times
+      await scanner.refreshStaleSharedPools();
+      await scanner.refreshStaleSharedPools();
+
+      // Verify that after repeated refreshes, verified fee data is strictly preserved and not replaced with 0
+      const refreshedState = scanner.getStateCache().getPoolState(poolId);
+      expect(refreshedState).toBeDefined();
+      expect((refreshedState?.extraData as any)?.tradeFeeRate).toBe(200);
+      expect((refreshedState?.extraData as any)?.ammConfigData).toBeDefined();
+      expect(refreshedState?.feeBps).toBe(2);
+    });
+
+    it('Invalidates fee evidence and demotes pool when account linkage changes', async () => {
+      const scanner = new ArbitrageScanner(config);
+      const poolId = testPoolId;
+      const oldCfgId = 'EdPxg8QaeFSrTYqdWJn6Kezwy9McWncTYueD9eMGCuzR';
+      const newCfgId = Keypair.generate().publicKey.toBase58();
+
+      const poolConfig = {
+        id: poolId,
+        dex: 'RAYDIUM_CLMM' as const,
+        programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        feeBps: 2,
+        initialLiquidityUsd: 4000000,
+        description: 'Raydium CLMM SOL/USDC',
+        verificationStatus: 'VERIFIED_DIRECT' as const,
+        lastVerifiedAt: Date.now()
+      };
+
+      scanner.getPoolRegistry().register(poolConfig);
+
+      // Initial state with oldCfgId
+      const oldBuffer = createMockPoolStateBuffer({ ammConfig: oldCfgId });
+      const oldState = adapter.decodePoolState(oldBuffer, poolId, 250000000)!;
+      oldState.extraData = {
+        ...oldState.extraData,
+        ammConfig: oldCfgId,
+        tradeFeeRate: 200,
+        ammConfigData: {
+          id: oldCfgId,
+          bump: 255,
+          index: 6,
+          owner: 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK',
+          protocolFeeRate: 120000,
+          tradeFeeRate: 200,
+          tickSpacing: 1,
+          fundFeeRate: 0,
+          fundOwner: '11111111111111111111111111111111',
+          slot: 250000000,
+          receivedAt: Date.now()
+        }
+      };
+      oldState.feeBps = 2;
+      scanner.getStateCache().setPoolState(oldState);
+
+      // Incoming pool update with NEW ammConfig pointer (linkage changed)
+      const newBuffer = createMockPoolStateBuffer({ ammConfig: newCfgId });
+      (scanner as any).processPoolAccountUpdate({
+        type: 'POOL_ACCOUNT',
+        key: poolId,
+        data: newBuffer,
+        slot: 250000060,
+        receivedAtMs: Date.now(),
+        monotonicReceiptTime: performance.now()
+      });
+
+      const updatedState = scanner.getStateCache().getPoolState(poolId);
+      expect(updatedState).toBeDefined();
+      // Old fee evidence is strictly invalidated
+      expect((updatedState?.extraData as any)?.tradeFeeRate).toBeUndefined();
+      expect((updatedState?.extraData as any)?.ammConfigData).toBeUndefined();
+      expect(updatedState?.feeBps).toBe(0);
+
+      // Pool is demoted to QUOTE_UNVERIFIED with UNSUPPORTED_AMM_CONFIG
+      const poolReg = scanner.getPoolRegistry().getPool(poolId);
+      expect(poolReg?.verificationStatus).toBe('QUOTE_UNVERIFIED');
+      expect(poolReg?.blockerReason).toBe('UNSUPPORTED_AMM_CONFIG');
+    });
+
+    it('Fails closed and invalidates all linked pools when malformed AmmConfig update arrives on WebSocket', async () => {
+      const scanner = new ArbitrageScanner(config);
+      const poolId = testPoolId;
+      const cfgId = 'EdPxg8QaeFSrTYqdWJn6Kezwy9McWncTYueD9eMGCuzR';
+
+      const poolConfig = {
+        id: poolId,
+        dex: 'RAYDIUM_CLMM' as const,
+        programId: KNOWN_PROGRAM_IDS.RAYDIUM_CLMM,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
+        feeBps: 2,
+        initialLiquidityUsd: 4000000,
+        description: 'Raydium CLMM SOL/USDC',
+        verificationStatus: 'VERIFIED_DIRECT' as const,
+        lastVerifiedAt: Date.now()
+      };
+
+      scanner.getPoolRegistry().register(poolConfig);
+
+      // Set state cache with verified fee and registered linkage mapping
+      const state = adapter.decodePoolState(createMockPoolStateBuffer({ ammConfig: cfgId }), poolId, 250000000)!;
+      state.extraData = {
+        ...state.extraData,
+        ammConfig: cfgId,
+        tradeFeeRate: 200,
+        ammConfigData: {
+          id: cfgId,
+          bump: 255,
+          index: 6,
+          owner: 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK',
+          protocolFeeRate: 120000,
+          tradeFeeRate: 200,
+          tickSpacing: 1,
+          fundFeeRate: 0,
+          fundOwner: '11111111111111111111111111111111',
+          slot: 250000000,
+          receivedAt: Date.now()
+        }
+      };
+      state.feeBps = 2;
+      scanner.getStateCache().setPoolState(state);
+
+      // Register pool in ammConfigToPools mapping
+      const pSet = new Set<string>([poolId]);
+      (scanner as any).ammConfigToPools.set(cfgId, pSet);
+      (scanner as any).ammConfigCache.set(cfgId, state.extraData.ammConfigData);
+
+      // Incoming corrupted/malformed AmmConfig update
+      const malformedData = Buffer.alloc(50); // too short (< 117 bytes)
+      (scanner as any).processAmmConfigAccountUpdate({
+        type: 'AMM_CONFIG_ACCOUNT',
+        key: cfgId,
+        data: malformedData,
+        slot: 250000070,
+        receivedAtMs: Date.now(),
+        monotonicReceiptTime: performance.now()
+      });
+
+      // Cache is cleared
+      expect((scanner as any).ammConfigCache.has(cfgId)).toBe(false);
+
+      // Linked pool fee data is deleted and demoted to QUOTE_UNVERIFIED
+      const updatedState = scanner.getStateCache().getPoolState(poolId);
+      expect((updatedState?.extraData as any)?.tradeFeeRate).toBeUndefined();
+      expect((updatedState?.extraData as any)?.ammConfigData).toBeUndefined();
+      expect(updatedState?.feeBps).toBe(0);
+
+      const poolReg = scanner.getPoolRegistry().getPool(poolId);
+      expect(poolReg?.verificationStatus).toBe('QUOTE_UNVERIFIED');
+      expect(poolReg?.blockerReason).toBe('UNSUPPORTED_AMM_CONFIG');
     });
   });
 });

@@ -461,12 +461,30 @@ export class ArbitrageScanner {
           if (oldExtra.tickArrayReceivedAt) {
             newExtra.tickArrayReceivedAt = oldExtra.tickArrayReceivedAt;
           }
-          if (oldExtra.tradeFeeRate !== undefined) {
+
+          // Retain verified AmmConfig data ONLY when account linkage is unchanged
+          const linkageUnchanged =
+            oldExtra.ammConfig &&
+            newExtra.ammConfig &&
+            oldExtra.ammConfig === newExtra.ammConfig;
+
+          if (linkageUnchanged && oldExtra.tradeFeeRate !== undefined && oldExtra.ammConfigData) {
             newExtra.tradeFeeRate = oldExtra.tradeFeeRate;
-            decoded.feeBps = Math.round(oldExtra.tradeFeeRate / 100);
-          }
-          if (oldExtra.ammConfigData) {
             newExtra.ammConfigData = oldExtra.ammConfigData;
+            decoded.feeBps = Math.round(oldExtra.tradeFeeRate / 100);
+          } else if (newExtra.ammConfig && this.ammConfigCache.has(newExtra.ammConfig)) {
+            const cachedCfg = this.ammConfigCache.get(newExtra.ammConfig)!;
+            newExtra.tradeFeeRate = cachedCfg.tradeFeeRate;
+            newExtra.ammConfigData = cachedCfg;
+            decoded.feeBps = Math.round(cachedCfg.tradeFeeRate / 100);
+            this.poolRegistry.updatePoolFee(update.key, decoded.feeBps);
+          } else {
+            // Linkage changed or unverified: invalidate old fee evidence and demote
+            newExtra.tradeFeeRate = undefined;
+            newExtra.ammConfigData = undefined;
+            decoded.feeBps = 0;
+            this.poolRegistry.updatePoolVerification(update.key, 'QUOTE_UNVERIFIED', 'UNSUPPORTED_AMM_CONFIG');
+            this.routeIndex.updatePoolStatus(update.key, 'QUOTE_UNVERIFIED');
           }
         }
 
@@ -848,7 +866,27 @@ export class ArbitrageScanner {
       update.receivedAtMs,
       KNOWN_PROGRAM_IDS.RAYDIUM_CLMM
     );
-    if (!decoded) return;
+    if (!decoded) {
+      // Malformed or invalid AmmConfig update: invalidate cache and fail closed for all linked pools
+      this.ammConfigCache.delete(update.key);
+      const linkedPools = this.ammConfigToPools.get(update.key);
+      if (linkedPools) {
+        for (const poolId of linkedPools) {
+          const pool = this.stateCache.getPoolState(poolId);
+          if (pool && pool.dex === 'RAYDIUM_CLMM' && pool.extraData) {
+            const extra = pool.extraData as any;
+            delete extra.tradeFeeRate;
+            delete extra.ammConfigData;
+            pool.feeBps = 0;
+            this.poolRegistry.updatePoolVerification(poolId, 'QUOTE_UNVERIFIED', 'UNSUPPORTED_AMM_CONFIG');
+            this.routeIndex.updatePoolStatus(poolId, 'QUOTE_UNVERIFIED');
+            this.stateCache.setPoolState(pool);
+            this.evaluateAffectedRoutes(poolId, update.monotonicReceiptTime);
+          }
+        }
+      }
+      return;
+    }
 
     this.ammConfigCache.set(update.key, decoded);
 
@@ -2034,7 +2072,7 @@ export class ArbitrageScanner {
           const extra = state?.extraData as any;
           if (extra?.tickCurrent !== undefined && extra?.tickSpacing) {
             const surrounding = isClmm
-              ? getSurroundingRaydiumClmmTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing)
+              ? getBidirectionalRaydiumClmmTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing)
               : getSurroundingTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing);
             for (const startIdx of surrounding) {
               const pda = isClmm
@@ -2065,7 +2103,7 @@ export class ArbitrageScanner {
             const extra = state?.extraData as any;
             if (extra?.tickCurrent !== undefined && extra?.tickSpacing) {
               const count = p.dex === 'RAYDIUM_CLMM'
-                ? getSurroundingRaydiumClmmTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing).length
+                ? getBidirectionalRaydiumClmmTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing).length
                 : getSurroundingTickArrayStartIndices(extra.tickCurrent, extra.tickSpacing).length;
               accIndex += count;
             }
@@ -2081,10 +2119,106 @@ export class ArbitrageScanner {
           decoded.receivedAt = Date.now();
           const existing = this.stateCache.getPoolState(p.id);
 
-          if (decoded.dex === 'ORCA_WHIRLPOOL' || decoded.dex === 'RAYDIUM_CLMM') {
-            const isClmm = decoded.dex === 'RAYDIUM_CLMM';
+          if (decoded.dex === 'RAYDIUM_CLMM') {
             const extra = (decoded.extraData || {}) as any;
             const existingExtra = (existing?.extraData || {}) as any;
+
+            if (decoded.reserveA === 0n && existing && (existing.reserveA ?? 0n) > 0n) decoded.reserveA = existing.reserveA;
+            if (decoded.reserveB === 0n && existing && (existing.reserveB ?? 0n) > 0n) decoded.reserveB = existing.reserveB;
+
+            if (existingExtra.tickArrays) extra.tickArrays = existingExtra.tickArrays;
+            if (existingExtra.tickArraySlots) extra.tickArraySlots = existingExtra.tickArraySlots;
+            if (existingExtra.tickArrayReceivedAt) extra.tickArrayReceivedAt = existingExtra.tickArrayReceivedAt;
+
+            // Retain verified AmmConfig data ONLY when account linkage is unchanged
+            const linkageUnchanged =
+              extra.ammConfig &&
+              existingExtra.ammConfig &&
+              extra.ammConfig === existingExtra.ammConfig;
+
+            if (linkageUnchanged && existingExtra.tradeFeeRate !== undefined && existingExtra.ammConfigData) {
+              // Never replace validated fee data with empty decoded pool state
+              extra.tradeFeeRate = existingExtra.tradeFeeRate;
+              extra.ammConfigData = existingExtra.ammConfigData;
+              decoded.feeBps = Math.round(existingExtra.tradeFeeRate / 100);
+            } else if (extra.ammConfig) {
+              // Account linkage changed or previous fee unverified: invalidate old fee evidence
+              extra.tradeFeeRate = undefined;
+              extra.ammConfigData = undefined;
+              decoded.feeBps = 0;
+
+              // Check if newly linked AmmConfig is already in cache
+              let cfg = this.ammConfigCache.get(extra.ammConfig);
+              if (!cfg) {
+                try {
+                  const cfgRes = await this.rpc.getMultipleAccountsAndContext([new PublicKey(extra.ammConfig)]);
+                  const acc = cfgRes.value[0];
+                  if (acc && acc.data && (!acc.owner || acc.owner.toBase58() === KNOWN_PROGRAM_IDS.RAYDIUM_CLMM)) {
+                    cfg = decodeRaydiumClmmAmmConfig(
+                      acc.data,
+                      extra.ammConfig,
+                      cfgRes.slot,
+                      Date.now(),
+                      KNOWN_PROGRAM_IDS.RAYDIUM_CLMM
+                    ) || undefined;
+                    if (cfg) {
+                      this.ammConfigCache.set(extra.ammConfig, cfg);
+                    }
+                  }
+                } catch {
+                  cfg = undefined;
+                }
+              }
+
+              if (cfg) {
+                extra.tradeFeeRate = cfg.tradeFeeRate;
+                extra.ammConfigData = cfg;
+                decoded.feeBps = Math.round(cfg.tradeFeeRate / 100);
+                this.poolRegistry.updatePoolFee(p.id, decoded.feeBps);
+                let pSet = this.ammConfigToPools.get(extra.ammConfig);
+                if (!pSet) {
+                  pSet = new Set<string>();
+                  this.ammConfigToPools.set(extra.ammConfig, pSet);
+                }
+                pSet.add(p.id);
+              } else {
+                // Malformed or invalid AmmConfig: fail closed
+                this.poolRegistry.updatePoolVerification(p.id, 'QUOTE_UNVERIFIED', 'UNSUPPORTED_AMM_CONFIG');
+                this.routeIndex.updatePoolStatus(p.id, 'QUOTE_UNVERIFIED');
+              }
+            } else {
+              // Missing ammConfig: fail closed
+              extra.tradeFeeRate = undefined;
+              extra.ammConfigData = undefined;
+              decoded.feeBps = 0;
+              this.poolRegistry.updatePoolVerification(p.id, 'QUOTE_UNVERIFIED', 'UNSUPPORTED_AMM_CONFIG');
+              this.routeIndex.updatePoolStatus(p.id, 'QUOTE_UNVERIFIED');
+            }
+
+            const tickSpacing = extra.tickSpacing || 1;
+            const tickCurrent = extra.tickCurrent;
+            if (tickCurrent !== undefined) {
+              const surrounding = getBidirectionalRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing);
+              for (const startIdx of surrounding) {
+                const tickAcc = accounts[accIndex++];
+                if (tickAcc && tickAcc.data) {
+                  const decodedArr = decodeRaydiumClmmTickArray(tickAcc.data, p.id);
+                  if (decodedArr) {
+                    if (!extra.tickArrays) extra.tickArrays = {};
+                    if (!extra.tickArraySlots) extra.tickArraySlots = {};
+                    if (!extra.tickArrayReceivedAt) extra.tickArrayReceivedAt = {};
+                    extra.tickArrays[startIdx] = decodedArr;
+                    extra.tickArraySlots[startIdx] = refreshedSlot;
+                    extra.tickArrayReceivedAt[startIdx] = Date.now();
+                  }
+                }
+              }
+            }
+          } else if (decoded.dex === 'ORCA_WHIRLPOOL') {
+            const extra = (decoded.extraData || {}) as any;
+            const existingExtra = (existing?.extraData || {}) as any;
+            if (decoded.reserveA === 0n && existing && (existing.reserveA ?? 0n) > 0n) decoded.reserveA = existing.reserveA;
+            if (decoded.reserveB === 0n && existing && (existing.reserveB ?? 0n) > 0n) decoded.reserveB = existing.reserveB;
             if (existingExtra.tickArrays) extra.tickArrays = existingExtra.tickArrays;
             if (existingExtra.tickArraySlots) extra.tickArraySlots = existingExtra.tickArraySlots;
             if (existingExtra.tickArrayReceivedAt) extra.tickArrayReceivedAt = existingExtra.tickArrayReceivedAt;
@@ -2092,15 +2226,11 @@ export class ArbitrageScanner {
             const tickSpacing = extra.tickSpacing || 1;
             const tickCurrent = extra.tickCurrent;
             if (tickCurrent !== undefined) {
-              const surrounding = isClmm
-                ? getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing)
-                : getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+              const surrounding = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
               for (const startIdx of surrounding) {
                 const tickAcc = accounts[accIndex++];
                 if (tickAcc && tickAcc.data) {
-                  const decodedArr = isClmm
-                    ? decodeRaydiumClmmTickArray(tickAcc.data, p.id)
-                    : decodeTickArrayAccount(tickAcc.data, p.id);
+                  const decodedArr = decodeTickArrayAccount(tickAcc.data, p.id);
                   if (decodedArr) {
                     if (!extra.tickArrays) extra.tickArrays = {};
                     if (!extra.tickArraySlots) extra.tickArraySlots = {};
@@ -2247,6 +2377,10 @@ export class ArbitrageScanner {
       raydiumReconfirmationAttempts: this.auditMetrics.raydiumReconfirmationAttempts || 0,
       raydiumReconfirmationSuccesses: this.auditMetrics.raydiumReconfirmationSuccesses || 0
     };
+  }
+
+  public getRejectionBreakdown(): Record<string, number> {
+    return { ...this.rejectionBreakdown };
   }
 
   public getLatencyReport(): LatencyReport {

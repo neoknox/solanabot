@@ -70,7 +70,12 @@ export interface Phase16BenchmarkResult {
     uniqueRoutesCount: number;
     restoredRoutesCount: number;
     verifiedRoutesTotal: number;
+    freshlyVerifiedRoutesCount: number;
+    unvalidatedRoutesCount: number;
+    currentlyReadyRoutes: number;
+    verifiedPoolsTotal: number;
     clmmActivatedPoolsTotal: number;
+    clmmPricingRejections: Record<string, number>;
     totalPoolsInUniverse: number;
     totalQuotesGenerated: number;
     quoteValidEvaluations: number;
@@ -269,6 +274,7 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
   const uptimeReport = scanner.getRouteUptimeReport(totalSessionMs);
   const finalAudit = scanner.getAuditMetrics();
   const finalLatency = scanner.getLatencyReport();
+  const finalRejections = scanner.getRejectionBreakdown();
 
   const activeSamples = samples.filter(s => (s.configuredBlockers?.websocketDelay ?? 0) < s.storedRoutes);
   const repSample = activeSamples.length > 0 ? activeSamples[activeSamples.length - 1] : samples[samples.length - 1];
@@ -313,7 +319,18 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
       uniqueRoutesCount: routeIndex.getUniqueRouteCount(),
       restoredRoutesCount: routeIndex.getRestoredRouteCount(),
       verifiedRoutesTotal: routeIndex.getVerifiedRouteCount(),
+      freshlyVerifiedRoutesCount: routeIndex.getRouteCountByState('VERIFIED'),
+      unvalidatedRoutesCount: routeIndex.getUnvalidatedRouteCount(),
+      currentlyReadyRoutes: routeIndex.getReadyRouteCount(),
+      verifiedPoolsTotal: poolReg.getAllPools().filter(p => p.verificationStatus === 'VERIFIED_DIRECT').length,
       clmmActivatedPoolsTotal: poolReg.getAllPools().filter(p => p.dex === 'RAYDIUM_CLMM' && p.verificationStatus === 'VERIFIED_DIRECT').length,
+      clmmPricingRejections: {
+        MISSING_TICK_DATA: finalRejections['MISSING_TICK_DATA'] || 0,
+        UNSUPPORTED_AMM_CONFIG: finalRejections['UNSUPPORTED_AMM_CONFIG'] || 0,
+        QUOTE_UNVERIFIED: finalRejections['QUOTE_UNVERIFIED'] || 0,
+        TICK_BOUNDARY_EXCEEDED: finalRejections['TICK_BOUNDARY_EXCEEDED'] || 0,
+        EXCESSIVE_PRICE_IMPACT: finalRejections['EXCESSIVE_PRICE_IMPACT'] || 0
+      },
       totalPoolsInUniverse: poolReg.getAllPools().length,
       totalQuotesGenerated: totalEvaluatedFinal,
       quoteValidEvaluations: quoteValidFinal,
@@ -342,12 +359,16 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
   console.log('================================================================');
   console.log(`  Duration:                 ${durationSeconds} seconds`);
   console.log(`  Total Pools in Registry:  ${result.summary.totalPoolsInUniverse}`);
+  console.log(`  Verified Pools (Direct):  ${result.summary.verifiedPoolsTotal}`);
   console.log(`  Active CLMM Pools:        ${result.summary.clmmActivatedPoolsTotal}`);
   console.log(`  Total Configured Routes:  ${result.summary.totalConfiguredRoutes}`);
   console.log(`  Unique Stored Routes:     ${result.summary.uniqueRoutesCount}`);
   console.log(`  Restored Routes:          ${result.summary.restoredRoutesCount}`);
   console.log(`  Structurally Verified:    ${result.summary.verifiedRoutesTotal}`);
+  console.log(`  Freshly Verified State:   ${result.summary.freshlyVerifiedRoutesCount}`);
+  console.log(`  Unvalidated Routes:       ${result.summary.unvalidatedRoutesCount}`);
   console.log('----------------------------------------------------------------');
+  console.log(`  Currently READY Routes:   ${result.summary.currentlyReadyRoutes}`);
   console.log(`  Peak READY Routes:        ${result.summary.peakReady}`);
   console.log(`  Min READY Routes:         ${result.summary.minReady}`);
   console.log(`  Average READY Routes:     ${result.summary.averageReady}`);
@@ -389,6 +410,11 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
     if (count > 0) {
       console.log(`    ${reason.padEnd(30)}: ${count} routes`);
     }
+  }
+  console.log('----------------------------------------------------------------');
+  console.log('  CLMM PRICING REJECTION COUNTS:');
+  for (const [reason, count] of Object.entries(result.summary.clmmPricingRejections)) {
+    console.log(`    ${reason.padEnd(30)}: ${count}`);
   }
   console.log('================================================================\n');
 

@@ -53,8 +53,15 @@ export function decodeRaydiumClmmAmmConfig(
     const fundFeeRate = data.readUInt32LE(53);
     const fundOwner = new PublicKey(data.subarray(57, 89)).toBase58();
 
-    // Sanity checks on decoded numeric parameters
-    if (tradeFeeRate > 1_000_000 || tickSpacing === 0) {
+    // Strict sanity checks on decoded numeric parameters
+    if (
+      !Number.isInteger(tradeFeeRate) ||
+      tradeFeeRate < 0 ||
+      tradeFeeRate >= 1_000_000 ||
+      tickSpacing === 0 ||
+      protocolFeeRate > 1_000_000 ||
+      fundFeeRate > 1_000_000
+    ) {
       return null;
     }
 

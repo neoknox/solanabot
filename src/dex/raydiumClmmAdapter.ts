@@ -132,20 +132,23 @@ export class RaydiumClmmAdapter implements DexAdapter {
       tickSpacing?: number;
       tradeFeeRate?: number;
       ammConfigData?: RaydiumClmmAmmConfig;
-      feeRate?: number;
       maxPriceImpactBps?: number;
       tickArrays?: Record<number, RaydiumClmmTickArray>;
       tickArrayReceivedAt?: Record<number, number>;
       tickArraySlots?: Record<number, number>;
     } | undefined;
 
-    // Resolve dynamic pool fee from verified on-chain AmmConfig (fails closed if missing or invalid)
-    const tradeFeeRate =
-      extra?.tradeFeeRate ??
-      extra?.ammConfigData?.tradeFeeRate ??
-      (extra?.feeRate !== undefined ? extra.feeRate : (pool.feeBps ? pool.feeBps * 100 : undefined));
+    // Resolve dynamic pool fee strictly from verified on-chain AmmConfig (fails closed if missing or invalid)
+    // Never accept API fee estimates, legacy extra.feeRate, or pool.feeBps as substitutes for verified data
+    const tradeFeeRate = extra?.ammConfigData?.tradeFeeRate ?? extra?.tradeFeeRate;
 
-    if (tradeFeeRate === undefined || tradeFeeRate < 0 || tradeFeeRate > 1_000_000) {
+    if (
+      tradeFeeRate === undefined ||
+      typeof tradeFeeRate !== 'number' ||
+      !Number.isInteger(tradeFeeRate) ||
+      tradeFeeRate < 0 ||
+      tradeFeeRate >= 1_000_000
+    ) {
       this.lastFailureReason = 'QUOTE_UNVERIFIED';
       return null;
     }
