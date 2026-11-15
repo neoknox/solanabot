@@ -690,7 +690,7 @@ export class ProfitHudServer {
         </div>
         <div class="telemetry-item">
           <div class="telemetry-label">Route Topologies</div>
-          <div class="telemetry-value" id="scoutRouteTopologies" style="font-size: 13px;">0 (2-leg) &bull; 0 (3-leg)</div>
+          <div class="telemetry-value" id="scoutRouteTopologies" style="font-size: 13px;">0 (2-leg) &bull; 0 intra</div>
         </div>
       </div>
       <div id="scoutAlert" class="alert" style="margin-top: 14px;"></div>
@@ -836,7 +836,6 @@ export class ProfitHudServer {
               (sc.blockedRoutesCount || 0) + ' BLOCKED';
 
             scoutTopologies.innerHTML = (sc.twoLegRoutesCount || 0) + ' (2-leg) &bull; ' +
-              (sc.threeLegRoutesCount || 0) + ' (3-leg) &bull; ' +
               (sc.intraDexRoutesCount || 0) + ' intra &bull; ' +
               (sc.interDexRoutesCount || 0) + ' inter';
           }

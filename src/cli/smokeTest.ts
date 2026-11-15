@@ -5,7 +5,7 @@ import { ProfitHudServer } from '../hud/profitHudServer.js';
 async function main() {
   console.log('================================================================');
   console.log('  SOLANA ARBITRAGE BOT - LIVE MAINNET SMOKE TEST (PHASE 1.2)    ');
-  console.log('  COMPETITIVE OPPORTUNITY INTELLIGENCE & 3-LEG CYCLES          ');
+  console.log('  COMPETITIVE OPPORTUNITY INTELLIGENCE & 2-LEG ARBITRAGE        ');
   console.log('  (Strictly Read-Only: No Private Keys, No Execution, No Funds) ');
   console.log('================================================================');
   console.log(`Connecting to Solana RPC: ${config.SOLANA_RPC_HTTP}`);
@@ -34,7 +34,6 @@ async function main() {
   console.log(`  - Verified Direct Routes:  ${routeIndex.getVerifiedDirectRouteCount()}`);
   console.log(`  - Blocked Routes (Data):   ${routeIndex.getBlockedRouteCount()}`);
   console.log(`  2-Leg Cycles:              ${routeIndex.getTwoLegRouteCount()}`);
-  console.log(`  3-Leg Cycles:              ${routeIndex.getThreeLegRouteCount()}`);
   console.log(`  Intra-DEX Routes:          ${routeIndex.getIntraDexRouteCount()}`);
   console.log(`  Inter-DEX Routes:          ${routeIndex.getInterDexRouteCount()}\n`);
 
@@ -45,7 +44,7 @@ async function main() {
   scanner.onCandidate((c) => {
     const time = new Date(c.timestamp).toISOString();
     const inputUSD = (Number(c.inputAmountUSDC) / 1e6).toFixed(2);
-    const outUSD = (Number(c.leg3ExpectedOutUSDC || c.leg2ExpectedOutUSDC) / 1e6).toFixed(2);
+    const outUSD = (Number(c.leg2ExpectedOutUSDC) / 1e6).toFixed(2);
     
     if (c.qualityLabel === 'SHADOW_QUALIFIED') shadowQualifiedCount++;
     else if (c.qualityLabel === 'INDICATIVE_ONLY') indicativeCount++;
@@ -147,7 +146,6 @@ async function main() {
   console.log(`  - Blocked Routes (Data/Gate): ${routeIndex.getBlockedRouteCount()}`);
   console.log(`Total Routes Evaluated:         ${audit.totalEvaluated}`);
   console.log(`  - 2-Leg Cycles Evaluated:     ${audit.twoLegEvaluated || 0}`);
-  console.log(`  - 3-Leg Cycles Evaluated:     ${audit.threeLegEvaluated || 0}`);
   console.log(`  - Intra-DEX Evaluated:        ${audit.intraDexEvaluated || 0}`);
   console.log(`  - Inter-DEX Evaluated:        ${audit.interDexEvaluated || 0}`);
   console.log(`Unique Opportunities:           ${audit.uniqueOpportunities}`);
@@ -191,7 +189,6 @@ async function main() {
   console.log(`  - Stale Routes:                        ${routeLibStats.staleCount}`);
   console.log(`  - Blocked Routes:                      ${routeLibStats.blockedCount}`);
   console.log(`  - 2-Leg Cycles:                        ${routeLibStats.twoLegCount}`);
-  console.log(`  - 3-Leg Cycles:                        ${routeLibStats.threeLegCount}`);
   console.log(`  - Intra-DEX Routes:                    ${routeLibStats.intraDexCount}`);
   console.log(`  - Inter-DEX Routes:                    ${routeLibStats.interDexCount}`);
   console.log(`  Route Lifecycle Transitions:`);
@@ -230,7 +227,6 @@ async function main() {
   console.log(`  - Stale Routes:                        ${scoutMetrics.staleRoutesCount}`);
   console.log(`  - Blocked Routes:                      ${scoutMetrics.blockedRoutesCount}`);
   console.log(`  - 2-Leg Cycles:                        ${scoutMetrics.twoLegRoutesCount}`);
-  console.log(`  - 3-Leg Cycles:                        ${scoutMetrics.threeLegRoutesCount}`);
   console.log(`  - Intra-DEX Cycles:                    ${scoutMetrics.intraDexRoutesCount}`);
   console.log(`  - Inter-DEX Cycles:                    ${scoutMetrics.interDexRoutesCount}`);
 

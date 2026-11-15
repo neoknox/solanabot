@@ -109,7 +109,6 @@ export interface ExecutionInstructionLayout {
     | 'JITO_TIP'
     | 'SWAP_LEG_1'
     | 'SWAP_LEG_2'
-    | 'SWAP_LEG_3'
     | 'ON_CHAIN_PROFIT_GUARD';
   programId: PublicKey;
   description: string;
@@ -118,7 +117,7 @@ export interface ExecutionInstructionLayout {
 
 export interface ExecutionContractSpec {
   routeId: string;
-  cycleType: '2_LEG' | '3_LEG';
+  cycleType: '2_LEG';
   initialAmountUSDC: bigint;
   minimumOutputAmountUSDC: bigint;
   minNetProfitUSDC: string;

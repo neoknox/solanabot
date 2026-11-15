@@ -398,7 +398,7 @@ describe('Phase 1.3: Discovered Pool Activation & Safety Suite', () => {
     });
     const scannerMissing = new ArbitrageScanner(configMissing);
     expect(scannerMissing.getPoolRegistry().getAllPools().length).toBe(8);
-    expect(scannerMissing.getRouteIndex().getRouteCount()).toBe(42);
+    expect(scannerMissing.getRouteIndex().getRouteCount()).toBe(30);
     scannerMissing.stop();
 
     // B) Corrupt file: scanner initializes cleanly with warning and default pools intact
@@ -410,7 +410,7 @@ describe('Phase 1.3: Discovered Pool Activation & Safety Suite', () => {
     });
     const scannerCorrupt = new ArbitrageScanner(configCorrupt);
     expect(scannerCorrupt.getPoolRegistry().getAllPools().length).toBe(8);
-    expect(scannerCorrupt.getRouteIndex().getRouteCount()).toBe(42);
+    expect(scannerCorrupt.getRouteIndex().getRouteCount()).toBe(30);
     scannerCorrupt.stop();
   });
 });

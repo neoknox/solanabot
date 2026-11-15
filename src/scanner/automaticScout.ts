@@ -298,7 +298,7 @@ export class AutomaticScout {
               this.repository.recordPersistenceError('saveVerifiedPool', err);
             }
 
-            // Step 4.2: Incrementally generate directed 2-leg and 3-leg cycles
+            // Step 4.2: Incrementally generate directed 2-leg cycles
             const genStart = performance.now();
             const newRoutes = this.routeIndex.addPoolAndGenerateRoutes(res.poolConfig);
             this.lastRouteGenTimeMs = Math.round(performance.now() - genStart);

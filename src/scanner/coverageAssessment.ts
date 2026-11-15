@@ -51,7 +51,7 @@ export class CoverageAssessmentService {
 
     const totalRoutes = allRoutes.length;
     const twoLegRoutes = allRoutes.filter(r => r.cycleType === '2_LEG').length;
-    const threeLegRoutes = allRoutes.filter(r => r.cycleType === '3_LEG').length;
+    const threeLegRoutes = 0;
 
     // Filter routes where all participating legs are verified direct
     const currentlyVerifiedRoutes = allRoutes.filter(r =>
@@ -64,8 +64,8 @@ export class CoverageAssessmentService {
 
     for (const pool of verifiedPools) {
       const affected = routeIndex.getRoutesAffectedByPool(pool.id);
-      const twoLeg = affected.filter(r => r.cycleType === '2_LEG').length;
-      const threeLeg = affected.filter(r => r.cycleType === '3_LEG').length;
+      const twoLeg = affected.length;
+      const threeLeg = 0;
 
       if (affected.length === 0) {
         allVerifiedCovered = false;

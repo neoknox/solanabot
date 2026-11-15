@@ -40,11 +40,6 @@ export interface IndexedDirectedRoute {
   intermediateMint: string;
   outputMint: string;
 
-  // 3-leg cycle extensions
-  poolCId?: string;
-  dexC?: DexType;
-  tokenBMint?: string;
-
   // Solana Transaction limits validation
   estimatedAccounts: number;
   estimatedComputeUnits: number;
@@ -199,13 +194,13 @@ export class RouteIndex {
       }
 
       let priority = 0;
-      if (route.isDirectToDirect) priority += (route.cycleType === '3_LEG' ? 800 : 1000);
+      if (route.isDirectToDirect) priority += 1000;
       else if (route.poolIds.some(id => {
         const cfg = this.poolConfigs.get(id);
         return cfg ? this.isPoolVerifiedDirect(cfg) : false;
       })) priority += 500;
 
-      if (route.isIntraDex) priority += (route.cycleType === '3_LEG' ? 150 : 200);
+      if (route.isIntraDex) priority += 200;
 
       const poolA = this.poolConfigs.get(route.poolAId);
       const poolB = this.poolConfigs.get(route.poolBId);
@@ -443,67 +438,10 @@ export class RouteIndex {
     };
   }
 
-  public create3LegRoute(p1: PoolConfig, p2: PoolConfig, p3: PoolConfig, tokenA: string, tokenB: string): IndexedDirectedRoute | null {
-    // Prevent repeated pool in the same atomic cycle
-    if (p1.id === p2.id || p2.id === p3.id || p1.id === p3.id) return null;
-
-    const isDirect1 = this.isPoolVerifiedDirect(p1);
-    const isDirect2 = this.isPoolVerifiedDirect(p2);
-    const isDirect3 = this.isPoolVerifiedDirect(p3);
-    const isDirectToDirect = isDirect1 && isDirect2 && isDirect3;
-    const isIntraDex = p1.dex === p2.dex && p2.dex === p3.dex;
-
-    let priority = 100;
-    if (isDirectToDirect) priority += 800;
-    if (isIntraDex) priority += 150;
-
-    const estAccounts = 3 + this.estimateLegAccounts(p1.dex) + this.estimateLegAccounts(p2.dex) + this.estimateLegAccounts(p3.dex);
-    const estCU = this.estimateLegComputeUnits(p1.dex) + this.estimateLegComputeUnits(p2.dex) + this.estimateLegComputeUnits(p3.dex);
-
-    // Fail closed if transaction limits exceeded
-    if (estAccounts > 64 || estCU > 1400000) return null;
-
-    const leg1 = { poolId: p1.id, dex: p1.dex, inputMint: CANONICAL_USDC_MINT, outputMint: tokenA };
-    const leg2 = { poolId: p2.id, dex: p2.dex, inputMint: tokenA, outputMint: tokenB };
-    const leg3 = { poolId: p3.id, dex: p3.dex, inputMint: tokenB, outputMint: CANONICAL_USDC_MINT };
-    const deps = this.buildDependenciesForLegs([leg1, leg2, leg3]);
-
-    const routeLastVerified = isDirectToDirect
-      ? Math.min(p1.lastVerifiedAt || 0, p2.lastVerifiedAt || 0, p3.lastVerifiedAt || 0)
-      : 0;
-
-    return {
-      routeId: `${p1.id}->${p2.id}->${p3.id}`,
-      cycleType: '3_LEG',
-      isIntraDex,
-      isDirectToDirect,
-      priorityScore: priority,
-      legs: [leg1, leg2, leg3],
-      poolIds: [p1.id, p2.id, p3.id],
-      poolAId: p1.id,
-      poolBId: p2.id,
-      poolCId: p3.id,
-      dexA: p1.dex,
-      dexB: p2.dex,
-      dexC: p3.dex,
-      inputMint: CANONICAL_USDC_MINT,
-      intermediateMint: tokenA,
-      tokenBMint: tokenB,
-      outputMint: CANONICAL_USDC_MINT,
-      estimatedAccounts: estAccounts,
-      estimatedComputeUnits: estCU,
-      state: isDirectToDirect ? 'VERIFIED' : 'BLOCKED',
-      staticDependencies: deps.staticDependencies,
-      dynamicDependencies: deps.dynamicDependencies,
-      protocolAdapterVersion: '1.4.0',
-      lastVerifiedAt: routeLastVerified,
-      isUnprofitablePreserved: true
-    };
-  }
-
   /**
-   * Hot-activates a new pool by generating only new non-duplicate 2-leg and 3-leg cycles
+   * Hot-activates a new pool by generating only new non-duplicate directed 2-leg cycles
    * involving that pool, updating indices without a full graph rebuild on the Sniper hot path.
+   * Solanabot is strictly a 2-leg arbitrage engine (USDC -> TOKEN -> USDC).
    */
   public addPoolAndGenerateRoutes(pool: PoolConfig): IndexedDirectedRoute[] {
     this.poolConfigs.set(pool.id, { ...pool });
@@ -526,7 +464,7 @@ export class RouteIndex {
     const intermediateTokens = [CANONICAL_WSOL_MINT, CANONICAL_USDT_MINT];
     const allPools = Array.from(this.poolConfigs.values());
 
-    // 1. Build 2-Leg Cycles involving this new pool
+    // Build 2-Leg Cycles involving this new pool (USDC -> Token A -> USDC)
     for (const tokenA of intermediateTokens) {
       if (this.poolTradesTokens(pool, CANONICAL_USDC_MINT, tokenA)) {
         for (const other of allPools) {
@@ -556,80 +494,6 @@ export class RouteIndex {
               this.mapPoolToRoute(other.id, r2);
               this.mapPoolToRoute(pool.id, r2);
               newRoutes.push(r2);
-            }
-          }
-        }
-      }
-    }
-
-    // 2. Build 3-Leg Cycles involving this new pool
-    const threeLegPatterns = [
-      { tokenA: CANONICAL_WSOL_MINT, tokenB: CANONICAL_USDT_MINT },
-      { tokenA: CANONICAL_USDT_MINT, tokenB: CANONICAL_WSOL_MINT }
-    ];
-
-    for (const pattern of threeLegPatterns) {
-      // Leg 1: pool is (USDC, tokenA)
-      if (this.poolTradesTokens(pool, CANONICAL_USDC_MINT, pattern.tokenA)) {
-        for (const p2 of allPools) {
-          if (p2.id === pool.id || !this.poolTradesTokens(p2, pattern.tokenA, pattern.tokenB)) continue;
-          for (const p3 of allPools) {
-            if (p3.id === pool.id || p3.id === p2.id || !this.poolTradesTokens(p3, pattern.tokenB, CANONICAL_USDC_MINT)) continue;
-            const rId = `${pool.id}->${p2.id}->${p3.id}`;
-            if (!this.routeById.has(rId)) {
-              const r = this.create3LegRoute(pool, p2, p3, pattern.tokenA, pattern.tokenB);
-              if (r) {
-                this.routeById.set(rId, r);
-                this.allRoutes.push(r);
-                this.mapPoolToRoute(pool.id, r);
-                this.mapPoolToRoute(p2.id, r);
-                this.mapPoolToRoute(p3.id, r);
-                newRoutes.push(r);
-              }
-            }
-          }
-        }
-      }
-
-      // Leg 2: pool is (tokenA, tokenB)
-      if (this.poolTradesTokens(pool, pattern.tokenA, pattern.tokenB)) {
-        for (const p1 of allPools) {
-          if (p1.id === pool.id || !this.poolTradesTokens(p1, CANONICAL_USDC_MINT, pattern.tokenA)) continue;
-          for (const p3 of allPools) {
-            if (p3.id === pool.id || p3.id === p1.id || !this.poolTradesTokens(p3, pattern.tokenB, CANONICAL_USDC_MINT)) continue;
-            const rId = `${p1.id}->${pool.id}->${p3.id}`;
-            if (!this.routeById.has(rId)) {
-              const r = this.create3LegRoute(p1, pool, p3, pattern.tokenA, pattern.tokenB);
-              if (r) {
-                this.routeById.set(rId, r);
-                this.allRoutes.push(r);
-                this.mapPoolToRoute(p1.id, r);
-                this.mapPoolToRoute(pool.id, r);
-                this.mapPoolToRoute(p3.id, r);
-                newRoutes.push(r);
-              }
-            }
-          }
-        }
-      }
-
-      // Leg 3: pool is (tokenB, USDC)
-      if (this.poolTradesTokens(pool, pattern.tokenB, CANONICAL_USDC_MINT)) {
-        for (const p1 of allPools) {
-          if (p1.id === pool.id || !this.poolTradesTokens(p1, CANONICAL_USDC_MINT, pattern.tokenA)) continue;
-          for (const p2 of allPools) {
-            if (p2.id === pool.id || p2.id === p1.id || !this.poolTradesTokens(p2, pattern.tokenA, pattern.tokenB)) continue;
-            const rId = `${p1.id}->${p2.id}->${pool.id}`;
-            if (!this.routeById.has(rId)) {
-              const r = this.create3LegRoute(p1, p2, pool, pattern.tokenA, pattern.tokenB);
-              if (r) {
-                this.routeById.set(rId, r);
-                this.allRoutes.push(r);
-                this.mapPoolToRoute(p1.id, r);
-                this.mapPoolToRoute(p2.id, r);
-                this.mapPoolToRoute(pool.id, r);
-                newRoutes.push(r);
-              }
             }
           }
         }
@@ -688,35 +552,6 @@ export class RouteIndex {
       }
     }
 
-    // 3. Build 3-Leg Cycles: USDC -> Token A -> Token B -> USDC
-    // Cycle Pattern 1: USDC -> WSOL -> USDT -> USDC
-    // Cycle Pattern 2: USDC -> USDT -> WSOL -> USDC
-    const threeLegPatterns = [
-      { tokenA: CANONICAL_WSOL_MINT, tokenB: CANONICAL_USDT_MINT },
-      { tokenA: CANONICAL_USDT_MINT, tokenB: CANONICAL_WSOL_MINT }
-    ];
-
-    for (const pattern of threeLegPatterns) {
-      const poolsLeg1 = pools.filter(p => this.poolTradesTokens(p, CANONICAL_USDC_MINT, pattern.tokenA));
-      const poolsLeg2 = pools.filter(p => this.poolTradesTokens(p, pattern.tokenA, pattern.tokenB));
-      const poolsLeg3 = pools.filter(p => this.poolTradesTokens(p, pattern.tokenB, CANONICAL_USDC_MINT));
-
-      for (const p1 of poolsLeg1) {
-        for (const p2 of poolsLeg2) {
-          for (const p3 of poolsLeg3) {
-            const route = this.create3LegRoute(p1, p2, p3, pattern.tokenA, pattern.tokenB);
-            if (route) {
-              this.allRoutes.push(route);
-              this.routeById.set(route.routeId, route);
-              this.mapPoolToRoute(p1.id, route);
-              this.mapPoolToRoute(p2.id, route);
-              this.mapPoolToRoute(p3.id, route);
-            }
-          }
-        }
-      }
-    }
-
     // Sort routes by priority score descending
     this.allRoutes.sort((a, b) => b.priorityScore - a.priorityScore);
   }
@@ -753,7 +588,7 @@ export class RouteIndex {
   }
 
   public getThreeLegRouteCount(): number {
-    return this.allRoutes.filter(r => r.cycleType === '3_LEG').length;
+    return 0; // Permanently removed: Solanabot is strictly a 2-leg arbitrage engine
   }
 
   public getIntraDexRouteCount(): number {
@@ -1092,6 +927,11 @@ export class RouteIndex {
     let updated = 0;
 
     for (const saved of savedRoutes) {
+      // CEO Mandate: Reject old 3-leg route records or invalid leg counts during reconciliation
+      if (saved.cycleType === '3_LEG' || saved.orderedPoolIds.length !== 2) {
+        continue;
+      }
+
       // 1. Fallback: If missing from poolConfigs, reconstruct minimal PoolConfig from saved route metadata
       for (let i = 0; i < saved.orderedPoolIds.length; i++) {
         const poolId = saved.orderedPoolIds[i];
@@ -1155,15 +995,14 @@ export class RouteIndex {
 
         const poolA = this.poolConfigs.get(legs[0].poolId)!;
         const poolB = this.poolConfigs.get(legs[1].poolId)!;
-        const poolC = legs[2] ? this.poolConfigs.get(legs[2].poolId) : undefined;
 
         let priority = 0;
-        if (allDirect) priority += (saved.cycleType === '3_LEG' ? 800 : 1000);
-        if (saved.isIntraDex) priority += (saved.cycleType === '3_LEG' ? 150 : 200);
+        if (allDirect) priority += 1000;
+        if (saved.isIntraDex) priority += 200;
 
         const newRoute: IndexedDirectedRoute = {
           routeId: saved.routeId,
-          cycleType: saved.cycleType,
+          cycleType: '2_LEG',
           isIntraDex: saved.isIntraDex,
           isDirectToDirect: allDirect,
           priorityScore: priority,
@@ -1171,14 +1010,11 @@ export class RouteIndex {
           poolIds: [...saved.orderedPoolIds],
           poolAId: poolA.id,
           poolBId: poolB.id,
-          poolCId: poolC?.id,
           dexA: poolA.dex,
           dexB: poolB.dex,
-          dexC: poolC?.dex,
           inputMint: legs[0].inputMint,
           intermediateMint: legs[0].outputMint,
-          tokenBMint: legs[2] ? legs[1].outputMint : undefined,
-          outputMint: legs[legs.length - 1].outputMint,
+          outputMint: legs[1].outputMint,
           estimatedAccounts: saved.estimatedAccounts,
           estimatedComputeUnits: saved.estimatedComputeUnits,
           state: targetState,

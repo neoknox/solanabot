@@ -39,9 +39,7 @@ export class OpportunityTracker {
     isSurvival: boolean;
   } {
     const inputSize = candidate.optimalSizeUSDC || Number(candidate.inputAmountUSDC) / 1e6;
-    const poolKeys = [candidate.leg1Quote.poolId, candidate.leg2Quote.poolId, candidate.leg3Quote?.poolId]
-      .filter(Boolean)
-      .join('->');
+    const poolKeys = `${candidate.leg1Quote.poolId}->${candidate.leg2Quote.poolId}`;
     const routeKey = `${poolKeys}:${inputSize.toFixed(0)}`;
 
     const now = candidate.timestamp || Date.now();

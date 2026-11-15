@@ -73,10 +73,7 @@ export class CompetitionScorer {
 
     // 5. Route Complexity Score (0 to 10 pts)
     let complexityScore = 8;
-    if (candidate.cycleType === '3_LEG') {
-      complexityScore = 5;
-      rationale.push(`Route complexity: 3-leg triangular cycle (3 pool hops) = 5/10 pts`);
-    } else if (candidate.routeName.includes('Intra-DEX') || candidate.leg1Quote.dex === candidate.leg2Quote.dex) {
+    if (candidate.routeName.includes('Intra-DEX') || candidate.leg1Quote.dex === candidate.leg2Quote.dex) {
       complexityScore = 10;
       rationale.push(`Route complexity: intra-DEX single protocol (lowest cross-program overhead) = 10/10 pts`);
     } else {

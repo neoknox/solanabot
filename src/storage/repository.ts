@@ -275,6 +275,7 @@ export class ArbitrageRepository {
   }
 
   private executeInsertCandidate(candidate: ArbitrageCandidate): void {
+    if (candidate.cycleType === '3_LEG') return;
     try {
       this.insertCandidateStmt.run(
         candidate.candidateId,
@@ -338,6 +339,7 @@ export class ArbitrageRepository {
   }
 
   private executeUpsertRoute(route: PermanentRouteRecord): void {
+    if (route.cycleType === '3_LEG' || route.orderedPoolIds.length !== 2) return;
     const now = Date.now();
     try {
       this.upsertRouteStmt.run(
@@ -446,6 +448,7 @@ export class ArbitrageRepository {
   }
 
   public queueRouteStateUpdate(routeId: string, state: RouteState, details?: string): void {
+    if (routeId.split('->').length !== 2) return;
     const existing = this.routeReadinessQueue.get(routeId);
     this.routeReadinessQueue.set(routeId, {
       routeId,
@@ -464,6 +467,7 @@ export class ArbitrageRepository {
     details?: string,
     quoteStats?: { expectedNetUSDC: string; timestamp: number }
   ): void {
+    if (routeId.split('->').length !== 2) return;
     const state: RouteState = isReady ? 'READY' : 'STALE';
     const existing = this.routeReadinessQueue.get(routeId);
     // Non-blocking in-memory queue with key coalescing to keep writes off the quoting hot path

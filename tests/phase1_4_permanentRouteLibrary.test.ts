@@ -156,7 +156,7 @@ describe('Phase 1.4: Permanent Route Library Suite (90-Day Roadmap Phase 1 Gate)
 
     expect(restartedSummary.totalRoutes).toBe(initialSummary.totalRoutes);
     expect(restartedSummary.twoLegCount).toBe(initialSummary.twoLegCount);
-    expect(restartedSummary.threeLegCount).toBe(initialSummary.threeLegCount);
+    expect(restartedSummary.threeLegCount).toBe(0);
     expect(restartedSummary.intraDexCount).toBe(initialSummary.intraDexCount);
     expect(restartedSummary.interDexCount).toBe(initialSummary.interDexCount);
 
@@ -314,7 +314,7 @@ describe('Phase 1.4: Permanent Route Library Suite (90-Day Roadmap Phase 1 Gate)
     const stats = scanner.getRouteLibrarySummary();
     expect(stats.totalRoutes).toBeGreaterThan(0);
     expect(stats.twoLegCount).toBeGreaterThan(0);
-    expect(stats.threeLegCount).toBeGreaterThan(0);
+    expect(stats.threeLegCount).toBe(0);
     expect(stats.verifiedPoolCount).toBeGreaterThan(0);
     expect(stats.verifiedDirectPoolCount).toBeGreaterThan(0);
     expect(stats.totalStoredPoolCount).toBeGreaterThanOrEqual(stats.verifiedDirectPoolCount);

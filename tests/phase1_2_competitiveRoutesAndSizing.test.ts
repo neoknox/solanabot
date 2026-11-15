@@ -28,13 +28,13 @@ describe('Phase 1.2 Acceptance: Competitive Route Search & Optimal Sizing', () =
     assumptions: ['Phase 1.2 standard test costs']
   };
 
-  it('Matrix 1.2-A: RouteIndex builds 2-leg and 3-leg cycles, intra-DEX, and inter-DEX routes', () => {
+  it('Matrix 1.2-A: RouteIndex builds exclusively directed 2-leg cycles, intra-DEX, and inter-DEX routes', () => {
     const index = new RouteIndex(poolRegistry.getAllPools());
     const allRoutes = index.getAllRoutes();
 
-    expect(allRoutes.length).toBeGreaterThan(10);
+    expect(allRoutes.length).toBeGreaterThan(5);
     expect(index.getTwoLegRouteCount()).toBeGreaterThan(0);
-    expect(index.getThreeLegRouteCount()).toBeGreaterThan(0);
+    expect(index.getThreeLegRouteCount()).toBe(0);
     expect(index.getIntraDexRouteCount()).toBeGreaterThan(0);
     expect(index.getInterDexRouteCount()).toBeGreaterThan(0);
 
@@ -51,18 +51,11 @@ describe('Phase 1.2 Acceptance: Competitive Route Search & Optimal Sizing', () =
       expect(route.estimatedAccounts).toBeLessThanOrEqual(64);
       expect(route.estimatedComputeUnits).toBeLessThanOrEqual(1400000);
 
-      // Leg count matches cycle type
-      if (route.cycleType === '2_LEG') {
-        expect(route.legs.length).toBe(2);
-        expect(route.legs[0].inputMint).toBe(CANONICAL_USDC_MINT);
-        expect(route.legs[1].outputMint).toBe(CANONICAL_USDC_MINT);
-      } else {
-        expect(route.legs.length).toBe(3);
-        expect(route.legs[0].inputMint).toBe(CANONICAL_USDC_MINT);
-        expect(route.legs[1].inputMint).toBe(route.legs[0].outputMint);
-        expect(route.legs[2].inputMint).toBe(route.legs[1].outputMint);
-        expect(route.legs[2].outputMint).toBe(CANONICAL_USDC_MINT);
-      }
+      // Leg count is strictly 2
+      expect(route.cycleType).toBe('2_LEG');
+      expect(route.legs.length).toBe(2);
+      expect(route.legs[0].inputMint).toBe(CANONICAL_USDC_MINT);
+      expect(route.legs[1].outputMint).toBe(CANONICAL_USDC_MINT);
     }
   });
 

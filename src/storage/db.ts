@@ -194,5 +194,12 @@ export function initDatabase(config: AppConfig): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_verified_pools_status ON verified_pools(verification_status);
   `);
 
+  // Idempotent CEO mandate: Solanabot is strictly a 2-leg arbitrage engine.
+  // Permanently purge any remaining 3-leg route definitions and obsolete 3-leg candidates.
+  db.exec(`
+    DELETE FROM routes WHERE cycle_type = '3_LEG';
+    DELETE FROM candidates WHERE cycle_type = '3_LEG' OR route_name LIKE '%(3-Leg Cycle)%';
+  `);
+
   return db;
 }

@@ -58,8 +58,7 @@ export class ArbitrageProfitCalculator {
       initialAmountUSDC,
       leg1Quote,
       leg2Quote,
-      leg3Quote,
-      cycleType = leg3Quote ? '3_LEG' : '2_LEG',
+      cycleType = '2_LEG',
       optimalSizeUSDC,
       sizingMethod,
       costs,
@@ -69,9 +68,7 @@ export class ArbitrageProfitCalculator {
     } = params;
 
     const candidateId = `ARB-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-    const routeName = leg3Quote
-      ? `${leg1Quote.dex} -> ${leg2Quote.dex} -> ${leg3Quote.dex} (3-Leg Cycle)`
-      : `${leg1Quote.dex} -> ${leg2Quote.dex} (${leg1Quote.quoteSource} / ${leg2Quote.quoteSource})`;
+    const routeName = `${leg1Quote.dex} -> ${leg2Quote.dex} (${leg1Quote.quoteSource} / ${leg2Quote.quoteSource})`;
 
     const rejectionReasons: RejectionReasonCode[] = [];
     const now = Date.now();
@@ -82,7 +79,7 @@ export class ArbitrageProfitCalculator {
     }
 
     // 2. Freshness and Slot synchronization
-    const quotes = leg3Quote ? [leg1Quote, leg2Quote, leg3Quote] : [leg1Quote, leg2Quote];
+    const quotes = [leg1Quote, leg2Quote];
     for (const q of quotes) {
       if (!q.timestamp || q.timestamp <= 0 || q.timestamp > now + 5000) {
         if (!rejectionReasons.includes('STALE_QUOTE')) {
@@ -141,21 +138,12 @@ export class ArbitrageProfitCalculator {
     }
 
     // 5. Mint continuity checks (must start and end in USDC)
-    if (leg3Quote) {
-      if (leg1Quote.inputMint !== CANONICAL_USDC_MINT || leg3Quote.outputMint !== CANONICAL_USDC_MINT) {
+    if (leg1Quote.inputMint && leg1Quote.inputMint !== CANONICAL_USDC_MINT && leg1Quote.inputMint !== 'mock-usdc') {
+      rejectionReasons.push('INVALID_MINT');
+    }
+    if (leg2Quote.outputMint === CANONICAL_USDC_MINT && leg1Quote.outputMint && leg2Quote.inputMint) {
+      if (leg1Quote.outputMint !== leg2Quote.inputMint) {
         rejectionReasons.push('INVALID_MINT');
-      }
-      if (leg1Quote.outputMint !== leg2Quote.inputMint || leg2Quote.outputMint !== leg3Quote.inputMint) {
-        rejectionReasons.push('INVALID_MINT');
-      }
-    } else {
-      if (leg1Quote.inputMint && leg1Quote.inputMint !== CANONICAL_USDC_MINT && leg1Quote.inputMint !== 'mock-usdc') {
-        rejectionReasons.push('INVALID_MINT');
-      }
-      if (leg2Quote.outputMint === CANONICAL_USDC_MINT && leg1Quote.outputMint && leg2Quote.inputMint) {
-        if (leg1Quote.outputMint !== leg2Quote.inputMint) {
-          rejectionReasons.push('INVALID_MINT');
-        }
       }
     }
 
@@ -174,26 +162,8 @@ export class ArbitrageProfitCalculator {
       ? params.leg2ConservativeQuote.outAmount - slippage2
       : leg2ExpectedOutUSDC - slippage2;
 
-    let leg3ExpectedOutUSDC: bigint | undefined;
-    let leg3ConservativeOutUSDC: bigint | undefined;
-
-    let finalExpectedUnits: bigint;
-    let finalConservativeUnits: bigint;
-
-    if (leg3Quote) {
-      leg3ExpectedOutUSDC = leg3Quote.outAmount;
-      const slippageBps3 = BigInt(this.config.SLIPPAGE_BPS_LEG3 || 10);
-      const slippage3 = (leg3ExpectedOutUSDC * slippageBps3) / 10000n;
-      leg3ConservativeOutUSDC = params.leg3ConservativeQuote
-        ? params.leg3ConservativeQuote.outAmount - slippage3
-        : leg3ExpectedOutUSDC - slippage3;
-
-      finalExpectedUnits = leg3ExpectedOutUSDC;
-      finalConservativeUnits = leg3ConservativeOutUSDC;
-    } else {
-      finalExpectedUnits = leg2ExpectedOutUSDC;
-      finalConservativeUnits = leg2ConservativeOutUSDC;
-    }
+    const finalExpectedUnits = leg2ExpectedOutUSDC;
+    const finalConservativeUnits = leg2ConservativeOutUSDC;
 
     // 7. Cost breakdown verification
     if (!costs) {
@@ -305,15 +275,13 @@ export class ArbitrageProfitCalculator {
       riskRewardRatio = new Decimal(potentialLossUSDC).div(minConservativeNetUSDC).toFixed(2);
     }
 
-    const direction = leg3Quote
-      ? `USDC_TO_${leg1Quote.outputMint.slice(0, 4)}_TO_${leg2Quote.outputMint.slice(0, 4)}_TO_USDC`
-      : 'USDC_TO_WSOL_TO_USDC';
+    const direction = 'USDC_TO_WSOL_TO_USDC';
 
     return {
       candidateId,
       routeName,
       direction,
-      cycleType,
+      cycleType: '2_LEG',
       qualityLabel,
       optimalSizeUSDC,
       sizingMethod,
@@ -324,9 +292,6 @@ export class ArbitrageProfitCalculator {
       leg2Quote,
       leg2ExpectedOutUSDC,
       leg2ConservativeOutUSDC,
-      leg3Quote,
-      leg3ExpectedOutUSDC,
-      leg3ConservativeOutUSDC,
       costs: {
         ...defaultCosts,
         riskRewardRatio

@@ -1117,11 +1117,7 @@ export class ArbitrageScanner {
 
     // 1. TOTAL ATTEMPTS EVALUATED: Every candidate route evaluation entering the pipeline
     this.auditMetrics.totalEvaluated++;
-    if (route.cycleType === '3_LEG') {
-      this.auditMetrics.threeLegEvaluated = (this.auditMetrics.threeLegEvaluated || 0) + 1;
-    } else {
-      this.auditMetrics.twoLegEvaluated = (this.auditMetrics.twoLegEvaluated || 0) + 1;
-    }
+    this.auditMetrics.twoLegEvaluated = (this.auditMetrics.twoLegEvaluated || 0) + 1;
     if (route.isIntraDex) {
       this.auditMetrics.intraDexEvaluated = (this.auditMetrics.intraDexEvaluated || 0) + 1;
     } else {
@@ -1248,9 +1244,7 @@ export class ArbitrageScanner {
         return;
       }
 
-      let slippageBps = this.config.SLIPPAGE_BPS_LEG1;
-      if (idx === 1) slippageBps = this.config.SLIPPAGE_BPS_LEG2;
-      else if (idx === 2) slippageBps = this.config.SLIPPAGE_BPS_LEG3 || 10;
+      const slippageBps = idx === 0 ? this.config.SLIPPAGE_BPS_LEG1 : this.config.SLIPPAGE_BPS_LEG2;
 
       quoterLegs.push({
         pool,
@@ -1332,11 +1326,9 @@ export class ArbitrageScanner {
       initialAmountUSDC: BigInt(Math.floor(sizerResult.optimalSizeUSDC * 1e6)),
       leg1Quote: sizerResult.optimalQuotes[0],
       leg2Quote: sizerResult.optimalQuotes[1],
-      leg3Quote: sizerResult.optimalQuotes[2],
       leg1ConservativeQuote: sizerResult.conservativeQuotes[0],
       leg2ConservativeQuote: sizerResult.conservativeQuotes[1],
-      leg3ConservativeQuote: sizerResult.conservativeQuotes[2],
-      cycleType: route.cycleType,
+      cycleType: '2_LEG',
       optimalSizeUSDC: sizerResult.optimalSizeUSDC,
       sizingMethod: sizerResult.sizingMethod,
       costs: costResult.breakdown,

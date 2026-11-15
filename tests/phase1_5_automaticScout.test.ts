@@ -458,11 +458,11 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
       expect(r.poolIds).toContain(newPoolId);
     }
 
-    // Verify both 2-leg and 3-leg routes were formed
+    // Verify 2-leg routes were formed and zero 3-leg routes
     const has2Leg = newRoutes.some(r => r.cycleType === '2_LEG');
     const has3Leg = newRoutes.some(r => r.cycleType === '3_LEG');
     expect(has2Leg).toBe(true);
-    expect(has3Leg).toBe(true);
+    expect(has3Leg).toBe(false);
   });
 
   // TEST 9: Non-duplication of existing routes
@@ -545,8 +545,8 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
     const testRegistry = new PoolRegistry();
     const testIndex = new RouteIndex(testRegistry.getAllPools());
 
-    // Initially 5 pools produce 42 routes (2-leg and 3-leg)
-    expect(testIndex.getRouteCount()).toBe(42);
+    // Initially 5 pools produce 30 2-leg routes
+    expect(testIndex.getRouteCount()).toBe(30);
 
     // Add 8 additional verified pools across allowlisted pairs (Orca + Raydium)
     const pairs = [
@@ -555,8 +555,8 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
       { a: CANONICAL_WSOL_MINT, b: CANONICAL_USDC_MINT, dex: 'RAYDIUM_AMM' as const, fee: 25 },
       { a: CANONICAL_USDC_MINT, b: CANONICAL_USDT_MINT, dex: 'ORCA_WHIRLPOOL' as const, fee: 100 },
       { a: CANONICAL_USDC_MINT, b: CANONICAL_USDT_MINT, dex: 'RAYDIUM_AMM' as const, fee: 25 },
-      { a: CANONICAL_WSOL_MINT, b: CANONICAL_USDT_MINT, dex: 'ORCA_WHIRLPOOL' as const, fee: 200 },
-      { a: CANONICAL_WSOL_MINT, b: CANONICAL_USDT_MINT, dex: 'RAYDIUM_AMM' as const, fee: 25 },
+      { a: CANONICAL_WSOL_MINT, b: CANONICAL_USDC_MINT, dex: 'ORCA_WHIRLPOOL' as const, fee: 200 },
+      { a: CANONICAL_WSOL_MINT, b: CANONICAL_USDC_MINT, dex: 'RAYDIUM_AMM' as const, fee: 25 },
       { a: CANONICAL_WSOL_MINT, b: CANONICAL_USDC_MINT, dex: 'RAYDIUM_CLMM' as const, fee: 25 }
     ];
 
@@ -575,14 +575,14 @@ describe('Phase 1.5: Automatic Scout & Route Expansion Suite', () => {
     // Milestone 1 Target: >= 100 routes
     expect(testIndex.getRouteCount()).toBeGreaterThanOrEqual(100);
 
-    // Add remaining available pools across the 3 pairs
-    for (let i = 0; i < 6; i++) {
+    // Add remaining available pools across allowlisted pairs
+    for (let i = 0; i < 8; i++) {
       testIndex.addPoolAndGenerateRoutes({
         id: Keypair.generate().publicKey.toBase58(),
         dex: 'ORCA_WHIRLPOOL',
         programId: KNOWN_PROGRAM_IDS.ORCA_WHIRLPOOL,
-        tokenAMint: i % 2 === 0 ? CANONICAL_WSOL_MINT : CANONICAL_USDC_MINT,
-        tokenBMint: i % 2 === 0 ? CANONICAL_USDT_MINT : CANONICAL_USDT_MINT,
+        tokenAMint: CANONICAL_WSOL_MINT,
+        tokenBMint: CANONICAL_USDC_MINT,
         feeBps: 200,
         verificationStatus: 'QUOTE_UNVERIFIED'
       });

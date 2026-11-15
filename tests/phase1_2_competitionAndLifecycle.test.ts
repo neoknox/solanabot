@@ -230,22 +230,22 @@ describe('Phase 1.2 Acceptance: Competition Engine & Opportunity Lifecycle', () 
       expect(scored.breakdown.rationale[4]).toContain('Route complexity:');
     });
 
-    it('Matrix 1.2-L: Intra-DEX routes receive higher complexity score than 3-leg triangular routes', () => {
+    it('Matrix 1.2-L: Intra-DEX routes receive higher complexity score than cross-DEX routes', () => {
       const intraCandidate = createDummyCandidate({
         routeName: 'Orca Whirlpool (4bps) -> Orca Whirlpool (2bps) (Intra-DEX)',
         cycleType: '2_LEG'
       });
-      const triCandidate = createDummyCandidate({
-        routeName: 'Orca -> Raydium -> Orca',
-        cycleType: '3_LEG'
+      const crossCandidate = createDummyCandidate({
+        routeName: 'Orca -> Raydium',
+        cycleType: '2_LEG'
       });
 
       const intraScore = scorer.scoreCandidate(intraCandidate, []);
-      const triScore = scorer.scoreCandidate(triCandidate, []);
+      const crossScore = scorer.scoreCandidate(crossCandidate, []);
 
       expect(intraScore.breakdown.complexityScore).toBe(10); // Intra-DEX bonus
-      expect(triScore.breakdown.complexityScore).toBe(5);  // 3-leg triangular penalty
-      expect(intraScore.breakdown.complexityScore).toBeGreaterThan(triScore.breakdown.complexityScore);
+      expect(crossScore.breakdown.complexityScore).toBe(8);  // Standard 2-leg cross-DEX
+      expect(intraScore.breakdown.complexityScore).toBeGreaterThan(crossScore.breakdown.complexityScore);
     });
   });
 

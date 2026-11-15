@@ -25,6 +25,7 @@ The approved SolanaBot 90-Day Master Roadmap and AI Supervisor Policy are the au
 8. **Empirical Reporting Integrity:** Report real, measured results and verified benchmarks only. Never present estimates, theoretical throughputs, or synthetic simulations as verified live performance.
 9. **Strict Read-Only Enforcement:** Do not implement wallets, private key handling, signing, or transaction broadcasts during this read-only roadmap.
 10. **Documentation Isolation:** Never treat roadmap installation or documentation updates as permission to start coding. All implementation requires explicit user authorization.
+11. **2-Leg Arbitrage Only (CEO Decision):** Solanabot operates strictly as a 2-leg arbitrage system (USDC -> TOKEN -> USDC). All 3-leg and triangular routes are permanently removed and prohibited from generation, persistence, restoration, and evaluation.
 
 ---
 
