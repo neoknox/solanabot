@@ -317,13 +317,18 @@ async function main() {
 
   console.log('\n--- LATENCY INSTRUMENTATION BENCHMARKS ---');
   const fmtUs = (stats: typeof latency.detectionToDecisionUs) =>
-    `p50: ${(stats.p50).toFixed(1)}μs | p95: ${(stats.p95).toFixed(1)}μs | p99: ${(stats.p99).toFixed(1)}μs | max: ${(stats.max).toFixed(1)}μs | mean: ${(stats.mean).toFixed(1)}μs (n=${stats.count})`;
+    stats.p50 !== null
+      ? `p50: ${stats.p50.toFixed(1)}μs | p95: ${(stats.p95 ?? 0).toFixed(1)}μs | p99: ${(stats.p99 ?? 0).toFixed(1)}μs | max: ${(stats.max ?? 0).toFixed(1)}μs | mean: ${(stats.mean ?? 0).toFixed(1)}μs (n=${stats.count})`
+      : `p50: N/A | p95: N/A | p99: N/A | max: N/A | mean: N/A (n=0)`;
   
   console.log(`Detection-to-Decision Latency:  ${fmtUs(latency.detectionToDecisionUs)}`);
   console.log(`Quote Calculation Latency:      ${fmtUs(latency.quoteLatencyUs)}`);
   console.log(`Pool State Decoding Latency:    ${fmtUs(latency.decodeLatencyUs)}`);
   console.log(`Profit Validation Latency:      ${fmtUs(latency.validationLatencyUs)}`);
-  console.log(`RPC Batch Fetch Latency:        p50: ${latency.rpcLatencyMs.p50.toFixed(1)}ms | p95: ${latency.rpcLatencyMs.p95.toFixed(1)}ms | max: ${latency.rpcLatencyMs.max.toFixed(1)}ms`);
+  const rpcP50 = latency.rpcLatencyMs.p50 !== null ? `${latency.rpcLatencyMs.p50.toFixed(1)}ms` : 'N/A';
+  const rpcP95 = latency.rpcLatencyMs.p95 !== null ? `${latency.rpcLatencyMs.p95.toFixed(1)}ms` : 'N/A';
+  const rpcMax = latency.rpcLatencyMs.max !== null ? `${latency.rpcLatencyMs.max.toFixed(1)}ms` : 'N/A';
+  console.log(`RPC Batch Fetch Latency:        p50: ${rpcP50} | p95: ${rpcP95} | max: ${rpcMax} (n=${latency.rpcLatencyMs.count})`);
   console.log(`Observed Slot Lag:              ${latency.lastSlotLag} slots`);
   console.log(`Event Loop Delay:               ${latency.eventLoopDelayMs.toFixed(2)} ms`);
 

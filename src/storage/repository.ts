@@ -105,6 +105,8 @@ export class ArbitrageRepository {
   }>) => void>;
   public static readonly MAX_READINESS_RETRIES = 3;
   private candidateQueue: ArbitrageCandidate[] = [];
+  private candidateOverflowCount = 0;
+  private readinessRetryCount = 0;
   private routeReadinessQueue = new Map<string, {
     routeId: string;
     state: RouteState;
@@ -708,15 +710,36 @@ export class ArbitrageRepository {
       return;
     }
 
-    // Bounded in-memory write buffer for sub-microsecond non-blocking saves
-    if (this.candidateQueue.length >= 5000) {
-      this.candidateQueue.shift(); // Drop oldest under extreme backpressure
-    }
-    this.candidateQueue.push(candidate);
+    // Protect important qualified signals from eviction under buffer pressure
+    const MAX_CANDIDATE_QUEUE = 5000;
+    if (this.candidateQueue.length >= MAX_CANDIDATE_QUEUE) {
+      // Find oldest non-special candidate to evict
+      let evictedIndex = -1;
+      for (let i = 0; i < this.candidateQueue.length; i++) {
+        const item = this.candidateQueue[i];
+        if (item.status !== 'QUALIFIED_SHADOW' && item.status !== 'CANDIDATE') {
+          evictedIndex = i;
+          break;
+        }
+      }
 
-    if (this.candidateQueue.length >= 100) {
-      this.flushSync();
+      if (evictedIndex >= 0) {
+        this.candidateQueue.splice(evictedIndex, 1);
+        this.candidateOverflowCount++;
+      } else if (!isSpecial) {
+        // If buffer is entirely filled with qualified signals, do not evict qualified signals for an ordinary candidate
+        this.candidateOverflowCount++;
+        return;
+      } else {
+        // Queue full of special candidates: drop oldest special
+        this.candidateQueue.shift();
+        this.candidateOverflowCount++;
+      }
     }
+
+    this.candidateQueue.push(candidate);
+    // REMOVED synchronous flushSync() from signal-critical path!
+    // Background flushTimer handles periodic batch writes off the hot path.
   }
 
   public flushSync(): void {
@@ -736,10 +759,11 @@ export class ArbitrageRepository {
         this.batchUpdateReadinessTx(updates);
       } catch (err) {
         this.recordPersistenceError('flushRouteReadiness', err);
-        // FIX 4: Bounded retry mechanism with error reporting
+        // Bounded retry mechanism with error reporting
         // Do not permanently discard queued readiness updates after a failed database transaction
         for (const update of updates) {
           const retries = (update.retryCount || 0) + 1;
+          this.readinessRetryCount++;
           if (retries <= ArbitrageRepository.MAX_READINESS_RETRIES) {
             update.retryCount = retries;
             // Re-queue only if not superseded by a newer update in the queue
@@ -755,6 +779,24 @@ export class ArbitrageRepository {
         }
       }
     }
+  }
+
+  public getPersistenceStats(): {
+    persistenceErrorsCount: number;
+    candidateOverflowCount: number;
+    readinessRetryCount: number;
+    queuedCandidatesCount: number;
+    queuedReadinessCount: number;
+    lastError?: { operation: string; error: string; timestamp: number };
+  } {
+    return {
+      persistenceErrorsCount: this.persistenceErrorsCount,
+      candidateOverflowCount: this.candidateOverflowCount,
+      readinessRetryCount: this.readinessRetryCount,
+      queuedCandidatesCount: this.candidateQueue.length,
+      queuedReadinessCount: this.routeReadinessQueue.size,
+      lastError: this.lastPersistenceError
+    };
   }
 
   public logProviderEvent(

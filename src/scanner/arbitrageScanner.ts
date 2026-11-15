@@ -82,6 +82,18 @@ export class ArbitrageScanner {
   private latencyTracker: LatencyTracker;
   private automaticScout: AutomaticScout;
   private isDrainingQueue = false;
+  private isDrainScheduled = false;
+  private pendingRouteBacklog: Array<{
+    route: IndexedDirectedRoute;
+    t0: number;
+    tDequeue: number;
+    t1: number;
+    t2: number;
+    tLookupStart: number;
+    t3: number;
+  }> = [];
+  private pendingRouteIds = new Set<string>();
+  private poolLastRpcRefreshTime = new Map<string, number>();
 
   private isRunning = false;
   private scanTimer: NodeJS.Timeout | null = null;
@@ -358,16 +370,19 @@ export class ArbitrageScanner {
 
   private enqueueUpdate(update: QueuedAccountUpdate): void {
     this.eventQueue.enqueue(update);
-    this.scheduleImmediateDrain();
+    this.scheduleImmediateDrain(true);
   }
 
-  private scheduleImmediateDrain(): void {
-    if (this.isDrainingQueue) {
-      this.hasPendingDrain = true;
+  private scheduleImmediateDrain(useMicrotask: boolean = true): void {
+    if (this.isDrainingQueue || this.isDrainScheduled) {
       return;
     }
-    this.hasPendingDrain = false;
-    queueMicrotask(() => this.drainEventQueue());
+    this.isDrainScheduled = true;
+    const scheduleFn = useMicrotask ? queueMicrotask : setImmediate;
+    scheduleFn(() => {
+      this.isDrainScheduled = false;
+      this.drainEventQueue();
+    });
   }
 
   private async drainEventQueue(): Promise<void> {
@@ -375,15 +390,21 @@ export class ArbitrageScanner {
     this.isDrainingQueue = true;
 
     try {
-      // Process a bounded batch of updates (max 100 per drain to prevent CPU starvation)
-      const MAX_BATCH_UPDATES = 100;
+      // 1. Process a bounded batch of account updates (max 50 to prevent CPU starvation and allow interleaving)
+      const MAX_BATCH_UPDATES = 50;
       let count = 0;
-      const modifiedPools = new Map<string, { t0: number; t1: number; t2: number }>();
+      const modifiedPools = new Map<string, { t0: number; tDequeue: number; t1: number; t2: number }>();
 
       while (!this.eventQueue.isEmpty() && count < MAX_BATCH_UPDATES) {
+        const tDequeue = performance.now();
         const update = this.eventQueue.dequeue();
         if (!update) break;
         count++;
+
+        if (update.monotonicReceiptTime > 0) {
+          const queueWaitUs = (tDequeue - update.monotonicReceiptTime) * 1000;
+          this.latencyTracker.recordQueueWait(queueWaitUs);
+        }
 
         let res: { poolId: string; t1: number; t2: number } | null = null;
         if (update.type === 'POOL_ACCOUNT') {
@@ -400,9 +421,11 @@ export class ArbitrageScanner {
 
         if (res && res.poolId) {
           const existing = modifiedPools.get(res.poolId);
-          if (!existing || update.monotonicReceiptTime < existing.t0) {
+          // Preserve latest update timestamps and ordering
+          if (!existing || update.monotonicReceiptTime > existing.t0) {
             modifiedPools.set(res.poolId, {
               t0: update.monotonicReceiptTime,
+              tDequeue,
               t1: res.t1,
               t2: res.t2
             });
@@ -410,36 +433,70 @@ export class ArbitrageScanner {
         }
       }
 
-      // Deduplicated route evaluation: evaluate each affected non-blocked route once
+      // 2. Identify affected routes: capture T3 AFTER lookup
       if (modifiedPools.size > 0) {
-        const t3 = performance.now();
-        const affectedRoutes = new Map<string, { route: IndexedDirectedRoute; t0: number; t1: number; t2: number; t3: number }>();
         for (const [poolId, meta] of modifiedPools.entries()) {
+          const tLookupStart = performance.now();
           const routes = this.routeIndex.getRoutesAffectedByPool(poolId, true);
+          const t3 = performance.now();
+          this.latencyTracker.recordRouteLookupDuration((t3 - tLookupStart) * 1000);
+
           for (const r of routes) {
             if (r.state === 'BLOCKED') continue;
-            const existing = affectedRoutes.get(r.routeId);
-            if (!existing || meta.t0 < existing.t0) {
-              affectedRoutes.set(r.routeId, {
+            if (this.pendingRouteIds.has(r.routeId)) {
+              // Update existing backlog entry with fresher metadata
+              const existingIdx = this.pendingRouteBacklog.findIndex(item => item.route.routeId === r.routeId);
+              if (existingIdx >= 0) {
+                this.pendingRouteBacklog[existingIdx] = {
+                  route: r,
+                  t0: meta.t0,
+                  tDequeue: meta.tDequeue,
+                  t1: meta.t1,
+                  t2: meta.t2,
+                  tLookupStart,
+                  t3
+                };
+              }
+            } else {
+              this.pendingRouteIds.add(r.routeId);
+              this.pendingRouteBacklog.push({
                 route: r,
                 t0: meta.t0,
+                tDequeue: meta.tDequeue,
                 t1: meta.t1,
                 t2: meta.t2,
+                tLookupStart,
                 t3
               });
             }
           }
         }
+      }
 
-        for (const item of affectedRoutes.values()) {
-          this.evaluateIndexedRoute(item.route, item.t0, item.t1, item.t2, item.t3);
-        }
+      // 3. Process bounded batch of route evaluations (max 50 per cycle)
+      const MAX_BATCH_EVALUATIONS = 50;
+      const routesToEvaluate = this.pendingRouteBacklog.splice(0, MAX_BATCH_EVALUATIONS);
+      for (const item of routesToEvaluate) {
+        this.pendingRouteIds.delete(item.route.routeId);
+      }
+
+      for (const item of routesToEvaluate) {
+        this.evaluateIndexedRoute(
+          item.route,
+          item.t0,
+          item.tDequeue,
+          item.t1,
+          item.t2,
+          item.tLookupStart,
+          item.t3
+        );
       }
     } finally {
       this.isDrainingQueue = false;
-      if (this.hasPendingDrain || !this.eventQueue.isEmpty()) {
-        this.hasPendingDrain = false;
-        queueMicrotask(() => this.drainEventQueue());
+      const hasBacklog = this.pendingRouteBacklog.length > 0 || !this.eventQueue.isEmpty();
+      if (hasBacklog) {
+        // Sustained backlog: yield to I/O via setImmediate to allow network/timer events to interleave
+        this.scheduleImmediateDrain(false);
       }
     }
   }
@@ -1328,23 +1385,41 @@ export class ArbitrageScanner {
 
   private evaluateAffectedRoutes(poolId: string, monotonicReceiptTime?: number): void {
     // Efficient Scaling: Skip BLOCKED routes on high-frequency evaluation path
+    const tLookupStart = performance.now();
     const affectedRoutes = this.routeIndex.getRoutesAffectedByPool(poolId, true);
+    const t3 = performance.now();
+    this.latencyTracker.recordRouteLookupDuration((t3 - tLookupStart) * 1000);
     const nowMono = performance.now();
     const t0 = monotonicReceiptTime ?? nowMono;
     for (const route of affectedRoutes) {
       if (route.state === 'BLOCKED') continue;
-      this.evaluateIndexedRoute(route, t0, nowMono, nowMono, nowMono);
+      this.evaluateIndexedRoute(route, t0, t0, t0, t0, tLookupStart, t3);
     }
   }
 
   private evaluateIndexedRoute(
     route: IndexedDirectedRoute,
     t0?: number,
+    tDequeue?: number,
     t1?: number,
     t2?: number,
+    tLookupStart?: number,
     t3?: number
   ): void {
     if (route.state === 'BLOCKED') return;
+
+    const nowMono = performance.now();
+    const _t0 = t0 ?? nowMono;
+    const _tDequeue = tDequeue ?? _t0;
+    const _t1 = t1 ?? _t0;
+    const _t2 = t2 ?? _t1;
+    const _tLookupStart = tLookupStart ?? _t2;
+    const _t3 = t3 ?? nowMono;
+
+    const recordRejected = () => {
+      const decisionDurationUs = (performance.now() - (_t0 > 0 ? _t0 : nowMono)) * 1000;
+      this.latencyTracker.recordRejectedDecision(decisionDurationUs);
+    };
 
     const preval = this.ensurePrevalidatedRoute(route);
     if (!preval.isValid) {
@@ -1352,14 +1427,9 @@ export class ArbitrageScanner {
       this.auditMetrics.rejectedRoutes++;
       const reason = (preval.blockerReason || 'UNSUPPORTED_ROUTE') as RejectionReasonCode;
       this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
+      recordRejected();
       return;
     }
-
-    const nowMono = performance.now();
-    const _t0 = t0 ?? nowMono;
-    const _t1 = t1 ?? _t0;
-    const _t2 = t2 ?? _t1;
-    const _t3 = t3 ?? nowMono;
 
     this.auditMetrics.configuredRouteCount = this.routeIndex.getAllRoutes().length;
 
@@ -1384,6 +1454,7 @@ export class ArbitrageScanner {
         this.auditMetrics.rejectedRoutes++;
         this.auditMetrics.unsupportedRoutes = (this.auditMetrics.unsupportedRoutes || 0) + 1;
         this.rejectionBreakdown['UNSUPPORTED_ROUTE'] = (this.rejectionBreakdown['UNSUPPORTED_ROUTE'] || 0) + 1;
+        recordRejected();
         return;
       }
 
@@ -1395,6 +1466,7 @@ export class ArbitrageScanner {
         const reason = (poolConfig?.blockerReason || 'QUOTE_UNVERIFIED') as RejectionReasonCode;
         this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
         this.auditMetrics.quoteValidationFailures++;
+        recordRejected();
         return;
       }
 
@@ -1402,6 +1474,7 @@ export class ArbitrageScanner {
       if (!pool) {
         this.rejectedCount++;
         this.auditMetrics.rejectedRoutes++;
+        recordRejected();
         return;
       }
 
@@ -1414,12 +1487,14 @@ export class ArbitrageScanner {
           const reason = (extra?.unverifiedReason || 'QUOTE_UNVERIFIED') as RejectionReasonCode;
           this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
           this.auditMetrics.quoteValidationFailures++;
+          recordRejected();
           return;
         }
         if ((pool.reserveA ?? 0n) <= 0n || (pool.reserveB ?? 0n) <= 0n) {
           this.rejectedCount++;
           this.auditMetrics.rejectedRoutes++;
           this.rejectionBreakdown['INSUFFICIENT_LIQUIDITY'] = (this.rejectionBreakdown['INSUFFICIENT_LIQUIDITY'] || 0) + 1;
+          recordRejected();
           return;
         }
       }
@@ -1434,6 +1509,7 @@ export class ArbitrageScanner {
           this.auditMetrics.rejectedRoutes++;
           this.rejectionBreakdown['MISSING_TICK_DATA'] = (this.rejectionBreakdown['MISSING_TICK_DATA'] || 0) + 1;
           this.auditMetrics.quoteValidationFailures++;
+          recordRejected();
           return;
         }
 
@@ -1445,6 +1521,7 @@ export class ArbitrageScanner {
           this.auditMetrics.rejectedRoutes++;
           this.rejectionBreakdown['MISSING_TICK_DATA'] = (this.rejectionBreakdown['MISSING_TICK_DATA'] || 0) + 1;
           this.auditMetrics.quoteValidationFailures++;
+          recordRejected();
           return;
         }
 
@@ -1481,6 +1558,7 @@ export class ArbitrageScanner {
           this.auditMetrics.quoteValidationFailures++;
           this.routeIndex.setRouteStale(route.routeId, failCode);
           this.repository.updateRouteReadiness(route.routeId, false, failCode);
+          recordRejected();
           return;
         }
       }
@@ -1489,6 +1567,7 @@ export class ArbitrageScanner {
       if (!adapter) {
         this.rejectedCount++;
         this.auditMetrics.rejectedRoutes++;
+        recordRejected();
         return;
       }
 
@@ -1508,6 +1587,7 @@ export class ArbitrageScanner {
     if (quoterLegs.length < route.legs.length) {
       this.rejectedCount++;
       this.auditMetrics.rejectedRoutes++;
+      recordRejected();
       return;
     }
 
@@ -1518,6 +1598,7 @@ export class ArbitrageScanner {
     if (!this.currentSolPriceUSDC || this.lastSolPriceTime <= 0) {
       this.rejectedCount++;
       this.auditMetrics.rejectedRoutes++;
+      recordRejected();
       return;
     }
 
@@ -1531,6 +1612,7 @@ export class ArbitrageScanner {
     if (!costResult.isComplete || !costResult.breakdown) {
       this.rejectedCount++;
       this.auditMetrics.rejectedRoutes++;
+      recordRejected();
       return;
     }
 
@@ -1564,6 +1646,7 @@ export class ArbitrageScanner {
       if (reason === 'UNSUPPORTED_ROUTE') {
         this.auditMetrics.unsupportedRoutes = (this.auditMetrics.unsupportedRoutes || 0) + 1;
       }
+      recordRejected();
       return;
     }
 
@@ -1628,17 +1711,6 @@ export class ArbitrageScanner {
     candidate.executionProbability = scoreResult.executionProbability;
     candidate.scoringBreakdown = scoreResult.breakdown;
 
-    // Signal qualification timestamp (T5 -> T6)
-    const t6 = performance.now();
-    const validationDurationUs = (t6 - calcStart) * 1000;
-    this.latencyTracker.recordValidationDuration(validationDurationUs);
-
-    // Total detection-to-decision latency
-    if (_t0 > 0) {
-      const decisionDurationUs = (t6 - _t0) * 1000;
-      this.latencyTracker.recordDecisionDuration(decisionDurationUs);
-    }
-
     if (oldestSlot !== Infinity) {
       this.latencyTracker.recordSlotLag(Math.max(0, currentSlot - oldestSlot));
     }
@@ -1661,6 +1733,18 @@ export class ArbitrageScanner {
     }
 
     if (candidate.status === 'QUALIFIED_SHADOW') {
+      if (isDupe) {
+        // CEO Requirement 4: Count unique profitable market-state opportunities (!isDupe).
+        // Do not count duplicates as new opportunities.
+        recordRejected();
+        return;
+      }
+
+      // Signal qualification timestamp (T5 -> T6) - Actual qualified signal emission
+      const t6 = performance.now();
+      const validationDurationUs = (t6 - calcStart) * 1000;
+      this.latencyTracker.recordValidationDuration(validationDurationUs);
+
       this.qualifiedCount++;
       this.auditMetrics.candidatesConservativeQualified++;
       this.auditMetrics.shadowQualifiedCount = (this.auditMetrics.shadowQualifiedCount || 0) + 1;
@@ -1703,15 +1787,21 @@ export class ArbitrageScanner {
 
       this.latencyTracker.recordPipelineStages({
         t0: _t0,
+        tDequeue: _tDequeue,
         t1: _t1,
         t2: _t2,
+        tLookupStart: _tLookupStart,
         t3: _t3,
+        tEvalStart: quoteStart,
         t4,
         t5,
         t6,
-        t7
+        t7,
+        isQualified: true
       });
     } else {
+      recordRejected();
+
       this.rejectedCount++;
       this.auditMetrics.rejectedRoutes++;
       for (const reason of candidate.rejectionReasons) {
@@ -1729,16 +1819,19 @@ export class ArbitrageScanner {
 
       this.latencyTracker.recordPipelineStages({
         t0: _t0,
+        tDequeue: _tDequeue,
         t1: _t1,
         t2: _t2,
+        tLookupStart: _tLookupStart,
         t3: _t3,
+        tEvalStart: quoteStart,
         t4,
         t5,
-        t6
+        isQualified: false
       });
     }
 
-    if (isDupe && candidate.status !== 'QUALIFIED_SHADOW') {
+    if (isDupe) {
       return;
     }
 
@@ -2338,6 +2431,8 @@ export class ArbitrageScanner {
       // Find VERIFIED_DIRECT pools whose observation age is approaching expiration (>= 1200ms) or slot lag >= 4
       const poolsToRefresh = allPools.filter(p => {
         if (p.verificationStatus !== 'VERIFIED_DIRECT') return false;
+        const lastRpc = this.poolLastRpcRefreshTime.get(p.id) || 0;
+        if (now - lastRpc < 2000) return false;
         const state = this.stateCache.getPoolState(p.id);
         if (!state) return true;
         const age = now - (state.receivedAt || 0);
@@ -2347,8 +2442,8 @@ export class ArbitrageScanner {
 
       if (poolsToRefresh.length === 0) return 0;
 
-      // Prioritize pools supporting the most valid 2-leg routes to maximize sustained READY route count
-      // and factor in staleness age to prevent starvation of lower-ranking pools.
+      // Fair aging scoring: prioritize starved pools while giving bounded weight to route count
+      // score = age * 2 + Math.min(routes * 100, 2000)
       poolsToRefresh.sort((a, b) => {
         const routesA = this.routeIndex.getRoutesAffectedByPool(a.id, true).length;
         const routesB = this.routeIndex.getRoutesAffectedByPool(b.id, true).length;
@@ -2357,14 +2452,16 @@ export class ArbitrageScanner {
         const ageA = now - (stateA?.receivedAt || 0);
         const ageB = now - (stateB?.receivedAt || 0);
 
-        // Score based on route leverage (weight: 1000 per route) plus starvation age bonus
-        const scoreA = routesA * 1000 + Math.min(ageA, 10000);
-        const scoreB = routesB * 1000 + Math.min(ageB, 10000);
+        const scoreA = ageA * 2 + Math.min(routesA * 100, 2000);
+        const scoreB = ageB * 2 + Math.min(routesB * 100, 2000);
         return scoreB - scoreA;
       });
 
       // Bound batch size to respect RPC rate limits (max 20 pools per cycle)
       const batch = poolsToRefresh.slice(0, 20);
+      for (const p of batch) {
+        this.poolLastRpcRefreshTime.set(p.id, now);
+      }
       const pubkeysToFetch: PublicKey[] = [];
 
       for (const p of batch) {
@@ -2551,16 +2648,59 @@ export class ArbitrageScanner {
           } else if (decoded.dex === 'RAYDIUM_AMM' && existing?.extraData) {
             const extra = (decoded.extraData || {}) as any;
             const existingExtra = existing.extraData as any;
-            if (decoded.reserveA === 0n && (existing.reserveA ?? 0n) > 0n) decoded.reserveA = existing.reserveA;
-            if (decoded.reserveB === 0n && (existing.reserveB ?? 0n) > 0n) decoded.reserveB = existing.reserveB;
-            extra.openOrdersVerified = existingExtra.openOrdersVerified;
-            extra.lastConfirmedAt = Date.now();
-            extra.lastRpcConfirmationContextSlot = refreshedSlot;
-            extra.vaultAReceivedAt = Date.now();
-            extra.vaultBReceivedAt = Date.now();
-            extra.vaultASlot = refreshedSlot;
-            extra.vaultBSlot = refreshedSlot;
-            extra.openOrdersSlot = refreshedSlot;
+
+            // Retain verified Raydium AMM data ONLY when account linkage is unchanged
+            const baseVaultMatch = !existingExtra.baseVault || existingExtra.baseVault === extra.baseVault;
+            const quoteVaultMatch = !existingExtra.quoteVault || existingExtra.quoteVault === extra.quoteVault;
+            const openOrdersMatch = !existingExtra.openOrders || existingExtra.openOrders === extra.openOrders;
+
+            if (!baseVaultMatch || !quoteVaultMatch || !openOrdersMatch) {
+              decoded.reserveA = 0n;
+              decoded.reserveB = 0n;
+              extra.openOrdersVerified = false;
+              extra.unverifiedReason = 'ACCOUNT_POINTERS_CHANGED';
+              this.poolRegistry.updatePoolVerification(p.id, 'QUOTE_UNVERIFIED', 'ACCOUNT_POINTERS_CHANGED');
+              this.routeIndex.updatePoolStatus(p.id, 'QUOTE_UNVERIFIED');
+            } else {
+              const vASlot = existingExtra.vaultASlot;
+              const vBSlot = existingExtra.vaultBSlot;
+              const vAReceivedAt = existingExtra.vaultAReceivedAt;
+              const vBReceivedAt = existingExtra.vaultBReceivedAt;
+              const ttl = existingExtra.observationFreshnessTtlMs || this.config.OPENORDERS_OBSERVATION_TTL_MS || 30000;
+              const hasReserves = (existing.reserveA ?? 0n) > 0n && (existing.reserveB ?? 0n) > 0n;
+              const hasVaultMeta = !!(vASlot && vBSlot && vAReceivedAt && vBReceivedAt);
+              const vAFresh = hasVaultMeta && (now - vAReceivedAt <= ttl);
+              const vBFresh = hasVaultMeta && (now - vBReceivedAt <= ttl);
+              const vaultSlotGap = hasVaultMeta ? Math.abs(vASlot - vBSlot) : Infinity;
+
+              if (!hasReserves || !hasVaultMeta || !vAFresh || !vBFresh || vaultSlotGap > 100) {
+                // Fail closed on stale, unhydrated, or inconsistent vault data
+                decoded.reserveA = 0n;
+                decoded.reserveB = 0n;
+                extra.openOrdersVerified = false;
+                extra.unverifiedReason = !hasReserves
+                  ? 'VAULT_RESERVES_UNHYDRATED'
+                  : !hasVaultMeta
+                  ? 'MISSING_VAULT_METADATA'
+                  : (!vAFresh || !vBFresh)
+                  ? 'STALE_VAULT_SNAPSHOT'
+                  : 'INCONSISTENT_VAULT_SNAPSHOT';
+                this.poolRegistry.updatePoolVerification(p.id, 'QUOTE_UNVERIFIED', extra.unverifiedReason);
+                this.routeIndex.updatePoolStatus(p.id, 'QUOTE_UNVERIFIED');
+              } else {
+                // Preserve genuine observation metadata - NEVER synthesize timestamps!
+                if (decoded.reserveA === 0n) decoded.reserveA = existing.reserveA;
+                if (decoded.reserveB === 0n) decoded.reserveB = existing.reserveB;
+                extra.vaultASlot = vASlot;
+                extra.vaultBSlot = vBSlot;
+                extra.vaultAReceivedAt = vAReceivedAt;
+                extra.vaultBReceivedAt = vBReceivedAt;
+                extra.openOrdersSlot = existingExtra.openOrdersSlot;
+                extra.lastConfirmedAt = existingExtra.lastConfirmedAt;
+                extra.openOrdersVerified = existingExtra.openOrdersVerified;
+                extra.unverifiedReason = existingExtra.unverifiedReason;
+              }
+            }
           }
 
           this.stateCache.setPoolState(decoded);
@@ -2583,7 +2723,7 @@ export class ArbitrageScanner {
 
       const evalNow = performance.now();
       for (const route of affectedRoutesMap.values()) {
-        this.evaluateIndexedRoute(route, evalNow);
+        this.evaluateIndexedRoute(route, evalNow, evalNow, evalNow, evalNow, evalNow, evalNow);
       }
 
       return refreshedCount;
@@ -2642,6 +2782,10 @@ export class ArbitrageScanner {
       isUnprofitablePreserved: true
     };
     this.evaluateIndexedRoute(route);
+  }
+
+  public getPersistenceStats() {
+    return this.repository.getPersistenceStats();
   }
 
   public onCandidate(listener: CandidateListener): void {
