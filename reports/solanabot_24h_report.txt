@@ -1,0 +1,79 @@
+================================================================================
+SOLANABOT - 24-HOUR PROFITABILITY & OPPORTUNITY WINDOW STUDY REPORT
+================================================================================
+Generated At: 2026-11-15T17:49:56.989Z
+Session ID:   study_24h_1794764965012
+Study Status: COMPLETED
+
+================================================================================
+SECTION A: SCAN COVERAGE & OPERATIONAL HEALTH
+================================================================================
+Target Duration:             24:00:00 (86,400,000 ms)
+Elapsed Scanning Time:       00:00:31 (0.01 hours)
+Healthy Scanning Uptime:     00:00:00 (0.00%)
+Feed Downtime:               00:00:30
+WebSocket Disconnects:       2
+Data Integrity:              Fail-closed on stale dependencies, no unobserved gap assumptions.
+
+================================================================================
+SECTION B: ROUTE DISCOVERY & OPPORTUNITY FUNNEL
+================================================================================
+Candidate Evaluations:       217
+Qualified 2-Leg Windows:     0
+Completed Market Windows:    0
+Censored / Interrupted:      0
+Still Open at Shutdown:      0
+Near Misses (Net > 0 <$0.50):0
+Revalidation Survival Rate:  100.0%
+
+================================================================================
+SECTION C: PROFITABILITY DISTRIBUTION & UNIT ECONOMICS
+================================================================================
+Best Conservative Net Profit:  $0.0000 USDC
+Profit Hurdle Threshold:       $0.5000 USDC net
+Safety Contingency Buffer:     $0.2500 USDC deducted per trade
+DEX Fees & Priority Costs:     Fully deducted before qualification
+
+================================================================================
+SECTION D: OPPORTUNITY WINDOW DURATION ANALYSIS
+(Calculated strictly from observed CLOSED windows; censored windows excluded)
+================================================================================
+Valid Closed Window Count:   0
+Shortest Observed Window:    0ms
+Median Observed Window:      0ms
+95th Percentile Window:      0ms
+Longest Observed Window:     0ms
+
+Duration Breakdown:
+  < 500 ms (Sub-second):     0
+  500 ms - 2000 ms:          0
+  > 2000 ms (Persistent):    0
+
+Window Closure Reasons:
+  None observed.
+
+================================================================================
+SECTION E: TOP MOST PROFITABLE OPPORTUNITY WINDOWS
+================================================================================
+No qualified profitable opportunity windows were observed during this session.
+
+================================================================================
+SECTION F: ECONOMIC FEASIBILITY & STRATEGY RECOMMENDATIONS
+================================================================================
+1. Zero Guaranteed Profit:
+   This study operates strictly in read-only shadow simulation mode. Realized
+   profitability requires live execution with Solana transaction submission,
+   priority fees, block builder contention, and actual execution slippage.
+
+2. Contention & Execution Windows:
+   Opportunities lasting under 500ms require sub-slot co-located execution or
+   Jito bundle inclusion to capture before public pool arbitrage bots arbitrage
+   the spread.
+
+3. Capital Allocation:
+   Opportunities across separate routes must not assume simultaneous capital reuse.
+   Each atomic swap requires available USDC in the trading wallet.
+
+4. Recommendation:
+   Maintain strictly 2-leg atomic routes. Do not lower the $0.50 USDC safety hurdle.
+================================================================================

@@ -1,0 +1,40 @@
+{
+  "studySessionId": "study_24h_1794764965012",
+  "status": "COMPLETED",
+  "timestamp": "2026-11-15T17:49:56.987Z",
+  "coverage": {
+    "startedAtUtc": "2026-11-15T17:49:25.197Z",
+    "elapsedMs": 31788,
+    "elapsedHours": "0.01",
+    "targetDurationHours": "0.00",
+    "healthyUptimeMs": 0,
+    "healthyUptimePct": "0.00",
+    "feedDowntimeMs": 30248,
+    "disconnectCount": 2
+  },
+  "routesAndOpportunities": {
+    "totalObservedEvaluations": 217,
+    "totalQualifiedWindows": 0,
+    "openWindowsAtEnd": 0,
+    "completedWindows": 0,
+    "censoredWindows": 0,
+    "nearMissesCount": 0,
+    "revalidationSuccessPct": "100.00"
+  },
+  "durationMetrics": {
+    "count": 0,
+    "minMs": 0,
+    "medianMs": 0,
+    "p95Ms": 0,
+    "maxMs": 0,
+    "under500msCount": 0,
+    "between500msAnd2sCount": 0,
+    "over2sCount": 0
+  },
+  "closureReasons": {},
+  "sizeDistribution": {},
+  "profitability": {
+    "bestConservativeNetUSDC": "0.0000"
+  },
+  "top20Windows": []
+}

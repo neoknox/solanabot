@@ -642,5 +642,144 @@ export interface HudV2Payload {
   rejectionAnalysis: RejectionAnalysisReport;
   diagnostics: ScannerDiagnostics;
   scout: ScoutMetricsSummary | null;
+  study?: StudyTelemetry;
 }
+
+// ========================================
+// 24-Hour Profitability & Opportunity Window Study Types
+// ========================================
+
+export type OpportunityWindowStatus = 'OPEN' | 'CLOSED' | 'INTERRUPTED_CENSORED';
+
+export const WindowClosureReason = {
+  SPREAD_COMPRESSION: 'SPREAD_COMPRESSION',
+  TARGET_SHORTFALL: 'TARGET_SHORTFALL',
+  PRICE_IMPACT_BREACH: 'PRICE_IMPACT_BREACH',
+  LIQUIDITY_DROP: 'LIQUIDITY_DROP',
+  REVALIDATION_FAILURE: 'REVALIDATION_FAILURE',
+  ROUTE_BLOCKED: 'ROUTE_BLOCKED',
+  ROUTE_UNVERIFIED: 'ROUTE_UNVERIFIED',
+  MARKET_CONDITION_CHANGED: 'MARKET_CONDITION_CHANGED',
+  QUOTE_EXPIRED: 'QUOTE_EXPIRED',
+  STALE_MARKET_STATE: 'STALE_MARKET_STATE',
+  WS_DISCONNECTED: 'WS_DISCONNECTED',
+  RPC_FAILURE: 'RPC_FAILURE',
+  SCANNER_STOP: 'SCANNER_STOP',
+  STUDY_COMPLETED: 'STUDY_COMPLETED',
+  ACTIVE: 'ACTIVE',
+  UNKNOWN: 'UNKNOWN'
+} as const;
+
+export type WindowClosureReason = (typeof WindowClosureReason)[keyof typeof WindowClosureReason];
+
+export interface WindowObservation {
+  timestamp: number;
+  slot: number;
+  conservativeNetUSDC: number;
+  expectedNetUSDC: number;
+  grossSpreadPercent?: number;
+  revalidationStatus?: string;
+  stateVersion?: string;
+}
+
+export interface OpportunityWindow {
+  windowId: string;
+  sessionId: string;
+  routeId: string;
+  tokenMint: string;
+  tokenSymbol: string;
+  buyDex: string;
+  buyPoolId: string;
+  sellDex: string;
+  sellPoolId: string;
+  tradeSizeUSDC: number;
+  status: OpportunityWindowStatus;
+  closureReason: WindowClosureReason | string;
+  isCensored: boolean;
+  revalidationStatus: 'SURVIVED' | 'DECAYED' | 'UNCHECKED';
+  firstObservedAt: number;
+  firstObservedSlot: number;
+  firstObservedMonotonic: number;
+  lastObservedAt: number;
+  lastObservedSlot: number;
+  lastObservedMonotonic: number;
+  closedAt?: number;
+  closedAtSlot?: number;
+  closedAtMonotonic?: number;
+  durationLowerBoundMs: number;
+  durationUpperBoundMs?: number;
+  netProfitOpeningUSDC: number;
+  netProfitPeakUSDC: number;
+  netProfitMinUSDC: number;
+  netProfitClosingUSDC?: number;
+  observationCount: number;
+  lastStateVersion?: string;
+  historyObservations: WindowObservation[];
+}
+
+export interface NearMissRecord {
+  id: string;
+  routeId: string;
+  tokenSymbol: string;
+  tradeSizeUSDC: number;
+  expectedNetUSDC: number;
+  conservativeNetUSDC: number;
+  shortfallUSDC: number;
+  timestamp: number;
+  slot: number;
+}
+
+export interface StudySessionRecord {
+  sessionId: string;
+  startedAt: number;
+  endedAt?: number;
+  status: 'RUNNING' | 'COMPLETED' | 'INTERRUPTED';
+  targetDurationMs: number;
+  healthyUptimeMs: number;
+  feedDowntimeMs: number;
+  disconnectCount: number;
+  totalWindowsCount: number;
+  qualifiedWindowsCount: number;
+  nearMissesCount: number;
+  summaryJson?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface DurationPercentiles {
+  count: number;
+  minMs: number;
+  medianMs: number;
+  p95Ms: number;
+  maxMs: number;
+  under500msCount: number;
+  between500msAnd2sCount: number;
+  over2sCount: number;
+}
+
+export interface StudyTelemetry {
+  sessionId: string;
+  status: 'RUNNING' | 'COMPLETED' | 'INTERRUPTED' | 'STANDBY';
+  startedAt: number;
+  targetDurationMs: number;
+  elapsedMs: number;
+  healthyUptimeMs: number;
+  feedDowntimeMs: number;
+  disconnectCount: number;
+  totalQualifiedWindows: number;
+  openQualifiedWindows: number;
+  completedQualifiedWindows: number;
+  censoredWindows: number;
+  revalidationSuccessPct: number;
+  minDurationMs: number;
+  medianDurationMs: number;
+  p95DurationMs: number;
+  maxDurationMs: number;
+  bestConservativeNetUSDC: number;
+  totalObservedShadowOpportunities: number;
+  liveWindows: OpportunityWindow[];
+  closedWindows: OpportunityWindow[];
+  nearMissesCount: number;
+}
+
 

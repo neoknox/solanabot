@@ -256,7 +256,31 @@ export class ProfitHudServer {
         },
         sessionUptimeSeconds: 0
       },
-      scout: null
+      scout: null,
+      study: {
+        sessionId: 'STANDBY',
+        status: 'STANDBY',
+        startedAt: Date.now(),
+        targetDurationMs: 86400000,
+        elapsedMs: 0,
+        healthyUptimeMs: 0,
+        feedDowntimeMs: 0,
+        disconnectCount: 0,
+        totalQualifiedWindows: 0,
+        openQualifiedWindows: 0,
+        completedQualifiedWindows: 0,
+        censoredWindows: 0,
+        revalidationSuccessPct: 100,
+        minDurationMs: 0,
+        medianDurationMs: 0,
+        p95DurationMs: 0,
+        maxDurationMs: 0,
+        bestConservativeNetUSDC: 0,
+        totalObservedShadowOpportunities: 0,
+        liveWindows: [],
+        closedWindows: [],
+        nearMissesCount: 0
+      }
     };
   }
 
@@ -1348,6 +1372,131 @@ export class ProfitHudServer {
       </div>
     </section>
 
+    <!-- Section: 24-Hour Profitability Study -->
+    <section class="card" id="studyCard">
+      <div class="card-header">
+        <div>
+          <div class="card-title">
+            <span id="studyStatusDot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--blue); box-shadow:0 0 6px var(--blue);"></span>
+            24-HOUR PROFITABILITY &amp; OPPORTUNITY WINDOW STUDY
+            <span id="studyStatusBadge" class="status-badge status-standby" style="margin-left: 8px;">STANDBY</span>
+          </div>
+          <div class="card-subtitle">
+            Continuous 24h shadow mainnet scan &bull; Window duration tracking, deduplication &amp; closure analysis &bull; Fail-closed on feed downtime
+          </div>
+        </div>
+        <div style="text-align: right; font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);">
+          Session: <strong id="studySessionId" style="color:var(--text-bright);">STANDBY</strong>
+        </div>
+      </div>
+
+      <!-- Study Hero Metrics -->
+      <div class="stats-grid" style="margin-bottom: 16px;">
+        <div class="stat-box">
+          <div class="stat-box-label">Elapsed / Target (24h)</div>
+          <div class="stat-box-val" id="studyElapsed" style="color:var(--blue);">00:00:00 / 24:00:00</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-box-label">Healthy Scan Uptime</div>
+          <div class="stat-box-val" id="studyHealthyUptime" style="color:var(--green);">00:00:00 (100%)</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-box-label">Feed Downtime</div>
+          <div class="stat-box-val" id="studyDowntime" style="color:var(--text-muted);">00:00:00 (0 drops)</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-box-label">Qualified Windows</div>
+          <div class="stat-box-val" id="studyQualifiedWindows">0</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-box-label">Revalidation Survival</div>
+          <div class="stat-box-val" id="studyRevalRate">100.0%</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-box-label">Duration Median / P95</div>
+          <div class="stat-box-val" id="studyDurationMedP95">0ms / 0ms</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-box-label">Duration Min / Max</div>
+          <div class="stat-box-val" id="studyDurationMinMax">0ms / 0ms</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-box-label">Best Conservative Net</div>
+          <div class="stat-box-val" id="studyBestNet" style="color:var(--green);">+$0.0000</div>
+        </div>
+      </div>
+
+      <!-- Live Windows Sub-section -->
+      <div style="margin-top: 14px; margin-bottom: 8px; display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size: 13px; font-weight: 700; color: var(--text-bright); display:flex; align-items:center; gap:6px;">
+          <span style="display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--green);"></span>
+          LIVE PROFITABLE WINDOWS (ACTIVE)
+          <span id="studyLiveCount" class="badge-qual" style="font-size:10px; margin-left:4px;">0</span>
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted);">Active qualified market windows awaiting closure or recheck</div>
+      </div>
+
+      <div class="table-container" style="margin-bottom: 16px;">
+        <table id="studyLiveTable">
+          <thead>
+            <tr>
+              <th>Token</th>
+              <th>Route</th>
+              <th>Trade Size</th>
+              <th>Opening Net</th>
+              <th>Peak Net</th>
+              <th>Live Duration</th>
+              <th>Snapshots</th>
+              <th>Revalidation</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="studyLiveTbody">
+            <tr>
+              <td colspan="9" style="text-align: center; color: var(--text-muted); padding: 14px;">
+                No currently open profitable opportunity windows.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Closed Windows Sub-section -->
+      <div style="margin-top: 14px; margin-bottom: 8px; display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size: 13px; font-weight: 700; color: var(--text-bright); display:flex; align-items:center; gap:6px;">
+          <span>&#9201;</span>
+          RECENT CLOSED / CENSORED WINDOWS
+          <span id="studyClosedCount" class="badge-near" style="font-size:10px; margin-left:4px;">0</span>
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted);">Most recent closed opportunities and bounded duration metrics</div>
+      </div>
+
+      <div class="table-container">
+        <table id="studyClosedTable">
+          <thead>
+            <tr>
+              <th>Token</th>
+              <th>Route</th>
+              <th>Trade Size</th>
+              <th>Peak Net</th>
+              <th>Closing Net</th>
+              <th>Observed Duration</th>
+              <th>Closure Reason</th>
+              <th>Type</th>
+              <th>Closed At (UTC)</th>
+            </tr>
+          </thead>
+          <tbody id="studyClosedTbody">
+            <tr>
+              <td colspan="9" style="text-align: center; color: var(--text-muted); padding: 14px;">
+                No closed opportunity windows recorded yet.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- Middle Grid: Performance & Health (Sections 4 & 5) -->
     <div class="two-col-grid">
       <!-- Section 4: Scanner Performance -->
@@ -1734,6 +1883,23 @@ export class ProfitHudServer {
       // Profit Watch Table
       const profitWatchTbody = document.getElementById('profitWatchTbody');
 
+      // 24-Hour Study Elements
+      const studyStatusBadge = document.getElementById('studyStatusBadge');
+      const studyStatusDot = document.getElementById('studyStatusDot');
+      const studySessionId = document.getElementById('studySessionId');
+      const studyElapsed = document.getElementById('studyElapsed');
+      const studyHealthyUptime = document.getElementById('studyHealthyUptime');
+      const studyDowntime = document.getElementById('studyDowntime');
+      const studyQualifiedWindows = document.getElementById('studyQualifiedWindows');
+      const studyRevalRate = document.getElementById('studyRevalRate');
+      const studyDurationMedP95 = document.getElementById('studyDurationMedP95');
+      const studyDurationMinMax = document.getElementById('studyDurationMinMax');
+      const studyBestNet = document.getElementById('studyBestNet');
+      const studyLiveCount = document.getElementById('studyLiveCount');
+      const studyLiveTbody = document.getElementById('studyLiveTbody');
+      const studyClosedCount = document.getElementById('studyClosedCount');
+      const studyClosedTbody = document.getElementById('studyClosedTbody');
+
       // Scanner Performance
       const perfRouteEvalsSec = document.getElementById('perfRouteEvalsSec');
       const perfQuoteCalcsSec = document.getElementById('perfQuoteCalcsSec');
@@ -1961,6 +2127,111 @@ export class ProfitHudServer {
         rejectionTbody.innerHTML = html;
       }
 
+      function formatMs(ms) {
+        if (ms === null || ms === undefined || ms === 0) return '0ms';
+        return ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms + 'ms';
+      }
+      function formatDurationMs(ms) {
+        const totalSec = Math.floor((ms || 0) / 1000);
+        const h = Math.floor(totalSec / 3600).toString().padStart(2, '0');
+        const m = Math.floor((totalSec % 3600) / 60).toString().padStart(2, '0');
+        const s = (totalSec % 60).toString().padStart(2, '0');
+        return h + ':' + m + ':' + s;
+      }
+
+      function renderStudyTelemetry(study) {
+        if (!study) return;
+        if (studyStatusBadge) {
+          updateBadge(studyStatusBadge, study.status || 'STANDBY', 'RUNNING', 'INTERRUPTED', 'OFFLINE');
+          if (studyStatusDot) {
+            if (study.status === 'RUNNING') {
+              studyStatusDot.style.background = 'var(--green)';
+              studyStatusDot.style.boxShadow = '0 0 6px var(--green)';
+            } else if (study.status === 'COMPLETED') {
+              studyStatusDot.style.background = 'var(--blue)';
+              studyStatusDot.style.boxShadow = '0 0 6px var(--blue)';
+            } else {
+              studyStatusDot.style.background = 'var(--amber)';
+              studyStatusDot.style.boxShadow = '0 0 6px var(--amber)';
+            }
+          }
+        }
+        if (studySessionId) studySessionId.textContent = study.sessionId || 'STANDBY';
+
+        const elapsedStr = formatDurationMs(study.elapsedMs) + ' / ' + formatDurationMs(study.targetDurationMs || 86400000);
+        if (studyElapsed) studyElapsed.textContent = elapsedStr;
+
+        const healthyPct = study.elapsedMs > 0 ? ((study.healthyUptimeMs / study.elapsedMs) * 100).toFixed(1) : '100.0';
+        if (studyHealthyUptime) studyHealthyUptime.textContent = formatDurationMs(study.healthyUptimeMs) + ' (' + healthyPct + '%)';
+
+        const drops = study.disconnectCount || 0;
+        if (studyDowntime) studyDowntime.textContent = formatDurationMs(study.feedDowntimeMs) + ' (' + drops + ' drops)';
+
+        if (studyQualifiedWindows) studyQualifiedWindows.textContent = formatNumber(study.totalQualifiedWindows || 0);
+        if (studyRevalRate) studyRevalRate.textContent = (study.revalidationSuccessPct !== undefined ? study.revalidationSuccessPct.toFixed(1) : '100.0') + '%';
+
+        if (studyDurationMedP95) studyDurationMedP95.textContent = formatMs(study.medianDurationMs) + ' / ' + formatMs(study.p95DurationMs);
+        if (studyDurationMinMax) studyDurationMinMax.textContent = formatMs(study.minDurationMs) + ' / ' + formatMs(study.maxDurationMs);
+        if (studyBestNet) studyBestNet.textContent = formatUsdc(study.bestConservativeNetUSDC, true);
+
+        // Render Live Windows Table
+        if (studyLiveCount) studyLiveCount.textContent = study.liveWindows ? study.liveWindows.length : 0;
+        if (studyLiveTbody) {
+          if (!study.liveWindows || study.liveWindows.length === 0) {
+            studyLiveTbody.innerHTML = '<tr><td colspan="9" style="text-align: center; color: var(--text-muted); padding: 14px;">No currently open profitable opportunity windows.</td></tr>';
+          } else {
+            let html = '';
+            study.liveWindows.forEach(function(w) {
+              const routeStr = w.buyDex + ' -> ' + w.sellDex;
+              const liveDur = formatMs(Date.now() - w.firstObservedAt);
+              html += '<tr>';
+              html += '<td style="font-weight:700; color:var(--blue);">' + w.tokenSymbol + '</td>';
+              html += '<td>' + routeStr + '</td>';
+              html += '<td>$' + w.tradeSizeUSDC.toFixed(2) + '</td>';
+              html += '<td>' + formatUsdc(w.netProfitOpeningUSDC, true) + '</td>';
+              html += '<td style="font-weight:700; color:var(--green);">' + formatUsdc(w.netProfitPeakUSDC, true) + '</td>';
+              html += '<td style="color:var(--text-bright); font-family:var(--font-mono);">' + liveDur + '</td>';
+              html += '<td>' + w.observationCount + '</td>';
+              html += '<td style="font-weight:700; color:' + (w.revalidationStatus === 'SURVIVED' ? 'var(--green)' : 'var(--amber)') + '">' + w.revalidationStatus + '</td>';
+              html += '<td><span class="badge-qual">OPEN</span></td>';
+              html += '</tr>';
+            });
+            studyLiveTbody.innerHTML = html;
+          }
+        }
+
+        // Render Closed Windows Table
+        if (studyClosedCount) studyClosedCount.textContent = study.closedWindows ? study.closedWindows.length : 0;
+        if (studyClosedTbody) {
+          if (!study.closedWindows || study.closedWindows.length === 0) {
+            studyClosedTbody.innerHTML = '<tr><td colspan="9" style="text-align: center; color: var(--text-muted); padding: 14px;">No closed opportunity windows recorded yet.</td></tr>';
+          } else {
+            let html = '';
+            study.closedWindows.forEach(function(w) {
+              const routeStr = w.buyDex + ' -> ' + w.sellDex;
+              const dur = formatMs(w.durationUpperBoundMs || w.durationLowerBoundMs);
+              const typeBadge = w.isCensored
+                ? '<span class="badge-rej" style="font-size:10px;">CENSORED</span>'
+                : '<span class="badge-qual" style="font-size:10px;">MARKET</span>';
+              const closedTime = w.closedAt ? new Date(w.closedAt).toLocaleTimeString() : '--:--:--';
+
+              html += '<tr>';
+              html += '<td style="font-weight:700; color:var(--blue);">' + w.tokenSymbol + '</td>';
+              html += '<td>' + routeStr + '</td>';
+              html += '<td>$' + w.tradeSizeUSDC.toFixed(2) + '</td>';
+              html += '<td style="color:var(--green);">' + formatUsdc(w.netProfitPeakUSDC, true) + '</td>';
+              html += '<td>' + (w.netProfitClosingUSDC !== undefined ? formatUsdc(w.netProfitClosingUSDC, true) : '--') + '</td>';
+              html += '<td style="font-family:var(--font-mono);">' + dur + '</td>';
+              html += '<td style="color:var(--amber);">' + w.closureReason + '</td>';
+              html += '<td>' + typeBadge + '</td>';
+              html += '<td style="color:var(--text-muted);">' + closedTime + '</td>';
+              html += '</tr>';
+            });
+            studyClosedTbody.innerHTML = html;
+          }
+        }
+      }
+
       async function fetchTelemetry() {
         try {
           const res = await fetch('/api/status');
@@ -2007,6 +2278,9 @@ export class ProfitHudServer {
 
           // 3. Top 10 Profit Watch Table
           renderProfitWatchTable(data.profitWatchTable || []);
+
+          // 3.5. 24-Hour Profitability Study
+          renderStudyTelemetry(data.study);
 
           // 4. Scanner Performance
           const perf = data.performance || {};

@@ -17,6 +17,7 @@
     "benchmark:registry": "tsx src/cli/persistent_registry_benchmark.ts",
     "benchmark:scaling": "tsx src/cli/phase1_6_benchmark.ts",
     "benchmark:mainnet:10min": "tsx src/cli/phase1_6_mainnet_10min.ts",
+    "monitor:24h": "tsx src/cli/study24h.ts",
     "build": "tsc"
   },
   "keywords": [

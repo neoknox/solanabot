@@ -12,7 +12,11 @@ import {
   CycleType,
   DexType,
   ScoutRunRecord,
-  ScoutMetricsSummary
+  ScoutMetricsSummary,
+  OpportunityWindow,
+  OpportunityWindowStatus,
+  StudySessionRecord,
+  WindowObservation
 } from '../types/index.js';
 import { initDatabase } from './db.js';
 
@@ -74,6 +78,71 @@ function rowToPoolRecord(row: Record<string, unknown>): VerifiedPoolRecord {
   };
 }
 
+function rowToOpportunityWindow(row: Record<string, unknown>): OpportunityWindow {
+  let historyObservations: WindowObservation[] = [];
+  if (row.details_json) {
+    try {
+      const parsed = JSON.parse(String(row.details_json));
+      if (Array.isArray(parsed.historyObservations)) {
+        historyObservations = parsed.historyObservations;
+      }
+    } catch {}
+  }
+
+  return {
+    windowId: String(row.window_id),
+    sessionId: String(row.session_id),
+    routeId: String(row.route_id),
+    tokenMint: String(row.token_mint),
+    tokenSymbol: String(row.token_symbol),
+    buyDex: String(row.buy_dex),
+    buyPoolId: String(row.buy_pool_id),
+    sellDex: String(row.sell_dex),
+    sellPoolId: String(row.sell_pool_id),
+    tradeSizeUSDC: Number(row.trade_size_usdc),
+    status: row.status as OpportunityWindowStatus,
+    closureReason: String(row.closure_reason),
+    isCensored: Boolean(row.is_censored),
+    revalidationStatus: (row.revalidation_status as 'SURVIVED' | 'DECAYED' | 'UNCHECKED') || 'UNCHECKED',
+    firstObservedAt: Number(row.first_observed_at),
+    firstObservedSlot: Number(row.first_observed_slot),
+    firstObservedMonotonic: Number(row.first_observed_at),
+    lastObservedAt: Number(row.last_observed_at),
+    lastObservedSlot: Number(row.last_observed_slot),
+    lastObservedMonotonic: Number(row.last_observed_at),
+    closedAt: row.closed_at !== null && row.closed_at !== undefined ? Number(row.closed_at) : undefined,
+    closedAtSlot: row.closed_at_slot !== null && row.closed_at_slot !== undefined ? Number(row.closed_at_slot) : undefined,
+    closedAtMonotonic: row.closed_at !== null && row.closed_at !== undefined ? Number(row.closed_at) : undefined,
+    durationLowerBoundMs: Number(row.duration_lower_bound_ms),
+    durationUpperBoundMs: row.duration_upper_bound_ms !== null && row.duration_upper_bound_ms !== undefined ? Number(row.duration_upper_bound_ms) : undefined,
+    netProfitOpeningUSDC: Number(row.net_profit_opening_usdc),
+    netProfitPeakUSDC: Number(row.net_profit_peak_usdc),
+    netProfitMinUSDC: Number(row.net_profit_min_usdc),
+    netProfitClosingUSDC: row.net_profit_closing_usdc !== null && row.net_profit_closing_usdc !== undefined ? Number(row.net_profit_closing_usdc) : undefined,
+    observationCount: Number(row.observation_count),
+    historyObservations
+  };
+}
+
+function rowToStudySession(row: Record<string, unknown>): StudySessionRecord {
+  return {
+    sessionId: String(row.session_id),
+    startedAt: Number(row.started_at),
+    endedAt: row.ended_at !== null && row.ended_at !== undefined ? Number(row.ended_at) : undefined,
+    status: row.status as 'RUNNING' | 'COMPLETED' | 'INTERRUPTED',
+    targetDurationMs: Number(row.target_duration_ms),
+    healthyUptimeMs: Number(row.healthy_uptime_ms ?? 0),
+    feedDowntimeMs: Number(row.feed_downtime_ms ?? 0),
+    disconnectCount: Number(row.disconnect_count ?? 0),
+    totalWindowsCount: Number(row.total_windows_count ?? 0),
+    qualifiedWindowsCount: Number(row.qualified_windows_count ?? 0),
+    nearMissesCount: Number(row.near_misses_count ?? 0),
+    summaryJson: row.summary_json ? String(row.summary_json) : undefined,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at)
+  };
+}
+
 export class ArbitrageRepository {
   private config: AppConfig;
   private db: Database.Database;
@@ -92,6 +161,13 @@ export class ArbitrageRepository {
   private selectLastScoutRunStmt: Database.Statement;
   private upsertScoutMetadataStmt: Database.Statement;
   private selectScoutMetadataStmt: Database.Statement;
+  private upsertStudySessionStmt: Database.Statement;
+  private selectStudySessionStmt: Database.Statement;
+  private upsertOpportunityWindowStmt: Database.Statement;
+  private selectOpportunityWindowStmt: Database.Statement;
+  private selectWindowsBySessionStmt: Database.Statement;
+  private selectOpenWindowsStmt: Database.Statement;
+  private selectClosedWindowsStmt: Database.Statement;
   private batchInsertTransaction: Database.Transaction<(items: ArbitrageCandidate[]) => void>;
   private batchUpsertRoutesTx: Database.Transaction<(items: PermanentRouteRecord[]) => void>;
   private batchUpsertPoolsTx: Database.Transaction<(items: VerifiedPoolRecord[]) => void>;
@@ -236,6 +312,77 @@ export class ArbitrageRepository {
 
     this.selectScoutMetadataStmt = this.db.prepare(`
       SELECT value FROM scout_metadata WHERE key = ?
+    `);
+
+    this.upsertStudySessionStmt = this.db.prepare(`
+      INSERT INTO study_sessions (
+        session_id, started_at, ended_at, status, target_duration_ms,
+        healthy_uptime_ms, feed_downtime_ms, disconnect_count,
+        total_windows_count, qualified_windows_count, near_misses_count,
+        summary_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        ended_at = excluded.ended_at,
+        status = excluded.status,
+        target_duration_ms = excluded.target_duration_ms,
+        healthy_uptime_ms = excluded.healthy_uptime_ms,
+        feed_downtime_ms = excluded.feed_downtime_ms,
+        disconnect_count = excluded.disconnect_count,
+        total_windows_count = excluded.total_windows_count,
+        qualified_windows_count = excluded.qualified_windows_count,
+        near_misses_count = excluded.near_misses_count,
+        summary_json = excluded.summary_json,
+        updated_at = excluded.updated_at
+    `);
+
+    this.selectStudySessionStmt = this.db.prepare(`
+      SELECT * FROM study_sessions WHERE session_id = ?
+    `);
+
+    this.upsertOpportunityWindowStmt = this.db.prepare(`
+      INSERT INTO opportunity_windows (
+        window_id, session_id, route_id, token_mint, token_symbol,
+        buy_dex, buy_pool_id, sell_dex, sell_pool_id, trade_size_usdc,
+        status, closure_reason, first_observed_at, first_observed_slot,
+        last_observed_at, last_observed_slot, closed_at, closed_at_slot,
+        duration_lower_bound_ms, duration_upper_bound_ms,
+        net_profit_opening_usdc, net_profit_peak_usdc, net_profit_min_usdc, net_profit_closing_usdc,
+        observation_count, revalidation_status, is_censored, details_json,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(window_id) DO UPDATE SET
+        status = excluded.status,
+        closure_reason = excluded.closure_reason,
+        last_observed_at = excluded.last_observed_at,
+        last_observed_slot = excluded.last_observed_slot,
+        closed_at = excluded.closed_at,
+        closed_at_slot = excluded.closed_at_slot,
+        duration_lower_bound_ms = excluded.duration_lower_bound_ms,
+        duration_upper_bound_ms = excluded.duration_upper_bound_ms,
+        net_profit_peak_usdc = excluded.net_profit_peak_usdc,
+        net_profit_min_usdc = excluded.net_profit_min_usdc,
+        net_profit_closing_usdc = excluded.net_profit_closing_usdc,
+        observation_count = excluded.observation_count,
+        revalidation_status = excluded.revalidation_status,
+        is_censored = excluded.is_censored,
+        details_json = excluded.details_json,
+        updated_at = excluded.updated_at
+    `);
+
+    this.selectOpportunityWindowStmt = this.db.prepare(`
+      SELECT * FROM opportunity_windows WHERE window_id = ?
+    `);
+
+    this.selectWindowsBySessionStmt = this.db.prepare(`
+      SELECT * FROM opportunity_windows WHERE session_id = ? ORDER BY first_observed_at ASC
+    `);
+
+    this.selectOpenWindowsStmt = this.db.prepare(`
+      SELECT * FROM opportunity_windows WHERE (? IS NULL OR session_id = ?) AND status = 'OPEN' ORDER BY first_observed_at ASC
+    `);
+
+    this.selectClosedWindowsStmt = this.db.prepare(`
+      SELECT * FROM opportunity_windows WHERE (? IS NULL OR session_id = ?) AND status != 'OPEN' ORDER BY closed_at DESC LIMIT ?
     `);
 
     this.batchInsertTransaction = this.db.transaction((items: ArbitrageCandidate[]) => {
@@ -1148,6 +1295,90 @@ export class ArbitrageRepository {
       DELETE FROM candidates WHERE timestamp < ?
     `).run(cutoffTimestamp);
     return result.changes;
+  }
+
+  public saveStudySession(session: StudySessionRecord): void {
+    const now = Date.now();
+    this.upsertStudySessionStmt.run(
+      session.sessionId,
+      session.startedAt,
+      session.endedAt ?? null,
+      session.status,
+      session.targetDurationMs,
+      session.healthyUptimeMs,
+      session.feedDowntimeMs,
+      session.disconnectCount,
+      session.totalWindowsCount,
+      session.qualifiedWindowsCount,
+      session.nearMissesCount,
+      session.summaryJson ?? null,
+      session.createdAt || now,
+      now
+    );
+  }
+
+  public getStudySession(sessionId: string): StudySessionRecord | null {
+    const row = this.selectStudySessionStmt.get(sessionId) as Record<string, unknown> | undefined;
+    return row ? rowToStudySession(row) : null;
+  }
+
+  public saveOpportunityWindow(window: OpportunityWindow): void {
+    const now = Date.now();
+    const detailsJson = JSON.stringify({
+      historyObservations: window.historyObservations || []
+    });
+    this.upsertOpportunityWindowStmt.run(
+      window.windowId,
+      window.sessionId,
+      window.routeId,
+      window.tokenMint,
+      window.tokenSymbol,
+      window.buyDex,
+      window.buyPoolId,
+      window.sellDex,
+      window.sellPoolId,
+      window.tradeSizeUSDC,
+      window.status,
+      window.closureReason,
+      window.firstObservedAt,
+      window.firstObservedSlot,
+      window.lastObservedAt,
+      window.lastObservedSlot,
+      window.closedAt ?? null,
+      window.closedAtSlot ?? null,
+      window.durationLowerBoundMs,
+      window.durationUpperBoundMs ?? null,
+      window.netProfitOpeningUSDC,
+      window.netProfitPeakUSDC,
+      window.netProfitMinUSDC,
+      window.netProfitClosingUSDC ?? null,
+      window.observationCount,
+      window.revalidationStatus || 'UNCHECKED',
+      window.isCensored ? 1 : 0,
+      detailsJson,
+      window.firstObservedAt,
+      now
+    );
+  }
+
+  public getOpportunityWindow(windowId: string): OpportunityWindow | null {
+    const row = this.selectOpportunityWindowStmt.get(windowId) as Record<string, unknown> | undefined;
+    return row ? rowToOpportunityWindow(row) : null;
+  }
+
+  public getOpportunityWindowsForSession(sessionId: string): OpportunityWindow[] {
+    const rows = this.selectWindowsBySessionStmt.all(sessionId) as Array<Record<string, unknown>>;
+    return rows.map(rowToOpportunityWindow);
+  }
+
+  public getOpenOpportunityWindows(sessionId?: string): OpportunityWindow[] {
+    const rows = this.selectOpenWindowsStmt.all(sessionId ?? null, sessionId ?? null) as Array<Record<string, unknown>>;
+    return rows.map(rowToOpportunityWindow);
+  }
+
+  public getClosedOpportunityWindows(sessionId?: string, limit = 50): OpportunityWindow[] {
+    const rows = this.selectClosedWindowsStmt.all(sessionId ?? null, sessionId ?? null, limit) as Array<Record<string, unknown>>;
+    return rows.map(rowToOpportunityWindow);
   }
 
   public close(): void {

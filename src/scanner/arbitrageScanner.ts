@@ -41,6 +41,7 @@ import { TradeSizer, QuoterLeg } from '../profit/tradeSizer.js';
 import { CompetitorAnalyzer } from '../competition/analyzer.js';
 import { CompetitionScorer } from '../profit/competitionScorer.js';
 import { OpportunityTracker } from './opportunityTracker.js';
+import { OpportunityWindowTracker } from '../study/windowTracker.js';
 import {
   deriveTickArrayPda,
   decodeTickArrayAccount,
@@ -81,6 +82,7 @@ export class ArbitrageScanner {
   private competitorAnalyzer: CompetitorAnalyzer;
   private competitionScorer: CompetitionScorer;
   private opportunityTracker: OpportunityTracker;
+  private windowTracker: OpportunityWindowTracker;
 
   // Performance Hardening & Routing Components
   private routeIndex: RouteIndex;
@@ -171,7 +173,8 @@ export class ArbitrageScanner {
     customWs?: SolanaWsProvider,
     customJupiter?: JupiterClient,
     customRepo?: ArbitrageRepository,
-    customThresholdManager?: ProfitThresholdManager
+    customThresholdManager?: ProfitThresholdManager,
+    customWindowTracker?: OpportunityWindowTracker
   ) {
     this.config = config;
     this.rpc = customRpc || new SolanaRpcProvider(config);
@@ -192,6 +195,10 @@ export class ArbitrageScanner {
     this.competitorAnalyzer = new CompetitorAnalyzer(this.rpc);
     this.competitionScorer = new CompetitionScorer();
     this.opportunityTracker = new OpportunityTracker();
+    this.windowTracker = customWindowTracker || new OpportunityWindowTracker({
+      profitHurdleUSDC: this.profitThresholdManager.getThresholdUSDC(),
+      repository: this.repository
+    });
 
     // Hook threshold changes to immediately reclassify active shadow opportunities
     this.profitThresholdManager.onThresholdChange((_newUSDC) => {
@@ -281,6 +288,7 @@ export class ArbitrageScanner {
 
     // Setup WS disconnect/reconnect hooks
     this.ws.onDisconnect(() => {
+      this.windowTracker.onWebSocketDisconnect(Date.now(), this.ws.getCurrentSlot());
       this.stateCache.invalidateAll('DISCONNECTED');
       this.routeIndex.invalidateAllPrevalidatedRoutes();
       const readyRoutes = this.routeIndex.getReadyRoutes();
@@ -298,6 +306,7 @@ export class ArbitrageScanner {
     });
 
     this.ws.onReconnect(async () => {
+      this.windowTracker.onWebSocketReconnect(Date.now());
       this.wsLastReconnectTime = Date.now();
       const reconnectStart = performance.now();
       this.routeIndex.invalidateAllPrevalidatedRoutes();
@@ -372,6 +381,11 @@ export class ArbitrageScanner {
       this.eventLoopDelayMs = Math.max(0, Math.round(delta - scanInterval));
       this.lastEventLoopTime = perfNow;
       this.latencyTracker.measureEventLoopDelay();
+
+      // Track 24-hour study feed uptime and purge expired observation windows
+      const isWsConnected = this.ws.getHealth() !== 'DISCONNECTED';
+      this.windowTracker.updateFeedUptime(isWsConnected, true, now);
+      this.windowTracker.purgeExpiredWindows(now, this.ws.getCurrentSlot());
 
       // Drain queued WebSocket account updates
       await this.drainEventQueue();
@@ -1880,6 +1894,16 @@ export class ArbitrageScanner {
 
     // Always update profit watch buffer with genuine fresh evaluation
     this.recordProfitWatchEvaluation(candidate, route);
+
+    // Record into 24-hour study opportunity window tracker
+    const routeTokens = [route.legs[0]?.inputMint, route.legs[0]?.outputMint, route.legs[1]?.outputMint].filter(Boolean);
+    this.windowTracker.recordEvaluation(
+      candidate,
+      { orderedTokens: routeTokens } as any,
+      currentSlot,
+      wsConnected,
+      true
+    );
 
     if (isDupe) {
       return;
@@ -3915,8 +3939,13 @@ export class ArbitrageScanner {
       historicalVsSession: this.getHistoricalVsSession(),
       rejectionAnalysis: this.getRejectionAnalysis(),
       diagnostics: this.getDiagnostics(),
-      scout: this.automaticScout.getMetrics()
+      scout: this.automaticScout.getMetrics(),
+      study: this.windowTracker.getTelemetry()
     };
+  }
+
+  public getWindowTracker(): OpportunityWindowTracker {
+    return this.windowTracker;
   }
 
   public isScannerRunning(): boolean {
@@ -3925,6 +3954,7 @@ export class ArbitrageScanner {
 
   public stop(): void {
     this.isRunning = false;
+    this.windowTracker.completeStudy('SCANNER_STOP');
     this.automaticScout.stop();
     if (this.scanTimer) {
       clearInterval(this.scanTimer);

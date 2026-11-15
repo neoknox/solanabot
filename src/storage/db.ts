@@ -12,6 +12,7 @@ export function initDatabase(config: AppConfig): Database.Database {
   const db = new Database(config.DB_PATH);
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
+  db.pragma('busy_timeout = 10000');
 
   // Schema creation
   db.exec(`
@@ -154,6 +155,56 @@ export function initDatabase(config: AppConfig): Database.Database {
       value TEXT NOT NULL,
       updated_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS study_sessions (
+      session_id TEXT PRIMARY KEY,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      status TEXT NOT NULL,
+      target_duration_ms INTEGER NOT NULL,
+      healthy_uptime_ms INTEGER DEFAULT 0,
+      feed_downtime_ms INTEGER DEFAULT 0,
+      disconnect_count INTEGER DEFAULT 0,
+      total_windows_count INTEGER DEFAULT 0,
+      qualified_windows_count INTEGER DEFAULT 0,
+      near_misses_count INTEGER DEFAULT 0,
+      summary_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS opportunity_windows (
+      window_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      route_id TEXT NOT NULL,
+      token_mint TEXT NOT NULL,
+      token_symbol TEXT NOT NULL,
+      buy_dex TEXT NOT NULL,
+      buy_pool_id TEXT NOT NULL,
+      sell_dex TEXT NOT NULL,
+      sell_pool_id TEXT NOT NULL,
+      trade_size_usdc REAL NOT NULL,
+      status TEXT NOT NULL,
+      closure_reason TEXT NOT NULL,
+      first_observed_at INTEGER NOT NULL,
+      first_observed_slot INTEGER NOT NULL,
+      last_observed_at INTEGER NOT NULL,
+      last_observed_slot INTEGER NOT NULL,
+      closed_at INTEGER,
+      closed_at_slot INTEGER,
+      duration_lower_bound_ms INTEGER NOT NULL,
+      duration_upper_bound_ms INTEGER,
+      net_profit_opening_usdc REAL NOT NULL,
+      net_profit_peak_usdc REAL NOT NULL,
+      net_profit_min_usdc REAL NOT NULL,
+      net_profit_closing_usdc REAL,
+      observation_count INTEGER NOT NULL DEFAULT 1,
+      revalidation_status TEXT NOT NULL DEFAULT 'UNCHECKED',
+      is_censored INTEGER NOT NULL DEFAULT 0,
+      details_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
   `);
 
   // Safe incremental column migration if table already existed from earlier phases
@@ -192,6 +243,9 @@ export function initDatabase(config: AppConfig): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_routes_updated_at ON routes(updated_at);
     CREATE INDEX IF NOT EXISTS idx_verified_pools_dex ON verified_pools(dex);
     CREATE INDEX IF NOT EXISTS idx_verified_pools_status ON verified_pools(verification_status);
+    CREATE INDEX IF NOT EXISTS idx_opp_windows_session_status ON opportunity_windows(session_id, status);
+    CREATE INDEX IF NOT EXISTS idx_opp_windows_route_size ON opportunity_windows(route_id, trade_size_usdc);
+    CREATE INDEX IF NOT EXISTS idx_opp_windows_closed_at ON opportunity_windows(closed_at);
   `);
 
   // Idempotent CEO mandate: Solanabot is strictly a 2-leg arbitrage engine.
