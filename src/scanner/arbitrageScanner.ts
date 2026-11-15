@@ -733,6 +733,7 @@ export class ArbitrageScanner {
   }
 
   private processOpenOrdersAccountUpdate(update: QueuedAccountUpdate): { poolId: string; t1: number; t2: number } | null {
+    const decodeStart = performance.now();
     const poolId = this.openOrdersToPool.get(update.key);
     if (!poolId) return null;
 
@@ -823,6 +824,7 @@ export class ArbitrageScanner {
     }
 
     const t1 = performance.now();
+    this.latencyTracker.recordDecodeDuration((t1 - decodeStart) * 1000);
     extra.openOrdersVerified = true;
     extra.openOrdersBaseTokenTotal = baseTokenTotal.toString();
     extra.openOrdersQuoteTokenTotal = quoteTokenTotal.toString();
@@ -844,6 +846,7 @@ export class ArbitrageScanner {
   }
 
   private processVaultAccountUpdate(update: QueuedAccountUpdate): { poolId: string; t1: number; t2: number } | null {
+    const decodeStart = performance.now();
     if (update.data.length >= 72) {
       try {
         const rawAmount = update.data.readBigUInt64LE(64);
@@ -869,6 +872,7 @@ export class ArbitrageScanner {
             pool.slot = update.slot;
             pool.receivedAt = update.receivedAtMs;
             const t1 = performance.now();
+    this.latencyTracker.recordDecodeDuration((t1 - decodeStart) * 1000);
 
             // Runtime recovery: If valid fresh vault data arrives, check if pool can be promoted back to VERIFIED_DIRECT
             if (pool.dex === 'RAYDIUM_AMM') {
@@ -912,6 +916,7 @@ export class ArbitrageScanner {
   }
 
   private processTickArrayAccountUpdate(update: QueuedAccountUpdate): { poolId: string; t1: number; t2: number } | null {
+    const decodeStart = performance.now();
     const now = Date.now();
     if (!update.slot || update.slot <= 0 || !update.receivedAtMs || update.receivedAtMs > now + 5000) {
       return null;
@@ -936,6 +941,7 @@ export class ArbitrageScanner {
     if (!decoded) return null;
 
     const t1 = performance.now();
+    this.latencyTracker.recordDecodeDuration((t1 - decodeStart) * 1000);
 
     if (!extra.tickArrays) extra.tickArrays = {};
     if (!extra.tickArraySlots) extra.tickArraySlots = {};
@@ -983,6 +989,7 @@ export class ArbitrageScanner {
   }
 
   private processAmmConfigAccountUpdate(update: QueuedAccountUpdate): { poolId: string; t1: number; t2: number } | null {
+    const decodeStart = performance.now();
     const now = Date.now();
     if (!update.slot || update.slot <= 0 || !update.receivedAtMs || update.receivedAtMs > now + 5000) {
       return null;
@@ -1017,6 +1024,7 @@ export class ArbitrageScanner {
     }
 
     const t1 = performance.now();
+    this.latencyTracker.recordDecodeDuration((t1 - decodeStart) * 1000);
     this.ammConfigCache.set(update.key, decoded);
 
     const linkedPools = this.ammConfigToPools.get(update.key);

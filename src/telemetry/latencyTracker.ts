@@ -159,15 +159,14 @@ export class LatencyTracker {
   public recordPipelineStages(stages: PipelineStages): void {
     const { t0, tDequeue, t1, t2, tLookupStart, t3, tEvalStart, t4, t5, t6, t7, isQualified } = stages;
 
-    // Queue wait latency (T0 -> tDequeue)
-    if (t0 > 0 && tDequeue !== undefined && tDequeue >= t0) {
-      this.addSample(this.queueWaitSamplesUs, (tDequeue - t0) * 1000);
-    }
+    // Queue wait latency is recorded once per queued event via recordQueueWait(durationUs)
+    // to prevent duplicate samples per evaluated route.
 
-    // Account decode & format validation (T0 -> T1)
-    if (t0 > 0 && t1 >= t0) {
-      this.addSample(this.t0ToT1SamplesUs, (t1 - t0) * 1000);
-      this.addSample(this.decodeSamplesUs, (t1 - t0) * 1000);
+    // Account decode & format validation (Tdequeue -> T1)
+    // Separates actual account decode duration from queue waiting time.
+    const decodeBase = tDequeue !== undefined && tDequeue > 0 ? tDequeue : t0;
+    if (decodeBase > 0 && t1 >= decodeBase) {
+      this.addSample(this.t0ToT1SamplesUs, (t1 - decodeBase) * 1000);
     }
 
     // Shared state cache update (T1 -> T2)
@@ -175,10 +174,8 @@ export class LatencyTracker {
       this.addSample(this.t1ToT2SamplesUs, (t2 - t1) * 1000);
     }
 
-    // Route identification duration (tLookupStart -> T3 or T2 -> T3)
-    if (tLookupStart !== undefined && t3 >= tLookupStart) {
-      this.addSample(this.routeLookupSamplesUs, (t3 - tLookupStart) * 1000);
-    }
+    // Route identification duration is recorded once per pool lookup via recordRouteLookupDuration(durationUs)
+    // to prevent duplicate samples per evaluated route.
     if (t2 > 0 && t3 >= t2) {
       this.addSample(this.t2ToT3SamplesUs, (t3 - t2) * 1000);
     }
@@ -255,7 +252,7 @@ export class LatencyTracker {
   }
 
   private addSample(array: number[], val: number): void {
-    if (val < 0 || isNaN(val)) return;
+    if (val < 0 || isNaN(val) || !isFinite(val)) return;
     if (array.length >= LatencyTracker.MAX_SAMPLES) {
       array.shift();
     }
@@ -274,9 +271,15 @@ export class LatencyTracker {
     const sum = sorted.reduce((acc, v) => acc + v, 0);
     const mean = sum / count;
 
-    const p50 = sorted[Math.floor(count * 0.50)];
-    const p95 = sorted[Math.floor(count * 0.95)] || max;
-    const p99 = sorted[Math.floor(count * 0.99)] || max;
+    const idx50 = Math.min(count - 1, Math.floor(count * 0.50));
+    const idx95 = Math.min(count - 1, Math.floor(count * 0.95));
+    const idx99 = Math.min(count - 1, Math.floor(count * 0.99));
+
+    const p50 = sorted[idx50];
+    // Mathematically enforce monotonic non-decreasing percentiles: min <= p50 <= p95 <= p99 <= max
+    // Never fall back to max with '|| max' which erroneously triggered on 0 values!
+    const p95 = Math.max(p50, sorted[idx95]);
+    const p99 = Math.max(p95, sorted[idx99]);
 
     return {
       count,

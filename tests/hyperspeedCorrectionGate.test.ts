@@ -237,6 +237,115 @@ describe('Hyperspeed Correction Gate: Comprehensive Regression Suite', () => {
       expect(report.revalidationDurationUs.count).toBe(1);
       expect(report.revalidationDurationUs.p50).toBeCloseTo(300.0, 0); // 0.3 ms = 300 us
     });
+
+    it('enforces monotonic percentiles (p50 <= p95 <= p99) under all sample distributions, including zero-heavy arrays', () => {
+      // 1. Zero-heavy distribution: 970 zeros, 25 values of 200, 5 values of 5000
+      // In the uncorrected code, sorted[950] = 0 triggered '0 || max', causing p95 to become 5000 while p99 was 200!
+      for (let i = 0; i < 970; i++) {
+        tracker.recordRejectedDecision(0);
+      }
+      for (let i = 0; i < 25; i++) {
+        tracker.recordRejectedDecision(200);
+      }
+      for (let i = 0; i < 5; i++) {
+        tracker.recordRejectedDecision(5000);
+      }
+
+      let report = tracker.getReport();
+      const stats = report.rejectedDecisionUs;
+      expect(stats.count).toBe(1000);
+      expect(stats.min).toBe(0);
+      expect(stats.p50).toBe(0);
+      expect(stats.p95).toBe(0);
+      expect(stats.p99).toBe(200);
+      expect(stats.max).toBe(5000);
+      // Strictly verify that p95 DOES NOT exceed p99
+      expect(stats.p50!).toBeLessThanOrEqual(stats.p95!);
+      expect(stats.p95!).toBeLessThanOrEqual(stats.p99!);
+      expect(stats.p99!).toBeLessThanOrEqual(stats.max!);
+
+      // 2. Randomized distribution: 500 varied values
+      const randomTracker = new LatencyTracker();
+      for (let i = 0; i < 500; i++) {
+        randomTracker.recordRejectedDecision(Math.random() * 1000);
+      }
+      const randStats = randomTracker.getReport().rejectedDecisionUs;
+      expect(randStats.min!).toBeLessThanOrEqual(randStats.p50!);
+      expect(randStats.p50!).toBeLessThanOrEqual(randStats.p95!);
+      expect(randStats.p95!).toBeLessThanOrEqual(randStats.p99!);
+      expect(randStats.p99!).toBeLessThanOrEqual(randStats.max!);
+
+      // 3. All identical samples
+      const uniformTracker = new LatencyTracker();
+      for (let i = 0; i < 50; i++) {
+        uniformTracker.recordRejectedDecision(123.45);
+      }
+      const unifStats = uniformTracker.getReport().rejectedDecisionUs;
+      expect(unifStats.p50).toBe(123.45);
+      expect(unifStats.p95).toBe(123.45);
+      expect(unifStats.p99).toBe(123.45);
+    });
+
+    it('enforces correct sample counts and prevents duplicate queue-wait and route-lookup recording', () => {
+      // Record 3 genuine queue wait samples (1 per incoming account)
+      tracker.recordQueueWait(10);
+      tracker.recordQueueWait(20);
+      tracker.recordQueueWait(30);
+
+      // Record 2 genuine route lookup samples (1 per pool lookup)
+      tracker.recordRouteLookupDuration(5);
+      tracker.recordRouteLookupDuration(6);
+
+      // Record 1 genuine decode sample
+      tracker.recordDecodeDuration(15);
+
+      // Simulate 10 route evaluations resulting from these updates
+      for (let i = 0; i < 10; i++) {
+        tracker.recordPipelineStages({
+          t0: 1000,
+          tDequeue: 1010,
+          t1: 1012,
+          t2: 1013,
+          tLookupStart: 1013,
+          t3: 1014,
+          tEvalStart: 1014,
+          t4: 1015,
+          t5: 1016,
+          isQualified: false
+        });
+      }
+
+      const report = tracker.getReport();
+      // Queue wait must have EXACTLY 3 samples (NOT 3 + 10 = 13!)
+      expect(report.queueWaitUs.count).toBe(3);
+      // Route lookup must have EXACTLY 2 samples (NOT 2 + 10 = 12!)
+      expect(report.routeLookupUs.count).toBe(2);
+      // Decode latency must have EXACTLY 1 sample (NOT 1 + 10 = 11!)
+      expect(report.decodeLatencyUs.count).toBe(1);
+      // Stage decode has 10 samples (1 per route evaluation)
+      expect(report.t0ToT1DecodeUs.count).toBe(10);
+    });
+
+    it('separates actual account decode duration from queue waiting in pipeline stages', () => {
+      // Event received at t0 = 1000
+      // Dequeued at tDequeue = 1050 (50ms queue wait)
+      // Decoded at t1 = 1052 (2ms actual decode duration)
+      tracker.recordPipelineStages({
+        t0: 1000,
+        tDequeue: 1050,
+        t1: 1052,
+        t2: 1053,
+        t3: 1054,
+        t4: 1055,
+        t5: 1056,
+        isQualified: false
+      });
+
+      const report = tracker.getReport();
+      // Stage T0/Dequeue -> T1 must record actual decode duration (2ms * 1000 = 2000us)
+      // and NOT include queue waiting (52ms * 1000 = 52000us)!
+      expect(report.t0ToT1DecodeUs.p50).toBe(2000);
+    });
   });
 
   describe('3. Queue Scheduling & Event Loop Fairness', () => {

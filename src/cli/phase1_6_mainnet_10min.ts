@@ -378,7 +378,7 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
       queueDropsTotal: scanner.getEventQueueStats().droppedCount,
       persistenceErrorsTotal: repo.getPersistenceErrorsCount(),
       peakMemoryRssMb: peakMemRss,
-      rejectionBreakdownSummary: { ...finalConfiguredBlockers },
+      rejectionBreakdownSummary: { ...finalRejections },
       configuredBlockersSummary: { ...finalConfiguredBlockers },
       verifiedBottlenecksSummary: { ...finalVerifiedBottlenecks },
       hyperspeedLatency: {
@@ -546,6 +546,13 @@ export async function runMainnet10MinBenchmark(durationSeconds: number = 600): P
   console.log(`    Simultaneous READY 250: ${result.checkpoints.readyRoutes['250'].reached ? `REACHED at T+${result.checkpoints.readyRoutes['250'].reachedAtSecond}s` : 'NOT REACHED'}`);
   console.log(`    Simultaneous READY 500: ${result.checkpoints.readyRoutes['500'].reached ? `REACHED at T+${result.checkpoints.readyRoutes['500'].reachedAtSecond}s` : 'NOT REACHED'}`);
   console.log(`    Simultaneous READY 1000:${result.checkpoints.readyRoutes['1000'].reached ? `REACHED at T+${result.checkpoints.readyRoutes['1000'].reachedAtSecond}s` : 'NOT REACHED'}`);
+  console.log('----------------------------------------------------------------');
+  console.log('  ACTUAL ROUTE EVALUATION REJECTION REASONS:');
+  for (const [reason, count] of Object.entries(result.summary.rejectionBreakdownSummary)) {
+    if (count > 0) {
+      console.log(`    ${reason.padEnd(30)}: ${count}`);
+    }
+  }
   console.log('----------------------------------------------------------------');
   console.log('  BOTTLENECKS AMONG STRUCTURALLY VERIFIED ROUTES:');
   for (const [reason, count] of Object.entries(result.summary.verifiedBottlenecksSummary)) {
