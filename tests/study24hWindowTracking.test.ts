@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { OpportunityWindowTracker } from '../src/study/windowTracker.js';
+import { OpportunityWindowTracker, formatQatarTime, formatQatarHour } from '../src/study/windowTracker.js';
 import { StudyReportGenerator } from '../src/study/studyReportGenerator.js';
 import { ArbitrageRepository } from '../src/storage/repository.js';
 import { config } from '../src/config/index.js';
@@ -467,5 +467,180 @@ describe('24-Hour Profitability & Opportunity Window Study Suite', () => {
     expect(jsonContent.studySessionId).toBe('test_session_12');
     expect(jsonContent.routesAndOpportunities.totalQualifiedWindows).toBe(1);
     expect(jsonContent.profitability.bestConservativeNetUSDC).toBe('1.4500');
+  });
+
+  it('Requirement 13: Time precision in UTC (millisecond precision) and Asia/Qatar (AST, UTC+3) formatting', () => {
+    // 2026-11-15T17:00:00.123Z UTC is 20:00:00.123 in Asia/Qatar (UTC+3)
+    const testEpoch = Date.UTC(2026, 10, 15, 17, 0, 0, 123);
+    const qatarFormatted = formatQatarTime(testEpoch, true);
+    expect(qatarFormatted).toBe('2026-11-15 20:00:00.123 AST');
+
+    const qatarHour = formatQatarHour(testEpoch);
+    expect(qatarHour).toBe('20:00 AST');
+
+    const qatarNoMs = formatQatarTime(testEpoch, false);
+    expect(qatarNoMs).toBe('2026-11-15 20:00:00 AST');
+  });
+
+  it('Requirement 14: Clear separation of observedDurationMs vs closureIntervalMs', () => {
+    const tracker = new OpportunityWindowTracker({
+      sessionId: 'test_session_14',
+      profitHurdleUSDC: 0.50,
+      repository: testRepo
+    });
+
+    const t0 = Date.now();
+    const cand1 = createMockCandidate({ minConservativeNetUSDC: '0.9000', stateVersion: 'v1' });
+    tracker.recordEvaluation(cand1, undefined, 100, true, true, t0);
+
+    // Update 300ms later: observed duration = 300ms
+    const t1 = t0 + 300;
+    const cand2 = createMockCandidate({ minConservativeNetUSDC: '1.1000', stateVersion: 'v2' });
+    tracker.recordEvaluation(cand2, undefined, 101, true, true, t1);
+
+    const openWin = tracker.getAllOpenWindows()[0];
+    expect(openWin.observedDurationMs).toBe(300);
+    expect(openWin.closureIntervalMs).toBeUndefined();
+
+    // Close 200ms after last observation: closure interval = 200ms
+    const t2 = t1 + 200;
+    const dropCand = createMockCandidate({
+      status: 'REJECTED',
+      minConservativeNetUSDC: '0.2000',
+      expectedNetUSDC: '0.3000',
+      rejectionReasons: []
+    });
+    tracker.recordEvaluation(dropCand, undefined, 102, true, true, t2);
+
+    expect(tracker.getAllOpenWindows().length).toBe(0);
+    const closedWin = tracker.getAllClosedWindows()[0];
+    expect(closedWin.status).toBe('CLOSED');
+    expect(closedWin.observedDurationMs).toBe(300);
+    expect(closedWin.closureIntervalMs).toBe(200);
+    expect(closedWin.durationLowerBoundMs).toBe(300);
+    expect(closedWin.durationUpperBoundMs).toBe(500);
+
+    // Verify stored in repository
+    const fromDb = testRepo.getOpportunityWindowsForSession('test_session_14');
+    expect(fromDb.length).toBe(1);
+    expect(fromDb[0].observedDurationMs).toBe(300);
+    expect(fromDb[0].closureIntervalMs).toBe(200);
+  });
+
+  it('Requirement 15: 24-hour hourly profitability buckets compute all 5 required metrics', () => {
+    const tracker = new OpportunityWindowTracker({ sessionId: 'test_session_15' });
+    const start = tracker.getStartedAt();
+
+    // Hour 0: Simulate 2 windows in Hour 0
+    const candH0_1 = createMockCandidate({ minConservativeNetUSDC: '1.2000', stateVersion: 'h0_1' });
+    tracker.recordEvaluation(candH0_1, undefined, 100, true, true, start + 1000);
+    tracker.recordEvaluation(createMockCandidate({ minConservativeNetUSDC: '0.1000' }), undefined, 101, true, true, start + 1500); // closes
+
+    const candH0_2 = createMockCandidate({ minConservativeNetUSDC: '2.5000', routeName: 'ETH (Raydium -> Orca)', stateVersion: 'h0_2' });
+    tracker.recordEvaluation(candH0_2, undefined, 102, true, true, start + 2000);
+
+    const buckets = tracker.getHourlyProfitabilityBuckets(start + 2500);
+    expect(buckets.length).toBe(24);
+
+    const b0 = buckets[0];
+    expect(b0.hourIndex).toBe(0);
+    expect(b0.uniqueWindowsCount).toBe(2);
+    expect(b0.bestConservativeNetUSDC).toBe(2.50);
+    expect(b0.healthyCoveragePct).toBe(100);
+    expect(b0.revalidationSuccessPct).toBe(100);
+    expect(b0.status).toBe('ACTIVE_OBSERVED');
+
+    // Future hours
+    expect(buckets[1].status).toBe('FUTURE');
+    expect(buckets[23].status).toBe('FUTURE');
+  });
+
+  it('Requirement 16: Disconnected periods are marked FEED_DISCONNECTED / COVERAGE_DEGRADED and never assumed as 0-opportunity', () => {
+    const tracker = new OpportunityWindowTracker({ sessionId: 'test_session_16' });
+    const start = tracker.getStartedAt();
+
+    // Hour 0: Simulate healthy monitoring
+    tracker.updateFeedUptime(true, true, start + 3600000);
+
+    // Hour 1: Entire hour disconnected (WS down)
+    tracker.updateFeedUptime(false, true, start + 7200000);
+
+    const buckets = tracker.getHourlyProfitabilityBuckets(start + 7200000);
+    const b0 = buckets[0];
+    expect(b0.status).toBe('NO_OPPORTUNITIES_VERIFIED'); // Monitored healthily, genuinely 0 opportunities verified
+
+    const b1 = buckets[1];
+    expect(b1.status).toBe('FEED_DISCONNECTED'); // Disconnected, NOT zero-opportunity!
+    expect(b1.uniqueWindowsCount).toBe(0);
+    expect(b1.healthyCoveragePct).toBe(0);
+  });
+
+  it('Requirement 17: Most active profitable hours ranked strictly on verified observations with healthy coverage', () => {
+    const tracker = new OpportunityWindowTracker({ sessionId: 'test_session_17' });
+    const start = tracker.getStartedAt();
+
+    // Hour 0: 1 opportunity with $1.50
+    tracker.recordEvaluation(createMockCandidate({ minConservativeNetUSDC: '1.5000' }), undefined, 100, true, true, start + 1000);
+
+    // Fast-forward to Hour 2: 2 opportunities with $3.00
+    tracker.recordEvaluation(createMockCandidate({ minConservativeNetUSDC: '2.0000', routeName: 'ROUTE_A', stateVersion: 'r_a' }), undefined, 200, true, true, start + 7200000 + 1000);
+    tracker.recordEvaluation(createMockCandidate({ minConservativeNetUSDC: '3.0000', routeName: 'ROUTE_B', stateVersion: 'r_b' }), undefined, 201, true, true, start + 7200000 + 2000);
+
+    const mostActive = tracker.getMostActiveHours(start + 7200000 + 3000);
+    expect(mostActive.length).toBe(2);
+
+    // Rank 1: Hour 2 (2 windows, best net $3.00)
+    expect(mostActive[0].rank).toBe(1);
+    expect(mostActive[0].hourIndex).toBe(2);
+    expect(mostActive[0].uniqueWindowsCount).toBe(2);
+    expect(mostActive[0].bestConservativeNetUSDC).toBe(3.00);
+
+    // Rank 2: Hour 0 (1 window, best net $1.50)
+    expect(mostActive[1].rank).toBe(2);
+    expect(mostActive[1].hourIndex).toBe(0);
+    expect(mostActive[1].uniqueWindowsCount).toBe(1);
+    expect(mostActive[1].bestConservativeNetUSDC).toBe(1.50);
+  });
+
+  it('Requirement 18: Generated reports (CSV, JSON, TXT) include hourly breakdown, Qatar times, and duration separation', () => {
+    const tracker = new OpportunityWindowTracker({ sessionId: 'test_session_18' });
+    const generator = new StudyReportGenerator(tracker, testReportsDir);
+    const start = tracker.getStartedAt();
+
+    // Record an opportunity
+    const cand = createMockCandidate({ minConservativeNetUSDC: '1.7500' });
+    tracker.recordEvaluation(cand, undefined, 500, true, true, start + 500);
+
+    const outputs = generator.generateAllReports();
+
+    // 1. CSV checks
+    const csvContent = fs.readFileSync(outputs.csvPath, 'utf8');
+    expect(csvContent).toContain('first_observed_qatar');
+    expect(csvContent).toContain('last_observed_qatar');
+    expect(csvContent).toContain('closed_at_qatar');
+    expect(csvContent).toContain('observed_duration_ms');
+    expect(csvContent).toContain('closure_interval_ms');
+    expect(csvContent).toContain('AST');
+
+    // 2. JSON checks
+    const jsonContent = JSON.parse(fs.readFileSync(outputs.jsonPath, 'utf8'));
+    expect(jsonContent.timezone).toBe('Asia/Qatar (UTC+3)');
+    expect(jsonContent.startedAtQatar).toContain('AST');
+    expect(jsonContent.generatedAtQatar).toContain('AST');
+    expect(jsonContent.hourlyProfitabilityAnalysis).toBeDefined();
+    expect(jsonContent.hourlyProfitabilityAnalysis.hourlyBuckets.length).toBe(24);
+
+    // 3. TXT checks
+    const txtContent = fs.readFileSync(outputs.txtPath, 'utf8');
+    expect(txtContent).toContain('Generated At (AST):');
+    expect(txtContent).toContain('Session Started (AST):');
+    expect(txtContent).toContain('Timezone Standard:    Asia/Qatar (UTC+3 / AST)');
+    expect(txtContent).toContain('SECTION D.2: 24-HOUR HOURLY PROFITABILITY BREAKDOWN (ASIA/QATAR - AST)');
+    expect(txtContent).toContain('Hour 0');
+    expect(txtContent).toContain('Data Integrity Note: Disconnected or degraded monitoring intervals are explicitly');
+    expect(txtContent).toContain('classified as FEED_DISCONNECTED or COVERAGE_DEGRADED');
+    expect(txtContent).toContain('SECTION D.3: MOST ACTIVE PROFITABLE HOURS (VERIFIED OBSERVATIONS ONLY)');
+    expect(txtContent).toContain('Observed Dur');
+    expect(txtContent).toContain('Closure Int');
   });
 });

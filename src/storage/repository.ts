@@ -115,6 +115,8 @@ function rowToOpportunityWindow(row: Record<string, unknown>): OpportunityWindow
     closedAtMonotonic: row.closed_at !== null && row.closed_at !== undefined ? Number(row.closed_at) : undefined,
     durationLowerBoundMs: Number(row.duration_lower_bound_ms),
     durationUpperBoundMs: row.duration_upper_bound_ms !== null && row.duration_upper_bound_ms !== undefined ? Number(row.duration_upper_bound_ms) : undefined,
+    observedDurationMs: row.observed_duration_ms !== null && row.observed_duration_ms !== undefined ? Number(row.observed_duration_ms) : Number(row.duration_lower_bound_ms),
+    closureIntervalMs: row.closure_interval_ms !== null && row.closure_interval_ms !== undefined ? Number(row.closure_interval_ms) : (row.duration_upper_bound_ms ? Number(row.duration_upper_bound_ms) - Number(row.duration_lower_bound_ms) : undefined),
     netProfitOpeningUSDC: Number(row.net_profit_opening_usdc),
     netProfitPeakUSDC: Number(row.net_profit_peak_usdc),
     netProfitMinUSDC: Number(row.net_profit_min_usdc),
@@ -346,10 +348,11 @@ export class ArbitrageRepository {
         status, closure_reason, first_observed_at, first_observed_slot,
         last_observed_at, last_observed_slot, closed_at, closed_at_slot,
         duration_lower_bound_ms, duration_upper_bound_ms,
+        observed_duration_ms, closure_interval_ms,
         net_profit_opening_usdc, net_profit_peak_usdc, net_profit_min_usdc, net_profit_closing_usdc,
         observation_count, revalidation_status, is_censored, details_json,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(window_id) DO UPDATE SET
         status = excluded.status,
         closure_reason = excluded.closure_reason,
@@ -359,6 +362,8 @@ export class ArbitrageRepository {
         closed_at_slot = excluded.closed_at_slot,
         duration_lower_bound_ms = excluded.duration_lower_bound_ms,
         duration_upper_bound_ms = excluded.duration_upper_bound_ms,
+        observed_duration_ms = excluded.observed_duration_ms,
+        closure_interval_ms = excluded.closure_interval_ms,
         net_profit_peak_usdc = excluded.net_profit_peak_usdc,
         net_profit_min_usdc = excluded.net_profit_min_usdc,
         net_profit_closing_usdc = excluded.net_profit_closing_usdc,
@@ -1348,6 +1353,8 @@ export class ArbitrageRepository {
       window.closedAtSlot ?? null,
       window.durationLowerBoundMs,
       window.durationUpperBoundMs ?? null,
+      window.observedDurationMs ?? window.durationLowerBoundMs,
+      window.closureIntervalMs ?? (window.durationUpperBoundMs ? Math.max(0, window.durationUpperBoundMs - window.durationLowerBoundMs) : null),
       window.netProfitOpeningUSDC,
       window.netProfitPeakUSDC,
       window.netProfitMinUSDC,

@@ -2,7 +2,8 @@ import http from 'http';
 import { URL } from 'url';
 import { ProfitThresholdManager, VALID_PROFIT_THRESHOLDS_CENTS } from '../profit/profitThresholdManager.js';
 import { ArbitrageScanner } from '../scanner/arbitrageScanner.js';
-import { HudV2Payload } from '../types/index.js';
+import { HudV2Payload, HourlyProfitabilityBucket } from '../types/index.js';
+import { formatQatarTime, formatQatarHour } from '../study/windowTracker.js';
 
 export interface ProfitHudServerOptions {
   port?: number;
@@ -279,7 +280,33 @@ export class ProfitHudServer {
         totalObservedShadowOpportunities: 0,
         liveWindows: [],
         closedWindows: [],
-        nearMissesCount: 0
+        nearMissesCount: 0,
+        hourlyBuckets: (() => {
+          const buckets: HourlyProfitabilityBucket[] = [];
+          const now = Date.now();
+          for (let h = 0; h < 24; h++) {
+            const start = now + h * 3600000;
+            const end = start + 3600000;
+            buckets.push({
+              hourIndex: h,
+              hourStartUtc: new Date(start).toISOString(),
+              hourStartQatar: formatQatarTime(start, false),
+              hourLabel: `Hour ${h} (${formatQatarHour(start)})`,
+              timeRangeQatar: `${formatQatarHour(start)} - ${formatQatarHour(end)}`,
+              uniqueWindowsCount: 0,
+              bestConservativeNetUSDC: 0,
+              medianObservedDurationMs: 0,
+              revalidationSuccessPct: 100,
+              healthyCoveragePct: 100,
+              healthyUptimeMs: 0,
+              feedDowntimeMs: 0,
+              disconnectCount: 0,
+              status: h === 0 ? 'NO_OPPORTUNITIES_VERIFIED' : 'FUTURE'
+            });
+          }
+          return buckets;
+        })(),
+        mostActiveHours: []
       }
     };
   }
@@ -1426,6 +1453,103 @@ export class ProfitHudServer {
         </div>
       </div>
 
+      <!-- Hourly Analysis Sub-section -->
+      <div style="margin-top: 18px; margin-bottom: 8px; display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size: 13px; font-weight: 700; color: var(--text-bright); display:flex; align-items:center; gap:6px;">
+          <span>&#128202;</span>
+          24-HOUR HOURLY PROFITABILITY ANALYSIS (ASIA/QATAR - AST)
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted);">
+          Hourly window distribution &bull; Median duration &bull; Revalidation survival &bull; Fail-closed on feed downtime
+        </div>
+      </div>
+
+      <!-- 24-Hour Visual Hourly Bar Chart -->
+      <div style="background: var(--bg-darkest); border: 1px solid var(--border); border-radius: 6px; padding: 14px; margin-bottom: 12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <span style="font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px;">
+            24-Hour Opportunity Windows &amp; Feed Health (UTC+3)
+          </span>
+          <span style="font-size:10px; color:var(--text-muted); display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+            <span style="display:inline-flex; align-items:center; gap:4px;"><span style="width:8px; height:8px; border-radius:2px; background:var(--green); display:inline-block;"></span> Active Observed</span>
+            <span style="display:inline-flex; align-items:center; gap:4px;"><span style="width:8px; height:8px; border-radius:2px; background:#2d3b55; display:inline-block;"></span> Zero Verified</span>
+            <span style="display:inline-flex; align-items:center; gap:4px;"><span style="width:8px; height:8px; border-radius:2px; background:var(--amber); display:inline-block;"></span> Degraded</span>
+            <span style="display:inline-flex; align-items:center; gap:4px;"><span style="width:8px; height:8px; border-radius:2px; background:var(--red); display:inline-block;"></span> Disconnected</span>
+            <span style="display:inline-flex; align-items:center; gap:4px;"><span style="width:8px; height:8px; border-radius:2px; background:#141b29; display:inline-block;"></span> Future</span>
+          </span>
+        </div>
+        <div id="studyHourlyChart" style="display:flex; align-items:flex-end; gap:3px; height:64px; padding-top:6px; border-bottom:1px solid var(--border);">
+          <!-- 24 bars inserted dynamically -->
+        </div>
+        <div id="studyHourlyLabels" style="display:flex; justify-content:space-between; font-size:9px; color:var(--text-muted); margin-top:4px; font-family:var(--font-mono);">
+          <span>Hour 0</span>
+          <span>Hour 6</span>
+          <span>Hour 12</span>
+          <span>Hour 18</span>
+          <span>Hour 23</span>
+        </div>
+      </div>
+
+      <!-- Hourly Profitability Table -->
+      <div class="table-container" style="margin-bottom: 16px; max-height: 240px; overflow-y: auto;">
+        <table id="studyHourlyTable">
+          <thead>
+            <tr>
+              <th>Hour</th>
+              <th>Time Range (AST)</th>
+              <th>Windows</th>
+              <th>Best Net (USDC)</th>
+              <th>Median Observed Dur</th>
+              <th>Revalidation %</th>
+              <th>Healthy Coverage %</th>
+              <th>Monitoring Status</th>
+            </tr>
+          </thead>
+          <tbody id="studyHourlyTbody">
+            <tr>
+              <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 14px;">
+                Hourly profitability data will stream continuously during the 24-hour study.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Most Active Profitable Hours Sub-section -->
+      <div style="margin-top: 14px; margin-bottom: 8px; display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size: 13px; font-weight: 700; color: var(--text-bright); display:flex; align-items:center; gap:6px;">
+          <span style="color:var(--green);">&#9733;</span>
+          MOST ACTIVE PROFITABLE HOURS (VERIFIED OBSERVATIONS ONLY)
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted);">
+          Ranked strictly on observed shadow opportunities with healthy coverage (&ge;50%). Disconnected periods excluded.
+        </div>
+      </div>
+
+      <div class="table-container" style="margin-bottom: 16px;">
+        <table id="studyActiveHoursTable">
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Hour</th>
+              <th>Time Range (AST)</th>
+              <th>Unique Windows</th>
+              <th>Best Conservative Net</th>
+              <th>Median Duration</th>
+              <th>Healthy Coverage</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="studyActiveHoursTbody">
+            <tr>
+              <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 14px;">
+                No active profitable hours confirmed yet.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
       <!-- Live Windows Sub-section -->
       <div style="margin-top: 14px; margin-bottom: 8px; display:flex; justify-content:space-between; align-items:center;">
         <div style="font-size: 13px; font-weight: 700; color: var(--text-bright); display:flex; align-items:center; gap:6px;">
@@ -1468,7 +1592,7 @@ export class ProfitHudServer {
           RECENT CLOSED / CENSORED WINDOWS
           <span id="studyClosedCount" class="badge-near" style="font-size:10px; margin-left:4px;">0</span>
         </div>
-        <div style="font-size: 11px; color: var(--text-muted);">Most recent closed opportunities and bounded duration metrics</div>
+        <div style="font-size: 11px; color: var(--text-muted);">Observed duration vs closure interval &bull; Asia/Qatar timestamps</div>
       </div>
 
       <div class="table-container">
@@ -1479,11 +1603,11 @@ export class ProfitHudServer {
               <th>Route</th>
               <th>Trade Size</th>
               <th>Peak Net</th>
-              <th>Closing Net</th>
-              <th>Observed Duration</th>
-              <th>Closure Reason</th>
-              <th>Type</th>
-              <th>Closed At (UTC)</th>
+              <th>Observed Dur</th>
+              <th>Closure Int</th>
+              <th>First Seen (AST)</th>
+              <th>Closed At (AST)</th>
+              <th>Status &amp; Reason</th>
             </tr>
           </thead>
           <tbody id="studyClosedTbody">
@@ -1899,6 +2023,10 @@ export class ProfitHudServer {
       const studyLiveTbody = document.getElementById('studyLiveTbody');
       const studyClosedCount = document.getElementById('studyClosedCount');
       const studyClosedTbody = document.getElementById('studyClosedTbody');
+      const studyHourlyChart = document.getElementById('studyHourlyChart');
+      const studyHourlyTable = document.getElementById('studyHourlyTable');
+      const studyHourlyTbody = document.getElementById('studyHourlyTbody');
+      const studyActiveHoursTbody = document.getElementById('studyActiveHoursTbody');
 
       // Scanner Performance
       const perfRouteEvalsSec = document.getElementById('perfRouteEvalsSec');
@@ -2139,6 +2267,16 @@ export class ProfitHudServer {
         return h + ':' + m + ':' + s;
       }
 
+      function toQatarTimeStr(epochMs) {
+        if (!epochMs) return '--:--:--';
+        const d = new Date(epochMs + 3 * 3600 * 1000);
+        const hh = d.getUTCHours().toString().padStart(2, '0');
+        const mm = d.getUTCMinutes().toString().padStart(2, '0');
+        const ss = d.getUTCSeconds().toString().padStart(2, '0');
+        const mss = d.getUTCMilliseconds().toString().padStart(3, '0');
+        return hh + ':' + mm + ':' + ss + '.' + mss + ' AST';
+      }
+
       function renderStudyTelemetry(study) {
         if (!study) return;
         if (studyStatusBadge) {
@@ -2173,6 +2311,97 @@ export class ProfitHudServer {
         if (studyDurationMedP95) studyDurationMedP95.textContent = formatMs(study.medianDurationMs) + ' / ' + formatMs(study.p95DurationMs);
         if (studyDurationMinMax) studyDurationMinMax.textContent = formatMs(study.minDurationMs) + ' / ' + formatMs(study.maxDurationMs);
         if (studyBestNet) studyBestNet.textContent = formatUsdc(study.bestConservativeNetUSDC, true);
+
+        // Render 24-Hour Hourly Chart & Table
+        if (studyHourlyChart && study.hourlyBuckets) {
+          let chartHtml = '';
+          const maxWindows = Math.max(1, ...study.hourlyBuckets.map(function(b) { return b.uniqueWindowsCount || 0; }));
+          study.hourlyBuckets.forEach(function(b) {
+            let barColor = '#141b29';
+            let barHeight = 4;
+            if (b.status === 'ACTIVE_OBSERVED') {
+              barColor = 'var(--green)';
+              barHeight = Math.max(10, Math.round((b.uniqueWindowsCount / maxWindows) * 54));
+            } else if (b.status === 'NO_OPPORTUNITIES_VERIFIED') {
+              barColor = '#2d3b55';
+              barHeight = 6;
+            } else if (b.status === 'COVERAGE_DEGRADED') {
+              barColor = 'var(--amber)';
+              barHeight = Math.max(8, Math.round((b.uniqueWindowsCount / maxWindows) * 54));
+            } else if (b.status === 'FEED_DISCONNECTED') {
+              barColor = 'var(--red)';
+              barHeight = 8;
+            } else { // FUTURE
+              barColor = '#141b29';
+              barHeight = 4;
+            }
+            const tip = b.hourLabel + ' (' + b.timeRangeQatar + ') | Windows: ' + b.uniqueWindowsCount + ' | Best Net: $' + b.bestConservativeNetUSDC.toFixed(4) + ' | Coverage: ' + b.healthyCoveragePct.toFixed(1) + '% | Status: ' + b.status;
+            chartHtml += '<div style="flex:1; display:flex; flex-direction:column; align-items:center; height:100%; justify-content:flex-end;" title="' + tip + '">';
+            chartHtml += '<div style="width:100%; max-width:24px; height:' + barHeight + 'px; background:' + barColor + '; border-radius:2px 2px 0 0; transition:height 0.3s;"></div>';
+            chartHtml += '</div>';
+          });
+          studyHourlyChart.innerHTML = chartHtml;
+        }
+
+        if (studyHourlyTbody && study.hourlyBuckets) {
+          if (study.hourlyBuckets.length === 0) {
+            studyHourlyTbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 14px;">No hourly data available.</td></tr>';
+          } else {
+            let tHtml = '';
+            study.hourlyBuckets.forEach(function(b) {
+              let statusBadge = '';
+              if (b.status === 'ACTIVE_OBSERVED') {
+                statusBadge = '<span class="badge-qual">ACTIVE OBSERVED</span>';
+              } else if (b.status === 'NO_OPPORTUNITIES_VERIFIED') {
+                statusBadge = '<span style="color:var(--text-muted); font-size:10px;">ZERO VERIFIED</span>';
+              } else if (b.status === 'COVERAGE_DEGRADED') {
+                statusBadge = '<span class="badge-near">COVERAGE DEGRADED</span>';
+              } else if (b.status === 'FEED_DISCONNECTED') {
+                statusBadge = '<span class="badge-rej">FEED DISCONNECTED</span>';
+              } else {
+                statusBadge = '<span style="color:var(--border-bright); font-size:10px;">SCHEDULED</span>';
+              }
+
+              const bestNetStr = b.uniqueWindowsCount > 0 ? formatUsdc(b.bestConservativeNetUSDC, true) : '$0.0000';
+              const medDurStr = b.uniqueWindowsCount > 0 ? formatMs(b.medianObservedDurationMs) : '--';
+              const covColor = b.healthyCoveragePct >= 95 ? 'var(--green)' : (b.healthyCoveragePct >= 50 ? 'var(--amber)' : 'var(--red)');
+
+              tHtml += '<tr>';
+              tHtml += '<td style="font-weight:700; color:var(--text-bright); font-family:var(--font-mono);">' + b.hourLabel + '</td>';
+              tHtml += '<td style="color:var(--text-muted); font-family:var(--font-mono);">' + b.timeRangeQatar + '</td>';
+              tHtml += '<td style="font-weight:700; color:' + (b.uniqueWindowsCount > 0 ? 'var(--green)' : 'var(--text-muted)') + ';">' + b.uniqueWindowsCount + '</td>';
+              tHtml += '<td style="color:' + (b.bestConservativeNetUSDC > 0 ? 'var(--green)' : 'var(--text-muted)') + ';">' + bestNetStr + '</td>';
+              tHtml += '<td style="font-family:var(--font-mono);">' + medDurStr + '</td>';
+              tHtml += '<td>' + b.revalidationSuccessPct.toFixed(1) + '%</td>';
+              tHtml += '<td style="font-weight:700; color:' + covColor + ';">' + b.healthyCoveragePct.toFixed(1) + '%</td>';
+              tHtml += '<td>' + statusBadge + '</td>';
+              tHtml += '</tr>';
+            });
+            studyHourlyTbody.innerHTML = tHtml;
+          }
+        }
+
+        // Render Most Active Hours Table
+        if (studyActiveHoursTbody) {
+          if (!study.mostActiveHours || study.mostActiveHours.length === 0) {
+            studyActiveHoursTbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 14px;">No active profitable hours confirmed yet. Unmonitored / disconnected periods are excluded from zero-opportunity conclusions.</td></tr>';
+          } else {
+            let aHtml = '';
+            study.mostActiveHours.forEach(function(a) {
+              aHtml += '<tr>';
+              aHtml += '<td style="font-weight:800; color:var(--amber);">#' + a.rank + '</td>';
+              aHtml += '<td style="font-weight:700; color:var(--text-bright); font-family:var(--font-mono);">' + a.hourLabel + '</td>';
+              aHtml += '<td style="color:var(--blue); font-family:var(--font-mono);">' + a.timeRangeQatar + '</td>';
+              aHtml += '<td style="font-weight:700; color:var(--green);">' + a.uniqueWindowsCount + '</td>';
+              aHtml += '<td style="font-weight:700; color:var(--green);">' + formatUsdc(a.bestConservativeNetUSDC, true) + '</td>';
+              aHtml += '<td style="font-family:var(--font-mono);">' + formatMs(a.medianObservedDurationMs) + '</td>';
+              aHtml += '<td style="color:var(--green); font-weight:700;">' + a.healthyCoveragePct.toFixed(1) + '%</td>';
+              aHtml += '<td><span class="badge-qual">VERIFIED ACTIVE</span></td>';
+              aHtml += '</tr>';
+            });
+            studyActiveHoursTbody.innerHTML = aHtml;
+          }
+        }
 
         // Render Live Windows Table
         if (studyLiveCount) studyLiveCount.textContent = study.liveWindows ? study.liveWindows.length : 0;
@@ -2209,22 +2438,21 @@ export class ProfitHudServer {
             let html = '';
             study.closedWindows.forEach(function(w) {
               const routeStr = w.buyDex + ' -> ' + w.sellDex;
-              const dur = formatMs(w.durationUpperBoundMs || w.durationLowerBoundMs);
-              const typeBadge = w.isCensored
-                ? '<span class="badge-rej" style="font-size:10px;">CENSORED</span>'
-                : '<span class="badge-qual" style="font-size:10px;">MARKET</span>';
-              const closedTime = w.closedAt ? new Date(w.closedAt).toLocaleTimeString() : '--:--:--';
+              const obsDur = formatMs(w.observedDurationMs !== undefined ? w.observedDurationMs : w.durationLowerBoundMs);
+              const clsInt = w.closureIntervalMs !== undefined ? formatMs(w.closureIntervalMs) : '--';
+              const firstSeenTime = toQatarTimeStr(w.firstObservedAt);
+              const closedTime = w.closedAt ? toQatarTimeStr(w.closedAt) : '--:--:--';
 
               html += '<tr>';
               html += '<td style="font-weight:700; color:var(--blue);">' + w.tokenSymbol + '</td>';
               html += '<td>' + routeStr + '</td>';
               html += '<td>$' + w.tradeSizeUSDC.toFixed(2) + '</td>';
-              html += '<td style="color:var(--green);">' + formatUsdc(w.netProfitPeakUSDC, true) + '</td>';
-              html += '<td>' + (w.netProfitClosingUSDC !== undefined ? formatUsdc(w.netProfitClosingUSDC, true) : '--') + '</td>';
-              html += '<td style="font-family:var(--font-mono);">' + dur + '</td>';
+              html += '<td style="color:var(--green); font-weight:700;">' + formatUsdc(w.netProfitPeakUSDC, true) + '</td>';
+              html += '<td style="font-family:var(--font-mono); color:var(--text-bright);">' + obsDur + '</td>';
+              html += '<td style="font-family:var(--font-mono); color:var(--text-muted);">' + clsInt + '</td>';
+              html += '<td style="color:var(--text-muted); font-family:var(--font-mono); font-size:11px;">' + firstSeenTime + '</td>';
+              html += '<td style="color:var(--text-muted); font-family:var(--font-mono); font-size:11px;">' + closedTime + '</td>';
               html += '<td style="color:var(--amber);">' + w.closureReason + '</td>';
-              html += '<td>' + typeBadge + '</td>';
-              html += '<td style="color:var(--text-muted);">' + closedTime + '</td>';
               html += '</tr>';
             });
             studyClosedTbody.innerHTML = html;

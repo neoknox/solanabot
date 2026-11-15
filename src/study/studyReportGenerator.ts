@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { OpportunityWindowTracker } from './windowTracker.js';
+import { OpportunityWindowTracker, formatQatarTime, formatQatarHour } from './windowTracker.js';
 import { OpportunityWindow, DurationPercentiles, StudyTelemetry } from '../types/index.js';
 
 export interface StudyReportOutputPaths {
@@ -54,8 +54,13 @@ export class StudyReportGenerator {
       'is_censored',
       'revalidation_status',
       'first_observed_utc',
+      'first_observed_qatar',
       'last_observed_utc',
+      'last_observed_qatar',
       'closed_at_utc',
+      'closed_at_qatar',
+      'observed_duration_ms',
+      'closure_interval_ms',
       'duration_lower_bound_ms',
       'duration_upper_bound_ms',
       'net_profit_opening_usdc',
@@ -83,8 +88,13 @@ export class StudyReportGenerator {
         w.isCensored ? 1 : 0,
         `"${w.revalidationStatus}"`,
         `"${new Date(w.firstObservedAt).toISOString()}"`,
+        `"${formatQatarTime(w.firstObservedAt)}"`,
         `"${new Date(w.lastObservedAt).toISOString()}"`,
+        `"${formatQatarTime(w.lastObservedAt)}"`,
         w.closedAt ? `"${new Date(w.closedAt).toISOString()}"` : '""',
+        w.closedAt ? `"${formatQatarTime(w.closedAt)}"` : '""',
+        w.observedDurationMs !== undefined ? w.observedDurationMs : w.durationLowerBoundMs,
+        w.closureIntervalMs !== undefined ? w.closureIntervalMs : '',
         w.durationLowerBoundMs,
         w.durationUpperBoundMs !== undefined ? w.durationUpperBoundMs : '',
         w.netProfitOpeningUSDC.toFixed(4),
@@ -131,8 +141,14 @@ export class StudyReportGenerator {
       studySessionId: telemetry.sessionId,
       status: telemetry.status,
       timestamp: new Date().toISOString(),
+      timezone: 'Asia/Qatar (UTC+3)',
+      startedAtUtc: new Date(telemetry.startedAt).toISOString(),
+      startedAtQatar: formatQatarTime(telemetry.startedAt),
+      generatedAtUtc: new Date().toISOString(),
+      generatedAtQatar: formatQatarTime(Date.now()),
       coverage: {
         startedAtUtc: new Date(telemetry.startedAt).toISOString(),
+        startedAtQatar: formatQatarTime(telemetry.startedAt),
         elapsedMs: telemetry.elapsedMs,
         elapsedHours: (telemetry.elapsedMs / 3600000).toFixed(2),
         targetDurationHours: (telemetry.targetDurationMs / 3600000).toFixed(2),
@@ -155,6 +171,11 @@ export class StudyReportGenerator {
       sizeDistribution,
       profitability: {
         bestConservativeNetUSDC: telemetry.bestConservativeNetUSDC.toFixed(4)
+      },
+      hourlyProfitabilityAnalysis: {
+        timezone: 'Asia/Qatar (UTC+3)',
+        hourlyBuckets: telemetry.hourlyBuckets || [],
+        mostActiveHours: telemetry.mostActiveHours || []
       },
       top20Windows: top20
     };
@@ -191,9 +212,13 @@ export class StudyReportGenerator {
     let txt = `================================================================================
 SOLANABOT - 24-HOUR PROFITABILITY & OPPORTUNITY WINDOW STUDY REPORT
 ================================================================================
-Generated At: ${new Date().toISOString()}
-Session ID:   ${telemetry.sessionId}
-Study Status: ${telemetry.status}
+Generated At (UTC):   ${new Date().toISOString()}
+Generated At (AST):   ${formatQatarTime(Date.now())}
+Session ID:           ${telemetry.sessionId}
+Study Status:         ${telemetry.status}
+Session Started (UTC): ${new Date(telemetry.startedAt).toISOString()}
+Session Started (AST): ${formatQatarTime(telemetry.startedAt)}
+Timezone Standard:    Asia/Qatar (UTC+3 / AST)
 
 ================================================================================
 SECTION A: SCAN COVERAGE & OPERATIONAL HEALTH
@@ -254,6 +279,57 @@ Window Closure Reasons:
 
     txt += `
 ================================================================================
+SECTION D.2: 24-HOUR HOURLY PROFITABILITY BREAKDOWN (ASIA/QATAR - AST)
+================================================================================
+Hour    Time Range (AST)      Windows  Best Net (USDC)  Median Dur   Reval %  Coverage %  Status
+------  --------------------  -------  ---------------  -----------  -------  ----------  -------------------------
+`;
+
+    const hourly = telemetry.hourlyBuckets || [];
+    for (const b of hourly) {
+      const hStr = `Hour ${b.hourIndex}`.padEnd(6);
+      const trStr = b.timeRangeQatar.padEnd(20);
+      const winStr = b.uniqueWindowsCount.toString().padStart(7);
+      const bestStr = (b.uniqueWindowsCount > 0 ? `$${b.bestConservativeNetUSDC.toFixed(4)}` : '$0.0000').padStart(15);
+      const medDurStr = (b.uniqueWindowsCount > 0 ? formatMs(b.medianObservedDurationMs) : '--').padStart(11);
+      const revalStr = `${b.revalidationSuccessPct.toFixed(1)}%`.padStart(7);
+      const covStr = `${b.healthyCoveragePct.toFixed(1)}%`.padStart(10);
+      const stStr = b.status;
+      txt += `${hStr}  ${trStr}  ${winStr}  ${bestStr}  ${medDurStr}  ${revalStr}  ${covStr}  ${stStr}\n`;
+    }
+
+    txt += `
+Data Integrity Note: Disconnected or degraded monitoring intervals are explicitly
+classified as FEED_DISCONNECTED or COVERAGE_DEGRADED. Solanabot never assumes
+zero market opportunities during unmonitored intervals.
+
+================================================================================
+SECTION D.3: MOST ACTIVE PROFITABLE HOURS (VERIFIED OBSERVATIONS ONLY)
+================================================================================
+`;
+
+    const mostActive = telemetry.mostActiveHours || [];
+    if (mostActive.length === 0) {
+      txt += `No hours met the active observed threshold with >=50% healthy coverage.\n`;
+    } else {
+      txt += `Rank  Hour    Time Range (AST)      Windows  Best Net (USDC)  Median Dur   Coverage %  Status\n`;
+      txt += `----  ------  --------------------  -------  ---------------  -----------  ----------  -------------------------\n`;
+      for (const a of mostActive) {
+        const rankStr = `#${a.rank.toString().padStart(2)}`;
+        const hourStr = `Hour ${a.hourIndex.toString().padStart(2)}`;
+        const trStr = a.timeRangeQatar.padEnd(20);
+        const winStr = a.uniqueWindowsCount.toString().padStart(7);
+        const bestStr = `$${a.bestConservativeNetUSDC.toFixed(4)}`.padStart(15);
+        const medDurStr = formatMs(a.medianObservedDurationMs).padStart(11);
+        const covStr = `${a.healthyCoveragePct.toFixed(1)}%`.padStart(10);
+        const stStr = a.status;
+        txt += `${rankStr}   ${hourStr}  ${trStr}  ${winStr}  ${bestStr}  ${medDurStr}  ${covStr}  ${stStr}\n`;
+      }
+      txt += `\nNote: Active hour ranking is based strictly on verified shadow observations with\nhealthy monitoring coverage (>=50%). Disconnected periods are excluded from analysis.\n`;
+    }
+
+    txt += `
+================================================================================
 SECTION E: TOP MOST PROFITABLE OPPORTUNITY WINDOWS
 ================================================================================
 `;
@@ -261,18 +337,20 @@ SECTION E: TOP MOST PROFITABLE OPPORTUNITY WINDOWS
     if (top20.length === 0) {
       txt += `No qualified profitable opportunity windows were observed during this session.\n`;
     } else {
-      txt += `Rank  Token    Route                   Size    Peak Net  Duration   Status & Reason\n`;
-      txt += `----  -------  ----------------------  ------  --------  ---------  --------------------\n`;
+      txt += `Rank  Token    Route                   Size    Peak Net  Observed Dur  Closure Int  First Seen (AST)          Status & Reason\n`;
+      txt += `----  -------  ----------------------  ------  --------  ------------  -----------  ------------------------  --------------------\n`;
       top20.forEach((w, idx) => {
         const rankStr = String(idx + 1).padStart(2);
         const tokenStr = w.tokenSymbol.padEnd(7);
         const routeStr = `${w.buyDex.substring(0, 3)}->${w.sellDex.substring(0, 3)}`.padEnd(22);
         const sizeStr = `$${w.tradeSizeUSDC}`.padEnd(6);
         const netStr = `$${w.netProfitPeakUSDC.toFixed(2)}`.padEnd(8);
-        const dur = w.durationUpperBoundMs ?? w.durationLowerBoundMs;
-        const durStr = formatMs(dur).padEnd(9);
+        const obsDur = w.observedDurationMs !== undefined ? w.observedDurationMs : w.durationLowerBoundMs;
+        const obsDurStr = formatMs(obsDur).padEnd(12);
+        const clsIntStr = (w.closureIntervalMs !== undefined ? formatMs(w.closureIntervalMs) : '--').padEnd(11);
+        const firstSeenStr = formatQatarTime(w.firstObservedAt, true).padEnd(24);
         const reasonStr = `${w.status}: ${w.closureReason}`;
-        txt += `${rankStr}    ${tokenStr}  ${routeStr}  ${sizeStr}  ${netStr}  ${durStr}  ${reasonStr}\n`;
+        txt += `${rankStr}    ${tokenStr}  ${routeStr}  ${sizeStr}  ${netStr}  ${obsDurStr}  ${clsIntStr}  ${firstSeenStr}  ${reasonStr}\n`;
       });
     }
 

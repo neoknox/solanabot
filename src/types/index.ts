@@ -708,6 +708,8 @@ export interface OpportunityWindow {
   closedAtMonotonic?: number;
   durationLowerBoundMs: number;
   durationUpperBoundMs?: number;
+  observedDurationMs: number;
+  closureIntervalMs?: number;
   netProfitOpeningUSDC: number;
   netProfitPeakUSDC: number;
   netProfitMinUSDC: number;
@@ -757,6 +759,35 @@ export interface DurationPercentiles {
   over2sCount: number;
 }
 
+export interface HourlyProfitabilityBucket {
+  hourIndex: number;                  // 0..23 relative study hour
+  hourStartUtc: string;               // ISO 8601 UTC
+  hourStartQatar: string;             // YYYY-MM-DD HH:mm:ss AST (UTC+3)
+  hourLabel: string;                  // e.g. "Hour 0 (20:00 AST)"
+  timeRangeQatar: string;             // e.g. "20:00 - 21:00 AST"
+  uniqueWindowsCount: number;
+  bestConservativeNetUSDC: number;
+  medianObservedDurationMs: number;
+  revalidationSuccessPct: number;
+  healthyCoveragePct: number;
+  healthyUptimeMs: number;
+  feedDowntimeMs: number;
+  disconnectCount: number;
+  status: 'ACTIVE_OBSERVED' | 'NO_OPPORTUNITIES_VERIFIED' | 'COVERAGE_DEGRADED' | 'FEED_DISCONNECTED' | 'FUTURE';
+}
+
+export interface MostActiveHourSummary {
+  rank: number;
+  hourIndex: number;
+  hourLabel: string;
+  timeRangeQatar: string;
+  uniqueWindowsCount: number;
+  bestConservativeNetUSDC: number;
+  medianObservedDurationMs: number;
+  healthyCoveragePct: number;
+  status: string;
+}
+
 export interface StudyTelemetry {
   sessionId: string;
   status: 'RUNNING' | 'COMPLETED' | 'INTERRUPTED' | 'STANDBY';
@@ -780,6 +811,8 @@ export interface StudyTelemetry {
   liveWindows: OpportunityWindow[];
   closedWindows: OpportunityWindow[];
   nearMissesCount: number;
+  hourlyBuckets: HourlyProfitabilityBucket[];
+  mostActiveHours: MostActiveHourSummary[];
 }
 
 

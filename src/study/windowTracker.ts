@@ -8,9 +8,45 @@ import {
   DurationPercentiles,
   StudyTelemetry,
   ArbitrageCandidate,
-  PermanentRouteRecord
+  PermanentRouteRecord,
+  HourlyProfitabilityBucket,
+  MostActiveHourSummary
 } from '../types/index.js';
 import { ArbitrageRepository } from '../storage/repository.js';
+
+export function formatQatarTime(epochMs: number, includeMs = true): string {
+  const d = new Date(epochMs);
+  const formatter = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Qatar',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
+  const parts = formatter.formatToParts(d);
+  const partMap: Record<string, string> = {};
+  for (const p of parts) partMap[p.type] = p.value;
+  const base = `${partMap.year}-${partMap.month}-${partMap.day} ${partMap.hour}:${partMap.minute}:${partMap.second}`;
+  if (includeMs) {
+    const ms = String(d.getUTCMilliseconds()).padStart(3, '0');
+    return `${base}.${ms} AST`;
+  }
+  return `${base} AST`;
+}
+
+export function formatQatarHour(epochMs: number): string {
+  const d = new Date(epochMs);
+  const formatter = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Qatar',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  });
+  return `${formatter.format(d)} AST`;
+}
 
 export interface OpportunityWindowTrackerOptions {
   sessionId?: string;
@@ -46,6 +82,11 @@ export class OpportunityWindowTracker {
   private disconnectCount = 0;
   private lastUptimeCheck: number;
   private lastFeedHealthy = true;
+
+  // Hourly tracking buckets (0..23)
+  private hourlyUptimeMs = new Array(24).fill(0);
+  private hourlyDowntimeMs = new Array(24).fill(0);
+  private hourlyDisconnectCount = new Array(24).fill(0);
 
   // Aggregate counters
   private totalObservedShadowOpportunities = 0;
@@ -92,14 +133,18 @@ export class OpportunityWindowTracker {
     route?: PermanentRouteRecord,
     currentSlot = 0,
     isWsConnected = true,
-    isRpcActive = true
+    isRpcActive = true,
+    nowOverride?: number
   ): void {
     const tradeSize = Number(candidate.inputAmountUSDC) / 1e6;
     const windowKey = `${candidate.routeName}:${tradeSize}`;
-    const now = Date.now();
-    const monotonicNow = typeof performance !== 'undefined' ? performance.now() : now;
+    const now = nowOverride !== undefined ? nowOverride : Date.now();
+    const monotonicNow = nowOverride !== undefined ? nowOverride : (typeof performance !== 'undefined' ? performance.now() : now);
     const conservativeNet = parseFloat(candidate.minConservativeNetUSDC);
     const expectedNet = parseFloat(candidate.expectedNetUSDC);
+
+    // Keep feed uptime tracked
+    this.updateFeedUptime(isWsConnected, isRpcActive, now);
 
     // Track total shadow opportunities observed
     this.totalObservedShadowOpportunities++;
@@ -143,6 +188,8 @@ export class OpportunityWindowTracker {
           lastObservedSlot: currentSlot || candidate.leg1Quote.slot || 0,
           lastObservedMonotonic: monotonicNow,
           durationLowerBoundMs: 0,
+          observedDurationMs: 0,
+          closureIntervalMs: undefined,
           netProfitOpeningUSDC: conservativeNet,
           netProfitPeakUSDC: conservativeNet,
           netProfitMinUSDC: conservativeNet,
@@ -184,7 +231,9 @@ export class OpportunityWindowTracker {
           existingWindow.lastObservedAt = now;
           existingWindow.lastObservedSlot = currentSlot || candidate.leg1Quote.slot || existingWindow.lastObservedSlot;
           existingWindow.lastObservedMonotonic = monotonicNow;
-          existingWindow.durationLowerBoundMs = Math.max(0, Math.round(monotonicNow - existingWindow.firstObservedMonotonic));
+          const obsDur = Math.max(0, Math.round(monotonicNow - existingWindow.firstObservedMonotonic));
+          existingWindow.durationLowerBoundMs = obsDur;
+          existingWindow.observedDurationMs = obsDur;
           existingWindow.netProfitPeakUSDC = Math.max(existingWindow.netProfitPeakUSDC, conservativeNet);
           existingWindow.netProfitMinUSDC = Math.min(existingWindow.netProfitMinUSDC, conservativeNet);
           existingWindow.lastStateVersion = candidate.stateVersion;
@@ -300,8 +349,10 @@ export class OpportunityWindowTracker {
     window.closedAt = closedAt;
     window.closedAtSlot = closedAtSlot;
     window.closedAtMonotonic = closedAtMonotonic;
+    window.observedDurationMs = Math.max(0, Math.round(window.lastObservedMonotonic - window.firstObservedMonotonic));
+    window.closureIntervalMs = Math.max(0, Math.round(closedAtMonotonic - window.lastObservedMonotonic));
     window.durationUpperBoundMs = Math.max(0, Math.round(closedAtMonotonic - window.firstObservedMonotonic));
-    window.durationLowerBoundMs = Math.max(0, Math.round(window.lastObservedMonotonic - window.firstObservedMonotonic));
+    window.durationLowerBoundMs = window.observedDurationMs;
     window.netProfitClosingUSDC = closingNet;
 
     if (window.revalidationStatus === 'UNCHECKED' && reason === WindowClosureReason.REVALIDATION_FAILURE) {
@@ -346,6 +397,9 @@ export class OpportunityWindowTracker {
     this.lastFeedHealthy = false;
     const monotonicNow = typeof performance !== 'undefined' ? performance.now() : now;
 
+    const hourIdx = Math.min(23, Math.max(0, Math.floor((now - this.startedAt) / 3600000)));
+    this.hourlyDisconnectCount[hourIdx] = (this.hourlyDisconnectCount[hourIdx] || 0) + 1;
+
     for (const [key, window] of this.openWindows.entries()) {
       this.closeWindow(
         window,
@@ -368,10 +422,11 @@ export class OpportunityWindowTracker {
   }
 
   /**
-   * Track healthy uptime vs feed downtime.
+   * Track healthy uptime vs feed downtime and record hourly allocations.
    */
   public updateFeedUptime(isWsConnected: boolean, isRpcActive: boolean, now = Date.now()): void {
     const delta = Math.max(0, now - this.lastUptimeCheck);
+    const prev = this.lastUptimeCheck;
     this.lastUptimeCheck = now;
 
     const isHealthy = isWsConnected && isRpcActive;
@@ -381,6 +436,24 @@ export class OpportunityWindowTracker {
       this.feedDowntimeMs += delta;
     }
     this.lastFeedHealthy = isHealthy;
+
+    // Distribute delta across hourly buckets from prev to now
+    let t = prev;
+    while (t < now) {
+      const relMs = Math.max(0, t - this.startedAt);
+      const hourIdx = Math.min(23, Math.floor(relMs / 3600000));
+      const nextHourStart = this.startedAt + (hourIdx + 1) * 3600000;
+      const chunkEnd = Math.min(now, nextHourStart);
+      const chunk = Math.max(0, chunkEnd - t);
+
+      if (isHealthy) {
+        this.hourlyUptimeMs[hourIdx] = (this.hourlyUptimeMs[hourIdx] || 0) + chunk;
+      } else {
+        this.hourlyDowntimeMs[hourIdx] = (this.hourlyDowntimeMs[hourIdx] || 0) + chunk;
+      }
+      t = chunkEnd;
+      if (t >= nextHourStart && hourIdx >= 23) break;
+    }
   }
 
   /**
@@ -484,6 +557,116 @@ export class OpportunityWindowTracker {
   }
 
   /**
+   * Compute 24-hour hourly profitability metrics across all 24 study hours.
+   */
+  public getHourlyProfitabilityBuckets(now = Date.now()): HourlyProfitabilityBucket[] {
+    const allWindows = [...this.openWindows.values(), ...this.closedWindows];
+    const buckets: HourlyProfitabilityBucket[] = [];
+
+    for (let h = 0; h < 24; h++) {
+      const hourStartMs = this.startedAt + h * 3600000;
+      const hourEndMs = hourStartMs + 3600000;
+      const hourStartUtc = new Date(hourStartMs).toISOString();
+      const hourStartQatar = formatQatarTime(hourStartMs, true);
+      const startQatar = formatQatarHour(hourStartMs);
+      const endQatar = formatQatarHour(hourEndMs);
+      const hourLabel = `Hour ${h} (${startQatar})`;
+      const timeRangeQatar = `${startQatar} - ${endQatar}`;
+
+      const uMs = this.hourlyUptimeMs[h] || 0;
+      const dMs = this.hourlyDowntimeMs[h] || 0;
+      const disc = this.hourlyDisconnectCount[h] || 0;
+      const totalTracked = uMs + dMs;
+
+      let healthyCoveragePct = 100.0;
+      if (totalTracked > 0) {
+        healthyCoveragePct = Number(((uMs / totalTracked) * 100).toFixed(1));
+      } else if (dMs > 0) {
+        healthyCoveragePct = 0.0;
+      } else {
+        healthyCoveragePct = 100.0;
+      }
+
+      // Collect windows active in this hour (opened during this hour)
+      const windowsInHour = allWindows.filter(w => w.firstObservedAt >= hourStartMs && w.firstObservedAt < hourEndMs);
+      const uniqueWindowsCount = windowsInHour.length;
+      const bestConservativeNetUSDC = windowsInHour.reduce((max, w) => Math.max(max, w.netProfitPeakUSDC), 0.0);
+
+      // Median observed duration strictly from closed windows in this hour
+      const closedInHour = windowsInHour.filter(w => w.status === 'CLOSED');
+      const durations = closedInHour.map(w => w.observedDurationMs).sort((a, b) => a - b);
+      const medianObservedDurationMs = durations.length > 0 ? durations[Math.floor(durations.length / 2)] : 0;
+
+      // Revalidation success rate
+      const survived = windowsInHour.filter(w => w.revalidationStatus === 'SURVIVED').length;
+      const decayed = windowsInHour.filter(w => w.revalidationStatus === 'DECAYED').length;
+      const totalReval = survived + decayed;
+      const revalidationSuccessPct = totalReval > 0 ? Number(((survived / totalReval) * 100).toFixed(1)) : 100.0;
+
+      let status: HourlyProfitabilityBucket['status'] = 'FUTURE';
+      if (now < hourStartMs) {
+        status = 'FUTURE';
+      } else if (totalTracked > 0 && uMs === 0) {
+        status = 'FEED_DISCONNECTED';
+      } else if (dMs > 0 && healthyCoveragePct < 50.0) {
+        status = 'COVERAGE_DEGRADED';
+      } else if (uniqueWindowsCount === 0) {
+        status = 'NO_OPPORTUNITIES_VERIFIED';
+      } else {
+        status = 'ACTIVE_OBSERVED';
+      }
+
+      buckets.push({
+        hourIndex: h,
+        hourStartUtc,
+        hourStartQatar,
+        hourLabel,
+        timeRangeQatar,
+        uniqueWindowsCount,
+        bestConservativeNetUSDC,
+        medianObservedDurationMs,
+        revalidationSuccessPct,
+        healthyCoveragePct,
+        healthyUptimeMs: uMs,
+        feedDowntimeMs: dMs,
+        disconnectCount: disc,
+        status
+      });
+    }
+
+    return buckets;
+  }
+
+  /**
+   * Identify the most active profitable hours based strictly on verified observations.
+   * Disconnected periods are excluded from zero-opportunity conclusions.
+   */
+  public getMostActiveHours(now = Date.now()): MostActiveHourSummary[] {
+    const buckets = this.getHourlyProfitabilityBuckets(now);
+    // Filter to hours with active observed opportunities and healthy monitoring
+    const verifiedBuckets = buckets.filter(b => b.status === 'ACTIVE_OBSERVED' && b.uniqueWindowsCount > 0);
+
+    verifiedBuckets.sort((a, b) => {
+      if (b.uniqueWindowsCount !== a.uniqueWindowsCount) {
+        return b.uniqueWindowsCount - a.uniqueWindowsCount;
+      }
+      return b.bestConservativeNetUSDC - a.bestConservativeNetUSDC;
+    });
+
+    return verifiedBuckets.map((b, idx) => ({
+      rank: idx + 1,
+      hourIndex: b.hourIndex,
+      hourLabel: b.hourLabel,
+      timeRangeQatar: b.timeRangeQatar,
+      uniqueWindowsCount: b.uniqueWindowsCount,
+      bestConservativeNetUSDC: b.bestConservativeNetUSDC,
+      medianObservedDurationMs: b.medianObservedDurationMs,
+      healthyCoveragePct: b.healthyCoveragePct,
+      status: b.status
+    }));
+  }
+
+  /**
    * Generate telemetry payload for HUD and reporting.
    */
   public getTelemetry(now = Date.now()): StudyTelemetry {
@@ -531,7 +714,9 @@ export class OpportunityWindowTracker {
       totalObservedShadowOpportunities: this.totalObservedShadowOpportunities,
       liveWindows,
       closedWindows: recentClosed,
-      nearMissesCount: this.nearMisses.length
+      nearMissesCount: this.nearMisses.length,
+      hourlyBuckets: this.getHourlyProfitabilityBuckets(now),
+      mostActiveHours: this.getMostActiveHours(now)
     };
   }
 
@@ -571,7 +756,6 @@ export class OpportunityWindowTracker {
   }
 
   private extractTokenSymbol(routeName: string, tokenMint: string): string {
-    // Route names typically look like: "SOL (Raydium -> Orca)" or "USDC -> JUP -> USDC"
     const match = routeName.match(/^([A-Za-z0-9_]+)\s*(\(|$)/);
     if (match && match[1] && match[1] !== 'USDC') {
       return match[1];

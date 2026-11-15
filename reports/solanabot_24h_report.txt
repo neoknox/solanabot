@@ -1,24 +1,28 @@
 ================================================================================
 SOLANABOT - 24-HOUR PROFITABILITY & OPPORTUNITY WINDOW STUDY REPORT
 ================================================================================
-Generated At: 2026-11-15T17:49:56.989Z
-Session ID:   study_24h_1794764965012
-Study Status: COMPLETED
+Generated At (UTC):   2026-11-15T18:16:55.854Z
+Generated At (AST):   2026-11-15 21:16:55.854 AST
+Session ID:           study_24h_1794766569433
+Study Status:         COMPLETED
+Session Started (UTC): 2026-11-15T18:16:09.551Z
+Session Started (AST): 2026-11-15 21:16:09.551 AST
+Timezone Standard:    Asia/Qatar (UTC+3 / AST)
 
 ================================================================================
 SECTION A: SCAN COVERAGE & OPERATIONAL HEALTH
 ================================================================================
 Target Duration:             24:00:00 (86,400,000 ms)
-Elapsed Scanning Time:       00:00:31 (0.01 hours)
+Elapsed Scanning Time:       00:00:46 (0.01 hours)
 Healthy Scanning Uptime:     00:00:00 (0.00%)
-Feed Downtime:               00:00:30
-WebSocket Disconnects:       2
+Feed Downtime:               00:00:46
+WebSocket Disconnects:       3
 Data Integrity:              Fail-closed on stale dependencies, no unobserved gap assumptions.
 
 ================================================================================
 SECTION B: ROUTE DISCOVERY & OPPORTUNITY FUNNEL
 ================================================================================
-Candidate Evaluations:       217
+Candidate Evaluations:       0
 Qualified 2-Leg Windows:     0
 Completed Market Windows:    0
 Censored / Interrupted:      0
@@ -51,6 +55,45 @@ Duration Breakdown:
 
 Window Closure Reasons:
   None observed.
+
+================================================================================
+SECTION D.2: 24-HOUR HOURLY PROFITABILITY BREAKDOWN (ASIA/QATAR - AST)
+================================================================================
+Hour    Time Range (AST)      Windows  Best Net (USDC)  Median Dur   Reval %  Coverage %  Status
+------  --------------------  -------  ---------------  -----------  -------  ----------  -------------------------
+Hour 0  21:16 AST - 22:16 AST        0          $0.0000           --   100.0%        0.0%  FEED_DISCONNECTED
+Hour 1  22:16 AST - 23:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 2  23:16 AST - 00:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 3  00:16 AST - 01:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 4  01:16 AST - 02:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 5  02:16 AST - 03:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 6  03:16 AST - 04:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 7  04:16 AST - 05:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 8  05:16 AST - 06:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 9  06:16 AST - 07:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 10  07:16 AST - 08:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 11  08:16 AST - 09:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 12  09:16 AST - 10:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 13  10:16 AST - 11:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 14  11:16 AST - 12:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 15  12:16 AST - 13:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 16  13:16 AST - 14:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 17  14:16 AST - 15:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 18  15:16 AST - 16:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 19  16:16 AST - 17:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 20  17:16 AST - 18:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 21  18:16 AST - 19:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 22  19:16 AST - 20:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+Hour 23  20:16 AST - 21:16 AST        0          $0.0000           --   100.0%      100.0%  FUTURE
+
+Data Integrity Note: Disconnected or degraded monitoring intervals are explicitly
+classified as FEED_DISCONNECTED or COVERAGE_DEGRADED. Solanabot never assumes
+zero market opportunities during unmonitored intervals.
+
+================================================================================
+SECTION D.3: MOST ACTIVE PROFITABLE HOURS (VERIFIED OBSERVATIONS ONLY)
+================================================================================
+No hours met the active observed threshold with >=50% healthy coverage.
 
 ================================================================================
 SECTION E: TOP MOST PROFITABLE OPPORTUNITY WINDOWS

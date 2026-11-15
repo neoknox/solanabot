@@ -194,6 +194,8 @@ export function initDatabase(config: AppConfig): Database.Database {
       closed_at_slot INTEGER,
       duration_lower_bound_ms INTEGER NOT NULL,
       duration_upper_bound_ms INTEGER,
+      observed_duration_ms INTEGER DEFAULT 0,
+      closure_interval_ms INTEGER DEFAULT 0,
       net_profit_opening_usdc REAL NOT NULL,
       net_profit_peak_usdc REAL NOT NULL,
       net_profit_min_usdc REAL NOT NULL,
@@ -231,6 +233,17 @@ export function initDatabase(config: AppConfig): Database.Database {
   if (!auditColNames.has('inter_dex_evaluated')) db.exec("ALTER TABLE audit_metrics ADD COLUMN inter_dex_evaluated INTEGER DEFAULT 0");
   if (!auditColNames.has('competitor_txs_analyzed')) db.exec("ALTER TABLE audit_metrics ADD COLUMN competitor_txs_analyzed INTEGER DEFAULT 0");
   if (!auditColNames.has('average_competition_score')) db.exec("ALTER TABLE audit_metrics ADD COLUMN average_competition_score REAL DEFAULT 0");
+
+  try {
+    const windowColumns = db.prepare("PRAGMA table_info(opportunity_windows)").all() as Array<{ name: string }>;
+    const winColNames = new Set(windowColumns.map(c => c.name));
+    if (!winColNames.has('observed_duration_ms')) {
+      try { db.exec("ALTER TABLE opportunity_windows ADD COLUMN observed_duration_ms INTEGER DEFAULT 0"); } catch {}
+    }
+    if (!winColNames.has('closure_interval_ms')) {
+      try { db.exec("ALTER TABLE opportunity_windows ADD COLUMN closure_interval_ms INTEGER DEFAULT 0"); } catch {}
+    }
+  } catch {}
 
   // Create indexes after ensuring columns exist
   db.exec(`
