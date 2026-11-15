@@ -26,6 +26,14 @@ export type WsConnectionState = 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED' | 
 export interface WsStats {
   connected: boolean;
   reconnectCount: number;
+  sessionTotalDisconnects?: number;
+  sessionTotalReconnectAttempts?: number;
+  sessionTotalReconnectSuccesses?: number;
+  lastDisconnectCode?: number | null;
+  lastDisconnectReason?: string | null;
+  lastDisconnectTime?: number;
+  lastReconnectResult?: 'SUCCESS' | 'FAILED' | 'PENDING' | 'NONE';
+  healthyFeedAgeMs?: number;
   lastSlot: number;
   lastMessageTime: number;
   subscriptionCount: number;
@@ -56,9 +64,23 @@ export class SolanaWsProvider {
   private backoffMaxMs = 30000;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  private pacingTimer: NodeJS.Timeout | null = null;
+  private subscriptionQueue: string[] = [];
   private socketGeneration = 0;
   private stage: WsConnectionStage = 'STANDBY';
   private lastError: string | null = null;
+
+  // Session-wide lifetime diagnostic counters (NEVER reset on reconnect success)
+  private sessionStartTime = Date.now();
+  private sessionTotalDisconnects = 0;
+  private sessionTotalReconnectAttempts = 0;
+  private sessionTotalReconnectSuccesses = 0;
+  private lastDisconnectCode: number | null = null;
+  private lastDisconnectReason: string | null = null;
+  private lastDisconnectTime = 0;
+  private lastReconnectResult: 'SUCCESS' | 'FAILED' | 'PENDING' | 'NONE' = 'NONE';
+  private lastHealthyFeedTime = 0;
+  private disconnectedGenerations = new Set<number>();
 
   private currentSlot = 0;
   private lastMessageTime = 0;
@@ -83,9 +105,15 @@ export class SolanaWsProvider {
   private onReconnectCallbacks: Array<() => void | Promise<void>> = [];
   private onDisconnectCallbacks: Array<() => void> = [];
   private onSlotCallbacks: Array<SlotUpdateHandler> = [];
+  private maxSubscriptions: number;
 
   constructor(config: AppConfig) {
     this.config = config;
+    this.maxSubscriptions = (config as any).MAX_WS_SUBSCRIPTIONS ?? 25;
+  }
+
+  public canSubscribeMore(): boolean {
+    return this.maxSubscriptions === 0 || this.accountSubscriptions.size < this.maxSubscriptions;
   }
 
   public connect(timeoutMs = 8000): Promise<boolean> {
@@ -111,9 +139,11 @@ export class SolanaWsProvider {
         timer = setTimeout(() => {
           if (!isSettled) {
             if (this.socketGeneration === currentGen) {
-              this.lastError = `Connection timeout (${timeoutMs}ms) exceeded`;
+              const timeoutReason = `Connection handshake timeout (${timeoutMs}ms) exceeded`;
+              this.lastError = timeoutReason;
+              this.lastReconnectResult = 'FAILED';
               try { this.ws?.terminate(); } catch {}
-              this.handleDisconnect();
+              this.handleDisconnect(currentGen, timeoutReason, undefined, false);
             }
             finish(false);
           }
@@ -137,8 +167,13 @@ export class SolanaWsProvider {
           this.reconnectAttempts = 0;
           this.lastManualAttemptFailed = false;
           this.lastMessageTime = Date.now();
+          this.lastHealthyFeedTime = Date.now();
+          this.lastReconnectResult = 'SUCCESS';
           this.lastError = null;
           this.stage = 'CONNECTED';
+          if (this.hasConnectedOnce || this.isReconnectingInProgress) {
+            this.sessionTotalReconnectSuccesses++;
+          }
 
           // 1. Resolve connect promise immediately once transport is open
           finish(true);
@@ -171,7 +206,14 @@ export class SolanaWsProvider {
         this.ws.on('message', (data: WebSocket.RawData) => {
           if (this.socketGeneration !== currentGen) return;
           this.lastMessageTime = Date.now();
+          this.lastHealthyFeedTime = Date.now();
           this.handleMessage(data.toString());
+        });
+
+        this.ws.on('pong', () => {
+          if (this.socketGeneration !== currentGen) return;
+          this.lastMessageTime = Date.now();
+          this.lastHealthyFeedTime = Date.now();
         });
 
         this.ws.on('error', (err) => {
@@ -181,28 +223,51 @@ export class SolanaWsProvider {
           console.warn(`[SolanaWsProvider] WebSocket error: ${errMsg}`);
         });
 
-        this.ws.on('close', () => {
+        this.ws.on('close', (code: number, reasonBuf: Buffer) => {
           if (this.socketGeneration !== currentGen) return;
+          const reasonStr = reasonBuf ? reasonBuf.toString('utf8') : '';
+          const codeMeaning = this.getCloseCodeMeaning(code);
+          const fullReason = `WS Closed [code=${code} (${codeMeaning})]${reasonStr ? ': ' + reasonStr : ''}`;
           this.stage = 'DISCONNECTED';
-          this.handleDisconnect();
+          this.lastError = fullReason;
+          console.warn(`[SolanaWsProvider] ${fullReason}`);
+          this.handleDisconnect(currentGen, fullReason, code, false);
           finish(false);
         });
       } catch (err: any) {
         if (this.socketGeneration === currentGen) {
-          this.lastError = err?.message || String(err);
+          const errReason = err?.message || String(err);
+          this.lastError = errReason;
           this.stage = 'DISCONNECTED';
-          this.handleDisconnect();
+          this.handleDisconnect(currentGen, errReason, undefined, false);
         }
         finish(false);
       }
     });
   }
 
-  private handleDisconnect(isManual = false): void {
+  private handleDisconnect(gen: number, reason = 'Connection closed', code?: number, isManual = false): void {
+    if (this.disconnectedGenerations.has(gen)) {
+      return;
+    }
+    this.disconnectedGenerations.add(gen);
+
+    this.sessionTotalDisconnects++;
+    this.lastDisconnectTime = Date.now();
+    this.lastDisconnectCode = code ?? null;
+    this.lastDisconnectReason = reason;
+
     if (this.disconnectStartTime === 0) {
       this.disconnectStartTime = Date.now();
       this.downtimeEventsCount++;
     }
+
+    if (this.pacingTimer) {
+      clearInterval(this.pacingTimer);
+      this.pacingTimer = null;
+    }
+    this.subscriptionQueue = [];
+
     this.slotSubId = null;
     this.subIdToPubkey.clear();
     this.reqIdToPubkey.clear();
@@ -222,18 +287,30 @@ export class SolanaWsProvider {
   }
 
   private scheduleAutoReconnect(): void {
-    if (!this.isExplicitlyClosed && !this.isReconnectingInProgress && this.reconnectAttempts < this.maxReconnectAttempts) {
-      const delay = Math.min(
-        this.backoffBaseMs * Math.pow(1.5, this.reconnectAttempts) + Math.random() * 500,
-        this.backoffMaxMs
-      );
-      this.reconnectAttempts++;
-      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = setTimeout(() => {
-        this.connect();
-      }, delay);
-      this.reconnectTimer.unref();
+    if (this.isExplicitlyClosed || this.isReconnectingInProgress) return;
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.stage = 'FAILED';
+      this.lastReconnectResult = 'FAILED';
+      return;
     }
+    this.sessionTotalReconnectAttempts++;
+    this.lastReconnectResult = 'PENDING';
+    const delay = Math.min(
+      this.backoffBaseMs * Math.pow(1.5, this.reconnectAttempts) + Math.random() * 500,
+      this.backoffMaxMs
+    );
+    this.reconnectAttempts++;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.isExplicitlyClosed && !this.isReconnectingInProgress) {
+        this.connect();
+      }
+    }, delay);
+    this.reconnectTimer.unref();
   }
 
   public async manualReconnect(timeoutMs = 8000): Promise<boolean> {
@@ -247,6 +324,8 @@ export class SolanaWsProvider {
     this.isReconnectingInProgress = true;
     this.stage = 'RECONNECTING';
     this.lastManualAttemptFailed = false;
+    this.sessionTotalReconnectAttempts++;
+    this.lastReconnectResult = 'PENDING';
 
     this.activeReconnectPromise = (async () => {
       try {
@@ -260,12 +339,13 @@ export class SolanaWsProvider {
         if (this.ws) {
           const oldWs = this.ws;
           this.ws = null;
+          const oldGen = this.socketGeneration;
           this.socketGeneration++;
           oldWs.removeAllListeners();
           try {
             oldWs.terminate();
           } catch {}
-          this.handleDisconnect(true);
+          this.handleDisconnect(oldGen, 'Manual reconnect requested', undefined, true);
         }
 
         // 3. Reset reconnect attempts & mark not explicitly closed
@@ -355,11 +435,61 @@ export class SolanaWsProvider {
     }));
   }
 
-  public subscribeAccount(pubkey: string, handler: AccountUpdateHandler): void {
-    this.accountSubscriptions.set(pubkey, { handler });
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+  public subscribeAccount(pubkey: string, handler: AccountUpdateHandler): boolean {
+    if (!this.accountSubscriptions.has(pubkey)) {
+      if (this.maxSubscriptions > 0 && this.accountSubscriptions.size >= this.maxSubscriptions) {
+        return false;
+      }
+      this.accountSubscriptions.set(pubkey, { handler });
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.enqueueAccountSubscribe(pubkey);
+      }
+      return true;
+    }
+    this.accountSubscriptions.set(pubkey, { ...this.accountSubscriptions.get(pubkey)!, handler });
+    return true;
+  }
+
+  private enqueueAccountSubscribe(pubkey: string): void {
+    if (!this.subscriptionQueue.includes(pubkey)) {
+      this.subscriptionQueue.push(pubkey);
+    }
+    this.drainSubscriptionQueue(this.socketGeneration);
+  }
+
+  private drainSubscriptionQueue(gen: number): void {
+    if (this.pacingTimer) return;
+    if (this.socketGeneration !== gen || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    // Send first bounded batch (up to 10) immediately
+    const immediate = this.subscriptionQueue.splice(0, 10);
+    for (const pubkey of immediate) {
       this.sendAccountSubscribe(pubkey);
     }
+
+    if (this.subscriptionQueue.length === 0) return;
+
+    // Pace remaining subscriptions in batches of up to 15 every 100ms
+    this.pacingTimer = setInterval(() => {
+      if (this.socketGeneration !== gen || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        if (this.pacingTimer) {
+          clearInterval(this.pacingTimer);
+          this.pacingTimer = null;
+        }
+        return;
+      }
+      const chunk = this.subscriptionQueue.splice(0, 15);
+      for (const pubkey of chunk) {
+        this.sendAccountSubscribe(pubkey);
+      }
+      if (this.subscriptionQueue.length === 0) {
+        if (this.pacingTimer) {
+          clearInterval(this.pacingTimer);
+          this.pacingTimer = null;
+        }
+      }
+    }, 100);
+    this.pacingTimer.unref();
   }
 
   private sendAccountSubscribe(pubkey: string): void {
@@ -380,36 +510,37 @@ export class SolanaWsProvider {
     }));
   }
 
+  private getCloseCodeMeaning(code: number): string {
+    switch (code) {
+      case 1000: return 'Normal Closure';
+      case 1001: return 'Going Away (Server restart/shutdown)';
+      case 1002: return 'Protocol Error';
+      case 1003: return 'Unsupported Data';
+      case 1005: return 'No Status Received';
+      case 1006: return 'Abnormal Closure (TCP drop / reset without close frame)';
+      case 1007: return 'Invalid Frame Payload Data';
+      case 1008: return 'Policy Violation (Rate limit / quota exceeded)';
+      case 1009: return 'Message Too Big';
+      case 1011: return 'Internal Server Error';
+      case 1012: return 'Service Restart';
+      case 1013: return 'Try Again Later';
+      case 1015: return 'TLS Handshake Failure';
+      default: return `Code ${code}`;
+    }
+  }
+
   private resubscribeAccountsPaced(gen: number): void {
+    if (this.pacingTimer) {
+      clearInterval(this.pacingTimer);
+      this.pacingTimer = null;
+    }
+    this.subscriptionQueue = [];
+    this.subscriptionQueue = [];
     const pubkeys = Array.from(this.accountSubscriptions.keys());
     if (pubkeys.length === 0) return;
 
-    // Send first batch of up to 10 immediately
-    const immediate = pubkeys.slice(0, 10);
-    for (const pubkey of immediate) {
-      if (this.socketGeneration !== gen || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-      this.sendAccountSubscribe(pubkey);
-    }
-
-    if (pubkeys.length <= 10) return;
-
-    // Pace remaining subscriptions in batches of 10 every 50ms to prevent RPC socket drops
-    let index = 10;
-    const interval = setInterval(() => {
-      if (this.socketGeneration !== gen || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        clearInterval(interval);
-        return;
-      }
-      const chunk = pubkeys.slice(index, index + 10);
-      for (const pubkey of chunk) {
-        this.sendAccountSubscribe(pubkey);
-      }
-      index += 10;
-      if (index >= pubkeys.length) {
-        clearInterval(interval);
-      }
-    }, 50);
-    interval.unref();
+    this.subscriptionQueue = [...pubkeys];
+    this.drainSubscriptionQueue(gen);
   }
 
   private resubscribeAccounts(): void {
@@ -499,12 +630,22 @@ export class SolanaWsProvider {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       const now = Date.now();
-      if (now - this.lastMessageTime > 20000 && this.ws && this.ws.readyState === WebSocket.OPEN) {
-        // Feed is stalled; terminate to trigger clean reconnection
-        console.warn('[SolanaWsProvider] Feed stalled >20s without messages. Terminating socket for recovery.');
-        this.ws.terminate();
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      const silentMs = now - this.lastMessageTime;
+      if (silentMs > 8000) {
+        // Send WebSocket ping frame if connection has been quiet
+        try {
+          this.ws.ping();
+        } catch {}
       }
-    }, 5000);
+      if (silentMs > 20000) {
+        // Feed is stalled >20s; terminate to trigger clean reconnection
+        const stallReason = `Feed stalled >20s without messages (${silentMs}ms silent)`;
+        console.warn(`[SolanaWsProvider] ${stallReason}. Terminating socket for recovery.`);
+        this.lastError = stallReason;
+        try { this.ws.terminate(); } catch {}
+      }
+    }, 4000);
     this.heartbeatTimer.unref();
   }
 
@@ -534,6 +675,7 @@ export class SolanaWsProvider {
   public setSlot(slot: number): void {
     this.currentSlot = slot;
     this.lastMessageTime = Date.now();
+    this.lastHealthyFeedTime = Date.now();
   }
 
   public getHealth(): FeedHealth {
@@ -552,12 +694,22 @@ export class SolanaWsProvider {
 
   public getStats(): WsStats {
     const confirmedCount = Array.from(this.accountSubscriptions.values()).filter(s => s.id !== undefined).length;
+    const now = Date.now();
+    const healthyFeedAgeMs = this.lastHealthyFeedTime > 0 ? now - this.lastHealthyFeedTime : now - this.sessionStartTime;
     return {
       connected: this.ws !== null && this.ws.readyState === WebSocket.OPEN,
       connectionState: this.getConnectionState(),
       connectionStage: this.getConnectionStage(),
       isReconnecting: this.isReconnectingInProgress,
-      reconnectCount: this.reconnectAttempts,
+      reconnectCount: this.sessionTotalReconnectAttempts,
+      sessionTotalDisconnects: this.sessionTotalDisconnects,
+      sessionTotalReconnectAttempts: this.sessionTotalReconnectAttempts,
+      sessionTotalReconnectSuccesses: this.sessionTotalReconnectSuccesses,
+      lastDisconnectCode: this.lastDisconnectCode,
+      lastDisconnectReason: this.lastDisconnectReason,
+      lastDisconnectTime: this.lastDisconnectTime,
+      lastReconnectResult: this.lastReconnectResult,
+      healthyFeedAgeMs,
       lastSlot: this.currentSlot,
       lastMessageTime: this.lastMessageTime,
       subscriptionCount: this.accountSubscriptions.size,
@@ -578,6 +730,11 @@ export class SolanaWsProvider {
     this.isReconnectingInProgress = false;
     this.lastManualAttemptFailed = false;
     this.stopHeartbeat();
+    if (this.pacingTimer) {
+      clearInterval(this.pacingTimer);
+      this.pacingTimer = null;
+    }
+    this.subscriptionQueue = [];
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

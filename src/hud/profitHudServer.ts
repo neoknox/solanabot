@@ -263,6 +263,7 @@ export class ProfitHudServer {
         status: 'STANDBY',
         startedAt: Date.now(),
         targetDurationMs: 86400000,
+        profitHurdleUSDC: 0.10,
         elapsedMs: 0,
         healthyUptimeMs: 0,
         feedDowntimeMs: 0,
@@ -271,7 +272,7 @@ export class ProfitHudServer {
         openQualifiedWindows: 0,
         completedQualifiedWindows: 0,
         censoredWindows: 0,
-        revalidationSuccessPct: 100,
+        revalidationSuccessPct: null,
         minDurationMs: 0,
         medianDurationMs: 0,
         p95DurationMs: 0,
@@ -296,12 +297,12 @@ export class ProfitHudServer {
               uniqueWindowsCount: 0,
               bestConservativeNetUSDC: 0,
               medianObservedDurationMs: 0,
-              revalidationSuccessPct: 100,
-              healthyCoveragePct: 100,
+              revalidationSuccessPct: null,
+              healthyCoveragePct: null,
               healthyUptimeMs: 0,
               feedDowntimeMs: 0,
               disconnectCount: 0,
-              status: h === 0 ? 'NO_OPPORTUNITIES_VERIFIED' : 'FUTURE'
+              status: 'FUTURE'
             });
           }
           return buckets;
@@ -1421,7 +1422,7 @@ export class ProfitHudServer {
           </div>
         </div>
         <div style="text-align: right; font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);">
-          Session: <strong id="studySessionId" style="color:var(--text-bright);">STANDBY</strong>
+          Session: <strong id="studySessionId" style="color:var(--text-bright);">STANDBY</strong> &bull; Hurdle: <strong id="studyHurdle" style="color:var(--green);">$0.10 USDC</strong>
         </div>
       </div>
 
@@ -2020,6 +2021,7 @@ export class ProfitHudServer {
       const studyStatusBadge = document.getElementById('studyStatusBadge');
       const studyStatusDot = document.getElementById('studyStatusDot');
       const studySessionId = document.getElementById('studySessionId');
+      const studyHurdle = document.getElementById('studyHurdle');
       const studyElapsed = document.getElementById('studyElapsed');
       const studyHealthyUptime = document.getElementById('studyHealthyUptime');
       const studyDowntime = document.getElementById('studyDowntime');
@@ -2312,10 +2314,11 @@ export class ProfitHudServer {
         if (studyHealthyUptime) studyHealthyUptime.textContent = formatDurationMs(study.healthyUptimeMs) + ' (' + healthyPct + '%)';
 
         const drops = study.disconnectCount || 0;
+        if (studyHurdle) studyHurdle.textContent = '$' + (study.profitHurdleUSDC !== undefined ? Number(study.profitHurdleUSDC).toFixed(2) : '0.10') + ' USDC';
         if (studyDowntime) studyDowntime.textContent = formatDurationMs(study.feedDowntimeMs) + ' (' + drops + ' drops)';
 
         if (studyQualifiedWindows) studyQualifiedWindows.textContent = formatNumber(study.totalQualifiedWindows || 0);
-        if (studyRevalRate) studyRevalRate.textContent = (study.revalidationSuccessPct !== undefined ? study.revalidationSuccessPct.toFixed(1) : '100.0') + '%';
+        if (studyRevalRate) studyRevalRate.textContent = (study.revalidationSuccessPct !== null && study.revalidationSuccessPct !== undefined) ? study.revalidationSuccessPct.toFixed(1) + '%' : 'N/A';
 
         if (studyDurationMedP95) studyDurationMedP95.textContent = formatMs(study.medianDurationMs) + ' / ' + formatMs(study.p95DurationMs);
         if (studyDurationMinMax) studyDurationMinMax.textContent = formatMs(study.minDurationMs) + ' / ' + formatMs(study.maxDurationMs);
@@ -2344,7 +2347,8 @@ export class ProfitHudServer {
               barColor = '#141b29';
               barHeight = 4;
             }
-            const tip = b.hourLabel + ' (' + b.timeRangeQatar + ') | Windows: ' + b.uniqueWindowsCount + ' | Best Net: $' + b.bestConservativeNetUSDC.toFixed(4) + ' | Coverage: ' + b.healthyCoveragePct.toFixed(1) + '% | Status: ' + b.status;
+            const covTip = (b.healthyCoveragePct !== null && b.healthyCoveragePct !== undefined) ? b.healthyCoveragePct.toFixed(1) + '%' : 'Pending';
+            const tip = b.hourLabel + ' (' + b.timeRangeQatar + ') | Windows: ' + b.uniqueWindowsCount + ' | Best Net: $' + b.bestConservativeNetUSDC.toFixed(4) + ' | Coverage: ' + covTip + ' | Status: ' + b.status;
             chartHtml += '<div style="flex:1; display:flex; flex-direction:column; align-items:center; height:100%; justify-content:flex-end;" title="' + tip + '">';
             chartHtml += '<div style="width:100%; max-width:24px; height:' + barHeight + 'px; background:' + barColor + '; border-radius:2px 2px 0 0; transition:height 0.3s;"></div>';
             chartHtml += '</div>';
@@ -2373,7 +2377,11 @@ export class ProfitHudServer {
 
               const bestNetStr = b.uniqueWindowsCount > 0 ? formatUsdc(b.bestConservativeNetUSDC, true) : '$0.0000';
               const medDurStr = b.uniqueWindowsCount > 0 ? formatMs(b.medianObservedDurationMs) : '--';
-              const covColor = b.healthyCoveragePct >= 95 ? 'var(--green)' : (b.healthyCoveragePct >= 50 ? 'var(--amber)' : 'var(--red)');
+              const covColor = b.healthyCoveragePct !== null
+                ? (b.healthyCoveragePct >= 95 ? 'var(--green)' : (b.healthyCoveragePct >= 50 ? 'var(--amber)' : 'var(--red)'))
+                : 'var(--text-muted)';
+              const covText = (b.healthyCoveragePct !== null && b.healthyCoveragePct !== undefined) ? b.healthyCoveragePct.toFixed(1) + '%' : 'Pending';
+              const revalText = (b.revalidationSuccessPct !== null && b.revalidationSuccessPct !== undefined) ? b.revalidationSuccessPct.toFixed(1) + '%' : 'N/A';
 
               tHtml += '<tr>';
               tHtml += '<td style="font-weight:700; color:var(--text-bright); font-family:var(--font-mono);">' + b.hourLabel + '</td>';
@@ -2381,8 +2389,8 @@ export class ProfitHudServer {
               tHtml += '<td style="font-weight:700; color:' + (b.uniqueWindowsCount > 0 ? 'var(--green)' : 'var(--text-muted)') + ';">' + b.uniqueWindowsCount + '</td>';
               tHtml += '<td style="color:' + (b.bestConservativeNetUSDC > 0 ? 'var(--green)' : 'var(--text-muted)') + ';">' + bestNetStr + '</td>';
               tHtml += '<td style="font-family:var(--font-mono);">' + medDurStr + '</td>';
-              tHtml += '<td>' + b.revalidationSuccessPct.toFixed(1) + '%</td>';
-              tHtml += '<td style="font-weight:700; color:' + covColor + ';">' + b.healthyCoveragePct.toFixed(1) + '%</td>';
+              tHtml += '<td>' + revalText + '</td>';
+              tHtml += '<td style="font-weight:700; color:' + covColor + ';">' + covText + '</td>';
               tHtml += '<td>' + statusBadge + '</td>';
               tHtml += '</tr>';
             });
@@ -2397,6 +2405,7 @@ export class ProfitHudServer {
           } else {
             let aHtml = '';
             study.mostActiveHours.forEach(function(a) {
+              const aCovText = (a.healthyCoveragePct !== null && a.healthyCoveragePct !== undefined) ? a.healthyCoveragePct.toFixed(1) + '%' : 'N/A';
               aHtml += '<tr>';
               aHtml += '<td style="font-weight:800; color:var(--amber);">#' + a.rank + '</td>';
               aHtml += '<td style="font-weight:700; color:var(--text-bright); font-family:var(--font-mono);">' + a.hourLabel + '</td>';
@@ -2404,7 +2413,7 @@ export class ProfitHudServer {
               aHtml += '<td style="font-weight:700; color:var(--green);">' + a.uniqueWindowsCount + '</td>';
               aHtml += '<td style="font-weight:700; color:var(--green);">' + formatUsdc(a.bestConservativeNetUSDC, true) + '</td>';
               aHtml += '<td style="font-family:var(--font-mono);">' + formatMs(a.medianObservedDurationMs) + '</td>';
-              aHtml += '<td style="color:var(--green); font-weight:700;">' + a.healthyCoveragePct.toFixed(1) + '%</td>';
+              aHtml += '<td style="color:var(--green); font-weight:700;">' + aCovText + '</td>';
               aHtml += '<td><span class="badge-qual">VERIFIED ACTIVE</span></td>';
               aHtml += '</tr>';
             });

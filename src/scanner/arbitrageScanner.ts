@@ -23,7 +23,7 @@ import {
 } from '../types/index.js';
 import { AutomaticScout, ScoutCycleResult } from './automaticScout.js';
 import { SolanaRpcProvider } from '../providers/solanaRpc.js';
-import { SolanaWsProvider } from '../providers/solanaWs.js';
+import { SolanaWsProvider, WsStats } from '../providers/solanaWs.js';
 import { JupiterClient } from '../providers/jupiterClient.js';
 import { dexRegistry } from '../dex/index.js';
 import { PoolRegistry, PoolConfig } from './poolRegistry.js';
@@ -205,10 +205,11 @@ export class ArbitrageScanner {
       repository: this.repository
     });
 
-    // Hook threshold changes to immediately reclassify active shadow opportunities
-    this.profitThresholdManager.onThresholdChange((_newUSDC) => {
+    // Hook threshold changes to immediately reclassify active shadow opportunities and unify study hurdle
+    this.profitThresholdManager.onThresholdChange((newUSDC) => {
       const minHurdle = this.profitThresholdManager.getThresholdDecimal();
       this.opportunityTracker.reclassifyActiveOpportunities(minHurdle);
+      this.windowTracker.setProfitHurdle(newUSDC);
     });
 
     // Phase 1.4: Startup restart recovery from SQLite permanent repository
@@ -295,10 +296,9 @@ export class ArbitrageScanner {
     this.ws.onDisconnect(() => {
       this.windowTracker.onWebSocketDisconnect(Date.now(), this.ws.getCurrentSlot());
       this.stateCache.invalidateAll('DISCONNECTED');
-      this.routeIndex.invalidateAllPrevalidatedRoutes();
-      const readyRoutes = this.routeIndex.getReadyRoutes();
-      for (const r of readyRoutes) {
-        this.routeIndex.setRouteStale(r.routeId, 'WS_DISCONNECTED');
+      this.routeIndex.setWsFeedConnected(false);
+      const invalidated = this.routeIndex.invalidateAllReadyRoutesOnDisconnect('WS_DISCONNECTED');
+      for (const r of invalidated) {
         this.repository.updateRouteReadiness(r.routeId, false, 'WS_DISCONNECTED');
       }
       this.repository.logProviderEvent(
@@ -306,11 +306,12 @@ export class ArbitrageScanner {
         'DISCONNECTED',
         undefined,
         this.ws.getCurrentSlot(),
-        'WebSocket feed disconnected; state cache invalidated'
+        'WebSocket feed disconnected; all READY routes transitioned to STALE'
       );
     });
 
     this.ws.onReconnect(async () => {
+      this.routeIndex.setWsFeedConnected(true);
       this.windowTracker.onWebSocketReconnect(Date.now());
       this.wsLastReconnectTime = Date.now();
       const reconnectStart = performance.now();
@@ -349,10 +350,22 @@ export class ArbitrageScanner {
     // 3. Initial snapshot hydration via RPC batch getMultipleAccountsAndContext
     await this.refreshAllPoolStates();
 
-    // 3. Subscribe to real-time WebSocket updates for all pool accounts
-    const pools = this.poolRegistry.getAllPools();
-    for (const pool of pools) {
+    // 3. Subscribe to real-time WebSocket updates for high-priority pool accounts
+    // Public Solana RPC limits active subscriptions per connection (code 1013 if exceeded).
+    // Prioritize top verified pools by liquidity and route coverage up to MAX_WS_SUBSCRIPTIONS.
+    const allPools = this.poolRegistry.getAllPools();
+    const sortedPools = [...allPools].sort((a, b) => {
+      const liqA = a.initialLiquidityUsd || 0;
+      const liqB = b.initialLiquidityUsd || 0;
+      return liqB - liqA;
+    });
+
+    const maxWsSubs = (this.config as any).MAX_WS_SUBSCRIPTIONS ?? 25;
+    const targetPools = maxWsSubs > 0 ? sortedPools.slice(0, maxWsSubs) : sortedPools;
+
+    for (const pool of targetPools) {
       if (!this.subscribedAccounts.has(pool.id)) {
+        if (!this.ws.canSubscribeMore()) break;
         this.subscribedAccounts.add(pool.id);
         this.ws.subscribeAccount(pool.id, (buf, slot, rxTime, monoTime) => {
           this.enqueueUpdate({
@@ -401,7 +414,8 @@ export class ArbitrageScanner {
       await this.drainEventQueue();
 
       // Roadmap Phase 3: Bounded shared-account refresh to resolve unchanged-price expiration
-      if (now - this.lastSharedRefreshTime >= 1000) {
+      const sharedRefreshInterval = this.config.POLL_INTERVAL_MS || 3000;
+      if (now - this.lastSharedRefreshTime >= sharedRefreshInterval) {
         this.lastSharedRefreshTime = now;
         this.routeIndex.recordReadySample();
         await this.refreshStaleSharedPools();
@@ -499,21 +513,7 @@ export class ArbitrageScanner {
 
           for (const r of routes) {
             if (r.state === 'BLOCKED') continue;
-            if (this.pendingRouteIds.has(r.routeId)) {
-              // Update existing backlog entry with fresher metadata
-              const existingIdx = this.pendingRouteBacklog.findIndex(item => item.route.routeId === r.routeId);
-              if (existingIdx >= 0) {
-                this.pendingRouteBacklog[existingIdx] = {
-                  route: r,
-                  t0: meta.t0,
-                  tDequeue: meta.tDequeue,
-                  t1: meta.t1,
-                  t2: meta.t2,
-                  tLookupStart,
-                  t3
-                };
-              }
-            } else {
+            if (!this.pendingRouteIds.has(r.routeId)) {
               this.pendingRouteIds.add(r.routeId);
               this.pendingRouteBacklog.push({
                 route: r,
@@ -525,6 +525,7 @@ export class ArbitrageScanner {
                 t3
               });
             }
+            if (this.pendingRouteBacklog.length >= 200) break;
           }
         }
       }
@@ -536,6 +537,7 @@ export class ArbitrageScanner {
         this.pendingRouteIds.delete(item.route.routeId);
       }
 
+      let evalIdx = 0;
       for (const item of routesToEvaluate) {
         this.evaluateIndexedRoute(
           item.route,
@@ -546,6 +548,10 @@ export class ArbitrageScanner {
           item.tLookupStart,
           item.t3
         );
+        evalIdx++;
+        if (evalIdx % 5 === 0) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+        }
       }
     } finally {
       this.isDrainingQueue = false;
@@ -1759,9 +1765,11 @@ export class ArbitrageScanner {
     });
     const t5 = performance.now();
 
-    // Phase 1.4: Update route readiness in permanent library index & persistent repository (non-blocking)
-    if (candidate.rejectionReasons.includes('STALE_QUOTE') || candidate.rejectionReasons.includes('SLOT_MISMATCH')) {
-      const reason = candidate.rejectionReasons.join(', ');
+    // Update route readiness in permanent library index & persistent repository (non-blocking)
+    if (!wsConnected || candidate.rejectionReasons.length > 0) {
+      const reason = !wsConnected
+        ? 'WS_DISCONNECTED'
+        : (candidate.rejectionReasons.join(', ') || 'REJECTED');
       this.routeIndex.setRouteStale(route.routeId, reason);
       this.repository.updateRouteReadiness(route.routeId, false, reason);
     } else {
@@ -2113,7 +2121,7 @@ export class ArbitrageScanner {
               }
               poolSet.add(decoded.id);
 
-              if (!this.subscribedAccounts.has(cfgId)) {
+              if (!this.subscribedAccounts.has(cfgId) && this.ws.canSubscribeMore()) {
                 this.subscribedAccounts.add(cfgId);
                 this.ws.subscribeAccount(cfgId, (buf, s, rxTime, monoTime) => {
                   this.enqueueUpdate({
@@ -2142,7 +2150,7 @@ export class ArbitrageScanner {
               }
             }
 
-            if (vaultA && vaultB) {
+            if (vaultA && vaultB && this.ws.canSubscribeMore()) {
               if (!this.subscribedAccounts.has(vaultA)) {
                 this.subscribedAccounts.add(vaultA);
                 this.vaultToPool.set(vaultA, { poolId: decoded.id, isA: true });
@@ -2157,7 +2165,7 @@ export class ArbitrageScanner {
                   });
                 });
               }
-              if (!this.subscribedAccounts.has(vaultB)) {
+              if (!this.subscribedAccounts.has(vaultB) && this.ws.canSubscribeMore()) {
                 this.subscribedAccounts.add(vaultB);
                 this.vaultToPool.set(vaultB, { poolId: decoded.id, isA: false });
                 this.ws.subscribeAccount(vaultB, (buf, s, rxTime, monoTime) => {
@@ -2322,7 +2330,7 @@ export class ArbitrageScanner {
 
             // Map and subscribe to OpenOrders account for real-time WebSocket state maintenance
             const ooPubkeyStr = ooInfo.pubkey.toBase58();
-            if (!this.subscribedAccounts.has(ooPubkeyStr)) {
+            if (!this.subscribedAccounts.has(ooPubkeyStr) && this.ws.canSubscribeMore()) {
               this.subscribedAccounts.add(ooPubkeyStr);
               this.openOrdersToPool.set(ooPubkeyStr, pool.id);
               this.ws.subscribeAccount(ooPubkeyStr, (buf, s, rxTime, monoTime) => {
@@ -2424,7 +2432,7 @@ export class ArbitrageScanner {
                 ? deriveRaydiumClmmTickArrayPda(pool.id, startIdx)
                 : deriveTickArrayPda(pool.id, startIdx);
               const pdaStr = pda.toBase58();
-              if (!this.subscribedAccounts.has(pdaStr)) {
+              if (!this.subscribedAccounts.has(pdaStr) && this.ws.canSubscribeMore()) {
                 this.subscribedAccounts.add(pdaStr);
                 this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx, isClmm });
                 this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
@@ -2573,11 +2581,17 @@ export class ArbitrageScanner {
 
       if (poolsToRefresh.length === 0) return 0;
 
+      // Pre-compute route counts before sorting using O(1) route count lookup
+      const poolRouteCounts = new Map<string, number>();
+      for (const p of poolsToRefresh) {
+        poolRouteCounts.set(p.id, this.routeIndex.getPoolRouteCount(p.id));
+      }
+
       // Fair aging scoring: prioritize starved pools while giving bounded weight to route count
       // score = age * 2 + Math.min(routes * 100, 2000)
       poolsToRefresh.sort((a, b) => {
-        const routesA = this.routeIndex.getRoutesAffectedByPool(a.id, true).length;
-        const routesB = this.routeIndex.getRoutesAffectedByPool(b.id, true).length;
+        const routesA = poolRouteCounts.get(a.id) || 0;
+        const routesB = poolRouteCounts.get(b.id) || 0;
         const stateA = this.stateCache.getPoolState(a.id);
         const stateB = this.stateCache.getPoolState(b.id);
         const ageA = now - (stateA?.receivedAt || 0);
@@ -2588,8 +2602,8 @@ export class ArbitrageScanner {
         return scoreB - scoreA;
       });
 
-      // Bound batch size to respect RPC rate limits (max 20 pools per cycle)
-      const batch = poolsToRefresh.slice(0, 20);
+      // Bound batch size to respect RPC rate limits (max 10 pools per cycle)
+      const batch = poolsToRefresh.slice(0, 10);
       for (const p of batch) {
         this.poolLastRpcRefreshTime.set(p.id, now);
       }
@@ -2841,7 +2855,7 @@ export class ArbitrageScanner {
       }
 
       // Batch evaluation: collect all unique non-blocked routes affected by any refreshed pool
-      // and evaluate each once with all refreshed pool states already present in stateCache.
+      // Bound evaluations to max 50 routes per cycle to prevent event loop delay spikes
       const affectedRoutesMap = new Map<string, IndexedDirectedRoute>();
       for (const pid of refreshedPoolIds) {
         const routes = this.routeIndex.getRoutesAffectedByPool(pid, true);
@@ -2849,12 +2863,19 @@ export class ArbitrageScanner {
           if (r.state !== 'BLOCKED') {
             affectedRoutesMap.set(r.routeId, r);
           }
+          if (affectedRoutesMap.size >= 50) break;
         }
+        if (affectedRoutesMap.size >= 50) break;
       }
 
       const evalNow = performance.now();
+      let refreshEvalIdx = 0;
       for (const route of affectedRoutesMap.values()) {
         this.evaluateIndexedRoute(route, evalNow, evalNow, evalNow, evalNow, evalNow, evalNow);
+        refreshEvalIdx++;
+        if (refreshEvalIdx % 5 === 0) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+        }
       }
 
       return refreshedCount;
@@ -3158,6 +3179,14 @@ export class ArbitrageScanner {
     return this.profitThresholdManager;
   }
 
+  public getWsStats(): WsStats {
+    return this.ws.getStats();
+  }
+
+  public getWsProvider(): SolanaWsProvider {
+    return this.ws;
+  }
+
   public async hotActivateDiscoveredPool(pool: PoolConfig): Promise<HotActivationOutcome> {
     if (pool.blockerReason === 'UNSUPPORTED_PRICING_ADAPTER_CLMM') {
       this.poolRegistry.updatePoolVerification(pool.id, 'QUOTE_UNVERIFIED', 'UNSUPPORTED_PRICING_ADAPTER_CLMM');
@@ -3258,7 +3287,7 @@ export class ArbitrageScanner {
           }
           poolSet.add(pool.id);
 
-          if (!this.subscribedAccounts.has(cfgId)) {
+          if (!this.subscribedAccounts.has(cfgId) && this.ws.canSubscribeMore()) {
             this.subscribedAccounts.add(cfgId);
             this.ws.subscribeAccount(cfgId, (buf, s, rxTime, monoTime) => {
               this.enqueueUpdate({
@@ -3314,7 +3343,7 @@ export class ArbitrageScanner {
                 ? deriveRaydiumClmmTickArrayPda(pool.id, startIdx)
                 : deriveTickArrayPda(pool.id, startIdx);
               const pdaStr = pda.toBase58();
-              if (!this.subscribedAccounts.has(pdaStr)) {
+              if (!this.subscribedAccounts.has(pdaStr) && this.ws.canSubscribeMore()) {
                 this.subscribedAccounts.add(pdaStr);
                 this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx, isClmm });
                 this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
@@ -3423,7 +3452,7 @@ export class ArbitrageScanner {
           return 'FAILED';
         }
 
-        if (vaultA && !this.subscribedAccounts.has(vaultA)) {
+        if (vaultA && !this.subscribedAccounts.has(vaultA) && this.ws.canSubscribeMore()) {
           this.subscribedAccounts.add(vaultA);
           this.vaultToPool.set(vaultA, { poolId: pool.id, isA: true });
           this.ws.subscribeAccount(vaultA, (buf, s, rxTime, monoTime) => {
@@ -3438,7 +3467,7 @@ export class ArbitrageScanner {
           });
         }
 
-        if (vaultB && !this.subscribedAccounts.has(vaultB)) {
+        if (vaultB && !this.subscribedAccounts.has(vaultB) && this.ws.canSubscribeMore()) {
           this.subscribedAccounts.add(vaultB);
           this.vaultToPool.set(vaultB, { poolId: pool.id, isA: false });
           this.ws.subscribeAccount(vaultB, (buf, s, rxTime, monoTime) => {
@@ -3481,7 +3510,7 @@ export class ArbitrageScanner {
         let openOrdersHydrated = false;
         if (openOrders) {
           const ooPubkeyStr = openOrders;
-          if (!this.subscribedAccounts.has(ooPubkeyStr)) {
+          if (!this.subscribedAccounts.has(ooPubkeyStr) && this.ws.canSubscribeMore()) {
             this.subscribedAccounts.add(ooPubkeyStr);
             this.openOrdersToPool.set(ooPubkeyStr, pool.id);
             this.ws.subscribeAccount(ooPubkeyStr, (buf, s, rxTime, monoTime) => {
@@ -3712,47 +3741,6 @@ export class ArbitrageScanner {
       return b.expectedNetUSDC - a.expectedNetUSDC;
     });
 
-    if (items.length === 0) {
-      const routes = this.routeIndex.getAllRoutes().slice(0, limit);
-      const activeTarget = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.10;
-      items = routes.map((r, idx) => {
-        const token = KNOWN_TOKENS[r.intermediateMint]?.symbol || (r.intermediateMint ? r.intermediateMint.slice(0, 4) + '..' + r.intermediateMint.slice(-4) : 'WSOL');
-        const buyDex = r.legs[0]?.dex || 'ORCA_WHIRLPOOL';
-        const sellDex = r.legs[1]?.dex || 'RAYDIUM_AMM';
-        return {
-          rank: idx + 1,
-          candidateId: `INIT-${r.routeId}`,
-          token,
-          buyDex,
-          sellDex,
-          tradeSizeUSDC: 100,
-          grossSpreadPercent: 0,
-          expectedNetUSDC: 0,
-          conservativeNetUSDC: 0,
-          shortfallToTargetUSDC: activeTarget,
-          quoteAgeMs: 0,
-          status: r.state === 'READY' ? 'READY' : (r.state || 'UNVALIDATED'),
-          classification: 'NEAR_MISS',
-          leg1PoolId: r.legs[0]?.poolId || 'N/A',
-          leg2PoolId: r.legs[1]?.poolId || 'N/A',
-          leg1Direction: `USDC -> ${token}`,
-          leg2Direction: `${token} -> USDC`,
-          leg1FeeBps: 25,
-          leg2FeeBps: 25,
-          priceImpactBps: 0,
-          slippageBps: 50,
-          networkFeeUSDC: '0.001000',
-          priorityFeeUSDC: '0.002000',
-          jitoTipUSDC: '0.000000',
-          safetyBufferUSDC: '0.250000',
-          totalCostsUSDC: '0.023000',
-          slotGap: 0,
-          revalidationStatus: 'INITIALIZING',
-          timestamp: now
-        };
-      });
-    }
-
     const top = items.slice(0, limit);
     top.forEach((item, idx) => {
       item.rank = idx + 1;
@@ -3924,7 +3912,7 @@ export class ArbitrageScanner {
     const secs = (uptimeSec % 60).toString().padStart(2, '0');
     const sessionUptimeFormatted = `${hours}:${mins}:${secs}`;
 
-    const totalRoutes = this.routeIndex.getAllRoutes().length;
+    const totalRoutes = this.routeIndex.getRouteCount();
     const verifiedRoutes = this.routeIndex.getRouteCountByState('VERIFIED');
     const readyRoutes = this.routeIndex.getRouteCountByState('READY');
     const staleRoutes = this.routeIndex.getRouteCountByState('STALE');

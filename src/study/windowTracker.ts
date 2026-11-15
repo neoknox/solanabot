@@ -94,6 +94,9 @@ export class OpportunityWindowTracker {
   private revalidationSurvivedCount = 0;
   private revalidationDecayedCount = 0;
 
+  // Hurdle history tracking
+  private hurdleHistory: Array<{ hurdleUSDC: number; effectiveFromMs: number }> = [];
+
   constructor(options?: OpportunityWindowTrackerOptions) {
     this.sessionId = options?.sessionId || `study_${Date.now()}`;
     this.targetDurationMs = options?.targetDurationMs ?? 24 * 60 * 60 * 1000;
@@ -103,9 +106,49 @@ export class OpportunityWindowTracker {
 
     this.startedAt = Date.now();
     this.lastUptimeCheck = Date.now();
+    this.hurdleHistory.push({
+      hurdleUSDC: this.profitHurdleUSDC,
+      effectiveFromMs: this.startedAt
+    });
 
     // Persist initial session record if repository provided
     this.saveSession();
+  }
+
+  public getProfitHurdle(): number {
+    return this.profitHurdleUSDC;
+  }
+
+  public getHurdleHistory(): Array<{ hurdleUSDC: number; effectiveFromMs: number }> {
+    return [...this.hurdleHistory];
+  }
+
+  public setProfitHurdle(newHurdle: number, now = Date.now()): void {
+    if (this.profitHurdleUSDC === newHurdle) return;
+    const oldHurdle = this.profitHurdleUSDC;
+    this.profitHurdleUSDC = newHurdle;
+    this.hurdleHistory.push({
+      hurdleUSDC: newHurdle,
+      effectiveFromMs: now
+    });
+
+    // If new hurdle is higher, close any open windows whose peak conservative net is below new hurdle
+    if (newHurdle > oldHurdle) {
+      const monotonicNow = typeof performance !== 'undefined' ? performance.now() : now;
+      for (const [key, window] of this.openWindows.entries()) {
+        if (window.netProfitPeakUSDC < newHurdle) {
+          this.closeWindow(
+            window,
+            key,
+            WindowClosureReason.TARGET_SHORTFALL,
+            now,
+            window.lastObservedSlot,
+            monotonicNow,
+            window.netProfitMinUSDC
+          );
+        }
+      }
+    }
   }
 
   public getSessionId(): string {
@@ -222,13 +265,14 @@ export class OpportunityWindowTracker {
           currentSlot === existingWindow.lastObservedSlot;
 
         if (isDuplicateSnapshot) {
-          // Just update monotonic time without duplicating observations
-          existingWindow.lastObservedAt = now;
-          existingWindow.lastObservedMonotonic = monotonicNow;
+          // Do not artificially lengthen window duration on duplicate snapshots of unchanged market state.
+          // Touch timestamp prevents premature quote expiry without inflating observed duration.
+          existingWindow.lastTouchedAt = now;
         } else {
           // Genuine state update while remaining qualified
           existingWindow.observationCount++;
           existingWindow.lastObservedAt = now;
+          existingWindow.lastTouchedAt = now;
           existingWindow.lastObservedSlot = currentSlot || candidate.leg1Quote.slot || existingWindow.lastObservedSlot;
           existingWindow.lastObservedMonotonic = monotonicNow;
           const obsDur = Math.max(0, Math.round(monotonicNow - existingWindow.firstObservedMonotonic));
@@ -378,7 +422,8 @@ export class OpportunityWindowTracker {
     const monotonicNow = typeof performance !== 'undefined' ? performance.now() : now;
 
     for (const [key, window] of this.openWindows.entries()) {
-      if (now - window.lastObservedAt > this.quoteExpiryMs) {
+      const lastActive = window.lastTouchedAt || window.lastObservedAt;
+      if (now - lastActive > this.quoteExpiryMs) {
         this.closeWindow(
           window,
           key,
@@ -580,14 +625,8 @@ export class OpportunityWindowTracker {
       const disc = this.hourlyDisconnectCount[h] || 0;
       const totalTracked = uMs + dMs;
 
-      let healthyCoveragePct = 100.0;
-      if (totalTracked > 0) {
-        healthyCoveragePct = Number(((uMs / totalTracked) * 100).toFixed(1));
-      } else if (dMs > 0) {
-        healthyCoveragePct = 0.0;
-      } else {
-        healthyCoveragePct = 100.0;
-      }
+      let healthyCoveragePct: number | null = null;
+      let revalidationSuccessPct: number | null = null;
 
       // Collect windows active in this hour (opened during this hour)
       const windowsInHour = allWindows.filter(w => w.firstObservedAt >= hourStartMs && w.firstObservedAt < hourEndMs);
@@ -603,19 +642,36 @@ export class OpportunityWindowTracker {
       const survived = windowsInHour.filter(w => w.revalidationStatus === 'SURVIVED').length;
       const decayed = windowsInHour.filter(w => w.revalidationStatus === 'DECAYED').length;
       const totalReval = survived + decayed;
-      const revalidationSuccessPct = totalReval > 0 ? Number(((survived / totalReval) * 100).toFixed(1)) : 100.0;
 
       let status: HourlyProfitabilityBucket['status'] = 'FUTURE';
       if (now < hourStartMs) {
         status = 'FUTURE';
-      } else if (totalTracked > 0 && uMs === 0) {
-        status = 'FEED_DISCONNECTED';
-      } else if (dMs > 0 && healthyCoveragePct < 50.0) {
-        status = 'COVERAGE_DEGRADED';
-      } else if (uniqueWindowsCount === 0) {
-        status = 'NO_OPPORTUNITIES_VERIFIED';
+        healthyCoveragePct = null;
+        revalidationSuccessPct = null;
       } else {
-        status = 'ACTIVE_OBSERVED';
+        if (totalTracked > 0) {
+          healthyCoveragePct = Number(((uMs / totalTracked) * 100).toFixed(1));
+        } else if (dMs > 0) {
+          healthyCoveragePct = 0.0;
+        } else {
+          healthyCoveragePct = null;
+        }
+
+        if (totalReval > 0) {
+          revalidationSuccessPct = Number(((survived / totalReval) * 100).toFixed(1));
+        } else {
+          revalidationSuccessPct = null;
+        }
+
+        if (totalTracked > 0 && uMs === 0) {
+          status = 'FEED_DISCONNECTED';
+        } else if (dMs > 0 && (healthyCoveragePct !== null && healthyCoveragePct < 50.0)) {
+          status = 'COVERAGE_DEGRADED';
+        } else if (uniqueWindowsCount === 0) {
+          status = 'NO_OPPORTUNITIES_VERIFIED';
+        } else {
+          status = 'ACTIVE_OBSERVED';
+        }
       }
 
       buckets.push({
@@ -688,14 +744,15 @@ export class OpportunityWindowTracker {
 
     const totalRevalChecked = this.revalidationSurvivedCount + this.revalidationDecayedCount;
     const revalidationSuccessPct = totalRevalChecked > 0
-      ? (this.revalidationSurvivedCount / totalRevalChecked) * 100
-      : 100.0;
+      ? Number(((this.revalidationSurvivedCount / totalRevalChecked) * 100).toFixed(1))
+      : null;
 
     const liveWindows = Array.from(this.openWindows.values());
     const recentClosed = this.closedWindows.slice(-20).reverse();
 
     return {
       sessionId: this.sessionId,
+      profitHurdleUSDC: this.profitHurdleUSDC,
       status: this.status,
       startedAt: this.startedAt,
       targetDurationMs: this.targetDurationMs,
@@ -718,7 +775,8 @@ export class OpportunityWindowTracker {
       closedWindows: recentClosed,
       nearMissesCount: this.nearMisses.length,
       hourlyBuckets: this.getHourlyProfitabilityBuckets(now),
-      mostActiveHours: this.getMostActiveHours(now)
+      mostActiveHours: this.getMostActiveHours(now),
+      activeHurdleHistory: this.getHurdleHistory()
     };
   }
 

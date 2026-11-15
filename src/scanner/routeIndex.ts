@@ -151,8 +151,58 @@ export class RouteIndex {
   private readySamples: number[] = [];
   private restoredRouteCount = 0;
 
+  // High-performance state-indexed lookup sets ($O(1)$ lookups & counts, preventing event-loop stalls)
+  private routesByState = new Map<RouteState, Set<string>>([
+    ['UNVALIDATED', new Set<string>()],
+    ['VERIFIED', new Set<string>()],
+    ['READY', new Set<string>()],
+    ['STALE', new Set<string>()],
+    ['BLOCKED', new Set<string>()]
+  ]);
+  private isWsFeedConnected = true;
+
   constructor(pools: PoolConfig[]) {
     this.buildIndices(pools);
+  }
+
+  public setWsFeedConnected(connected: boolean): void {
+    this.isWsFeedConnected = connected;
+    if (!connected) {
+      this.invalidateAllReadyRoutesOnDisconnect('WS_DISCONNECTED');
+    }
+  }
+
+  public invalidateAllReadyRoutesOnDisconnect(reason = 'WS_DISCONNECTED'): IndexedDirectedRoute[] {
+    const readyIds = Array.from(this.routesByState.get('READY') || []);
+    const invalidated: IndexedDirectedRoute[] = [];
+    const now = Date.now();
+    for (const routeId of readyIds) {
+      const route = this.routeById.get(routeId);
+      if (route) {
+        this.readyToStaleTransitions++;
+        if (route.lastBecameReadyAt) {
+          route.readyDurationMs = (route.readyDurationMs || 0) + (now - route.lastBecameReadyAt);
+          route.lastBecameReadyAt = undefined;
+        }
+        this.setRouteStateInternal(route, 'STALE');
+        route.verificationDetails = reason;
+        invalidated.push(route);
+      }
+    }
+    return invalidated;
+  }
+
+  private setRouteStateInternal(route: IndexedDirectedRoute, newState: RouteState): void {
+    const oldState = route.state;
+    if (oldState === newState) return;
+    this.routesByState.get(oldState)?.delete(route.routeId);
+    route.state = newState;
+    let set = this.routesByState.get(newState);
+    if (!set) {
+      set = new Set<string>();
+      this.routesByState.set(newState, set);
+    }
+    set.add(route.routeId);
   }
 
   public rebuild(pools: PoolConfig[]): void {
@@ -160,6 +210,7 @@ export class RouteIndex {
     this.poolToRoutes.clear();
     this.routeById.clear();
     this.allRoutes = [];
+    this.routesByState.clear();
     this.poolConfigs.clear();
     this.restoredRouteCount = 0;
     this.buildIndices(pools);
@@ -199,12 +250,12 @@ export class RouteIndex {
             route.lastBecameReadyAt = undefined;
           }
         }
-        route.state = 'BLOCKED';
+        this.setRouteStateInternal(route, 'BLOCKED');
         route.verificationDetails = `DEPENDENCY_UNVERIFIED:${poolId}`;
         route.lastVerifiedAt = 0;
       } else {
         if (route.state === 'BLOCKED') {
-          route.state = 'VERIFIED';
+          this.setRouteStateInternal(route, 'VERIFIED');
           route.verificationDetails = undefined;
         }
         route.lastVerifiedAt = Math.min(...route.poolIds.map(id => this.poolConfigs.get(id)?.lastVerifiedAt || 0));
@@ -501,6 +552,12 @@ export class RouteIndex {
               this.allRoutes.push(r1);
               this.mapPoolToRoute(pool.id, r1);
               this.mapPoolToRoute(other.id, r1);
+              let set1 = this.routesByState.get(r1.state);
+              if (!set1) {
+                set1 = new Set<string>();
+                this.routesByState.set(r1.state, set1);
+              }
+              set1.add(r1.routeId);
               newRoutes.push(r1);
             }
           }
@@ -514,6 +571,12 @@ export class RouteIndex {
               this.allRoutes.push(r2);
               this.mapPoolToRoute(other.id, r2);
               this.mapPoolToRoute(pool.id, r2);
+              let set2 = this.routesByState.get(r2.state);
+              if (!set2) {
+                set2 = new Set<string>();
+                this.routesByState.set(r2.state, set2);
+              }
+              set2.add(r2.routeId);
               newRoutes.push(r2);
             }
           }
@@ -575,6 +638,20 @@ export class RouteIndex {
 
     // Sort routes by priority score descending
     this.allRoutes.sort((a, b) => b.priorityScore - a.priorityScore);
+
+    this.routesByState.clear();
+    const allPossibleStates: RouteState[] = ['UNVALIDATED', 'VERIFIED', 'READY', 'STALE', 'BLOCKED'];
+    for (const s of allPossibleStates) {
+      this.routesByState.set(s, new Set<string>());
+    }
+    for (const r of this.allRoutes) {
+      let set = this.routesByState.get(r.state);
+      if (!set) {
+        set = new Set<string>();
+        this.routesByState.set(r.state, set);
+      }
+      set.add(r.routeId);
+    }
   }
 
   private mapPoolToRoute(poolId: string, route: IndexedDirectedRoute): void {
@@ -594,6 +671,10 @@ export class RouteIndex {
       return routes.filter(r => r.state !== 'BLOCKED');
     }
     return routes;
+  }
+
+  public getPoolRouteCount(poolId: string): number {
+    return this.poolToRoutes.get(poolId)?.length || 0;
   }
 
   public invalidateAllPrevalidatedRoutes(): void {
@@ -651,27 +732,55 @@ export class RouteIndex {
   }
 
   public getReadyRoutes(): IndexedDirectedRoute[] {
-    return this.allRoutes.filter(r => r.state === 'READY');
+    if (!this.isWsFeedConnected) return [];
+    const set = this.routesByState.get('READY');
+    if (!set || set.size === 0) return [];
+    const routes: IndexedDirectedRoute[] = [];
+    for (const id of set) {
+      const r = this.routeById.get(id);
+      if (r) routes.push(r);
+    }
+    return routes;
   }
 
   public getReadyRouteCount(): number {
-    return this.allRoutes.filter(r => r.state === 'READY').length;
+    if (!this.isWsFeedConnected) return 0;
+    return this.routesByState.get('READY')?.size || 0;
   }
 
   public getVerifiedRoutes(): IndexedDirectedRoute[] {
-    return this.allRoutes.filter(r => r.state === 'VERIFIED' || r.state === 'READY' || r.state === 'STALE' || r.state === 'UNVALIDATED');
+    const states: RouteState[] = this.isWsFeedConnected
+      ? ['VERIFIED', 'READY', 'STALE', 'UNVALIDATED']
+      : ['VERIFIED', 'STALE', 'UNVALIDATED'];
+    const routes: IndexedDirectedRoute[] = [];
+    for (const s of states) {
+      const set = this.routesByState.get(s);
+      if (set) {
+        for (const id of set) {
+          const r = this.routeById.get(id);
+          if (r) routes.push(r);
+        }
+      }
+    }
+    return routes;
   }
 
   public getVerifiedRouteCount(): number {
-    return this.allRoutes.filter(r => r.state === 'VERIFIED' || r.state === 'READY' || r.state === 'STALE' || r.state === 'UNVALIDATED').length;
+    const readyCnt = this.isWsFeedConnected ? (this.routesByState.get('READY')?.size || 0) : 0;
+    return (
+      (this.routesByState.get('VERIFIED')?.size || 0) +
+      readyCnt +
+      (this.routesByState.get('STALE')?.size || 0) +
+      (this.routesByState.get('UNVALIDATED')?.size || 0)
+    );
   }
 
   public getStaleRouteCount(): number {
-    return this.allRoutes.filter(r => r.state === 'STALE').length;
+    return this.routesByState.get('STALE')?.size || 0;
   }
 
   public getUnvalidatedRouteCount(): number {
-    return this.allRoutes.filter(r => r.state === 'UNVALIDATED').length;
+    return this.routesByState.get('UNVALIDATED')?.size || 0;
   }
 
   public getRestoredRouteCount(): number {
@@ -683,11 +792,20 @@ export class RouteIndex {
   }
 
   public getRouteCountByState(state: RouteState): number {
-    return this.allRoutes.filter(r => r.state === state).length;
+    if (state === 'READY' && !this.isWsFeedConnected) return 0;
+    return this.routesByState.get(state)?.size || 0;
   }
 
   public getRoutesByState(state: RouteState): IndexedDirectedRoute[] {
-    return this.allRoutes.filter(r => r.state === state);
+    if (state === 'READY' && !this.isWsFeedConnected) return [];
+    const set = this.routesByState.get(state);
+    if (!set || set.size === 0) return [];
+    const routes: IndexedDirectedRoute[] = [];
+    for (const id of set) {
+      const r = this.routeById.get(id);
+      if (r) routes.push(r);
+    }
+    return routes;
   }
 
   public getLifecycleTransitionStats(): {
@@ -703,13 +821,16 @@ export class RouteIndex {
   }
 
   public setRouteReady(routeId: string, quoteStats?: { expectedNetUSDC: string; timestamp: number }): boolean {
+    if (!this.isWsFeedConnected) {
+      return false;
+    }
     const route = this.routeById.get(routeId);
     if (!route || !route.isDirectToDirect || route.state === 'BLOCKED') {
       return false;
     }
 
     const prevState = route.state;
-    route.state = 'READY';
+    this.setRouteStateInternal(route, 'READY');
     if (prevState !== 'READY') {
       route.lastBecameReadyAt = Date.now();
     }
@@ -744,7 +865,7 @@ export class RouteIndex {
 
     // Transitory freshness loss: transitions READY or VERIFIED -> STALE.
     // Crucial: do not mark structurally valid routes as BLOCKED!
-    route.state = 'STALE';
+    this.setRouteStateInternal(route, 'STALE');
     if (reason) {
       route.verificationDetails = reason;
     }
@@ -763,6 +884,9 @@ export class RouteIndex {
     maxSlotGap: number = 20,
     currentSlot?: number
   ): boolean {
+    if (!this.isWsFeedConnected) {
+      return false;
+    }
     const route = this.routeById.get(routeId);
     if (!route || !route.isDirectToDirect || route.state === 'BLOCKED') {
       return false;
@@ -775,49 +899,41 @@ export class RouteIndex {
     for (const leg of route.legs) {
       const poolState = getPoolState(leg.poolId);
       if (!poolState) {
-        route.state = 'STALE';
-        route.verificationDetails = `MISSING_DEPENDENCY_STATE:${leg.poolId}`;
+        this.setRouteStale(route.routeId, `MISSING_DEPENDENCY_STATE:${leg.poolId}`);
         return false;
       }
 
       // FIX 3: Required timestamp evidence must be present, valid, non-future, and non-expired
       if (typeof poolState.receivedAt !== 'number' || poolState.receivedAt <= 0 || isNaN(poolState.receivedAt)) {
-        route.state = 'STALE';
-        route.verificationDetails = `MISSING_TIMESTAMP_EVIDENCE:${leg.poolId}`;
+        this.setRouteStale(route.routeId, `MISSING_TIMESTAMP_EVIDENCE:${leg.poolId}`);
         return false;
       }
       if (poolState.receivedAt > now + 5000) {
-        route.state = 'STALE';
-        route.verificationDetails = `FUTURE_TIMESTAMP:${leg.poolId}`;
+        this.setRouteStale(route.routeId, `FUTURE_TIMESTAMP:${leg.poolId}`);
         return false;
       }
       if (now - poolState.receivedAt > maxSlotAgeMs) {
-        route.state = 'STALE';
-        route.verificationDetails = `EXPIRED_DEPENDENCY_STATE:${leg.poolId}`;
+        this.setRouteStale(route.routeId, `EXPIRED_DEPENDENCY_STATE:${leg.poolId}`);
         return false;
       }
 
       // FIX 3: Required slot evidence must be present, valid, non-future, and non-lagging
       if (typeof poolState.slot !== 'number' || poolState.slot <= 0 || isNaN(poolState.slot)) {
-        route.state = 'STALE';
-        route.verificationDetails = `MISSING_SLOT_EVIDENCE:${leg.poolId}`;
+        this.setRouteStale(route.routeId, `MISSING_SLOT_EVIDENCE:${leg.poolId}`);
         return false;
       }
       if (currentSlot !== undefined && poolState.slot > currentSlot + 10) {
-        route.state = 'STALE';
-        route.verificationDetails = `FUTURE_SLOT:${leg.poolId}`;
+        this.setRouteStale(route.routeId, `FUTURE_SLOT:${leg.poolId}`);
         return false;
       }
       if (currentSlot !== undefined && currentSlot - poolState.slot > maxSlotGap) {
-        route.state = 'STALE';
-        route.verificationDetails = `EXCESSIVE_SLOT_LAG:${leg.poolId}`;
+        this.setRouteStale(route.routeId, `EXCESSIVE_SLOT_LAG:${leg.poolId}`);
         return false;
       }
 
       // FIX 3: Required feed-health evidence must be present and HEALTHY
       if (!poolState.feedHealth || typeof poolState.feedHealth !== 'string' || poolState.feedHealth !== 'HEALTHY') {
-        route.state = 'STALE';
-        route.verificationDetails = `MISSING_OR_UNHEALTHY_FEED_EVIDENCE:${leg.poolId}`;
+        this.setRouteStale(route.routeId, `MISSING_OR_UNHEALTHY_FEED_EVIDENCE:${leg.poolId}`);
         return false;
       }
 
@@ -827,14 +943,13 @@ export class RouteIndex {
 
     // Inter-pool slot gap check
     if (maxSlot !== -Infinity && minSlot !== Infinity && (maxSlot - minSlot > maxSlotGap)) {
-      route.state = 'STALE';
-      route.verificationDetails = `SLOT_GAP_EXCEEDED:${maxSlot - minSlot} > ${maxSlotGap}`;
+      this.setRouteStale(route.routeId, `SLOT_GAP_EXCEEDED:${maxSlot - minSlot} > ${maxSlotGap}`);
       return false;
     }
 
     // Dependencies verified fresh -> restore to READY
     const prevState = route.state;
-    route.state = 'READY';
+    this.setRouteStateInternal(route, 'READY');
     if (prevState === 'STALE') {
       this.staleToReadyRecoveries++;
     }
@@ -847,7 +962,7 @@ export class RouteIndex {
 
   /**
    * FIX 1: Expire READY routes when required live data, quote age, feed health, or slot limits become stale.
-   * Uses existing scanner configuration (maxSlotAgeMs / maxSlotGap / currentSlot).
+   * High performance: only checks routes currently in READY state instead of scanning all 38,000+ routes!
    */
   public expireStaleReadyRoutes(
     getPoolState: (poolId: string) => { receivedAt?: number; slot?: number; feedHealth?: string } | undefined,
@@ -858,8 +973,11 @@ export class RouteIndex {
     const expired: IndexedDirectedRoute[] = [];
     const now = Date.now();
 
-    for (const route of this.allRoutes) {
-      if (route.state !== 'READY') continue;
+    // Iterate ONLY currently READY route IDs ($O(READY)$ instead of $O(38,668)$)
+    const readyIds = Array.from(this.routesByState.get('READY') || []);
+    for (const routeId of readyIds) {
+      const route = this.routeById.get(routeId);
+      if (!route || route.state !== 'READY') continue;
 
       let isExpired = false;
       let expireReason = '';
@@ -928,13 +1046,7 @@ export class RouteIndex {
       }
 
       if (isExpired) {
-        route.state = 'STALE';
-        this.readyToStaleTransitions++;
-        if (route.lastBecameReadyAt) {
-          route.readyDurationMs = (route.readyDurationMs || 0) + (now - route.lastBecameReadyAt);
-          route.lastBecameReadyAt = undefined;
-        }
-        route.verificationDetails = expireReason;
+        this.setRouteStale(route.routeId, expireReason);
         expired.push(route);
       }
     }
@@ -1000,7 +1112,7 @@ export class RouteIndex {
       const existing = this.routeById.get(saved.routeId);
       if (existing) {
         existing.isRestored = true;
-        existing.state = targetState;
+        this.setRouteStateInternal(existing, targetState);
         existing.isDirectToDirect = allDirect;
         existing.isUnprofitablePreserved = saved.isUnprofitablePreserved !== false;
         existing.lastQuoteExpectedNetUSDC = undefined; // Do not store stale quotes as executable opportunities
@@ -1058,6 +1170,7 @@ export class RouteIndex {
 
         this.allRoutes.push(newRoute);
         this.routeById.set(newRoute.routeId, newRoute);
+        this.setRouteStateInternal(newRoute, targetState);
         for (const pid of saved.orderedPoolIds) {
           this.mapPoolToRoute(pid, newRoute);
         }
@@ -1087,6 +1200,7 @@ export class RouteIndex {
       removedIds.push(r.routeId);
       removedSet.add(r.routeId);
       this.routeById.delete(r.routeId);
+      this.routesByState.get(r.state)?.delete(r.routeId);
     }
 
     this.allRoutes = this.allRoutes.filter(r => !removedSet.has(r.routeId));
@@ -1117,7 +1231,7 @@ export class RouteIndex {
         }
       }
       route.isDirectToDirect = false;
-      route.state = 'BLOCKED';
+      this.setRouteStateInternal(route, 'BLOCKED');
       route.verificationDetails = reason;
       route.lastVerifiedAt = 0;
 

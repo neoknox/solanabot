@@ -423,8 +423,10 @@ export class ArbitrageRepository {
 
     // Background flush timer to keep SQLite writes off the quote hot path
     this.flushTimer = setInterval(() => {
-      this.flushSync();
-    }, 100);
+      if (this.candidateQueue.length > 0 || this.routeReadinessQueue.size > 0) {
+        this.flushSync();
+      }
+    }, 250);
     this.flushTimer.unref();
   }
 
@@ -575,6 +577,12 @@ export class ArbitrageRepository {
     this.flushSync();
     const row = this.selectRouteStmt.get(routeId) as Record<string, unknown> | undefined;
     return row ? rowToRouteRecord(row) : null;
+  }
+
+  public getRouteCount(): number {
+    this.flushSync();
+    const row = this.db.prepare('SELECT COUNT(*) as count FROM routes').get() as { count: number };
+    return row?.count || 0;
   }
 
   public getAllRoutes(): PermanentRouteRecord[] {

@@ -710,6 +710,7 @@ export interface OpportunityWindow {
   lastObservedAt: number;
   lastObservedSlot: number;
   lastObservedMonotonic: number;
+  lastTouchedAt?: number;
   closedAt?: number;
   closedAtSlot?: number;
   closedAtMonotonic?: number;
@@ -775,8 +776,8 @@ export interface HourlyProfitabilityBucket {
   uniqueWindowsCount: number;
   bestConservativeNetUSDC: number;
   medianObservedDurationMs: number;
-  revalidationSuccessPct: number;
-  healthyCoveragePct: number;
+  revalidationSuccessPct: number | null;
+  healthyCoveragePct: number | null;
   healthyUptimeMs: number;
   feedDowntimeMs: number;
   disconnectCount: number;
@@ -791,12 +792,13 @@ export interface MostActiveHourSummary {
   uniqueWindowsCount: number;
   bestConservativeNetUSDC: number;
   medianObservedDurationMs: number;
-  healthyCoveragePct: number;
+  healthyCoveragePct: number | null;
   status: string;
 }
 
 export interface StudyTelemetry {
   sessionId: string;
+  profitHurdleUSDC: number;
   status: 'RUNNING' | 'COMPLETED' | 'INTERRUPTED' | 'STANDBY';
   startedAt: number;
   targetDurationMs: number;
@@ -808,7 +810,7 @@ export interface StudyTelemetry {
   openQualifiedWindows: number;
   completedQualifiedWindows: number;
   censoredWindows: number;
-  revalidationSuccessPct: number;
+  revalidationSuccessPct: number | null;
   minDurationMs: number;
   medianDurationMs: number;
   p95DurationMs: number;
@@ -820,6 +822,7 @@ export interface StudyTelemetry {
   nearMissesCount: number;
   hourlyBuckets: HourlyProfitabilityBucket[];
   mostActiveHours: MostActiveHourSummary[];
+  activeHurdleHistory?: Array<{ hurdleUSDC: number; effectiveFromMs: number }>;
 }
 
 

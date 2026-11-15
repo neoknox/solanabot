@@ -305,13 +305,10 @@ export class AutomaticScout {
             routesGenerated += newRoutes.length;
             this.newlyAddedRoutesCount += newRoutes.length;
 
-            // Step 4.3: Persist newly generated routes in SQLite library
-            for (const route of newRoutes) {
-              try {
-                this.repository.saveRoute(this.routeIndex.toPermanentRecord(route));
-              } catch (err) {
-                this.repository.recordPersistenceError('saveRoute', err);
-              }
+            // Step 4.3: Persist newly generated routes in SQLite library in a single batch transaction
+            if (newRoutes.length > 0) {
+              const records = newRoutes.map(r => this.routeIndex.toPermanentRecord(r));
+              this.repository.upsertRoutes(records);
             }
 
             // Step 4.4 & 4.5: Hot-activate WebSocket subscriptions and hydrate state via callback

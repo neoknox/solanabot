@@ -102,7 +102,7 @@ export async function runStudy(options: StudyRunnerOptions = {}): Promise<void> 
     console.log(`Completed Market Windows:      ${telem.completedQualifiedWindows}`);
     console.log(`Censored / Interrupted Windows:${telem.censoredWindows}`);
     console.log(`Best Conservative Net Profit:  $${telem.bestConservativeNetUSDC.toFixed(4)} USDC`);
-    console.log(`Revalidation Survival Rate:    ${telem.revalidationSuccessPct.toFixed(1)}%`);
+    console.log(`Revalidation Survival Rate:    ${telem.revalidationSuccessPct !== null ? telem.revalidationSuccessPct.toFixed(1) + '%' : 'N/A'}`);
     console.log(`Median Window Duration:        ${telem.medianDurationMs} ms`);
     console.log(`95th Percentile Duration:      ${telem.p95DurationMs} ms`);
     console.log(`Scanning Healthy Uptime:       ${(telem.healthyUptimeMs / 1000).toFixed(1)}s (${((telem.healthyUptimeMs / Math.max(1, telem.elapsedMs)) * 100).toFixed(1)}%)`);

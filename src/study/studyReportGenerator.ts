@@ -164,7 +164,7 @@ export class StudyReportGenerator {
         completedWindows: closed.length,
         censoredWindows: censored.length,
         nearMissesCount: telemetry.nearMissesCount,
-        revalidationSuccessPct: telemetry.revalidationSuccessPct.toFixed(2)
+        revalidationSuccessPct: telemetry.revalidationSuccessPct !== null ? telemetry.revalidationSuccessPct.toFixed(2) : null
       },
       durationMetrics: percentiles,
       closureReasons: closureBreakdown,
@@ -239,7 +239,7 @@ Completed Market Windows:    ${closed.length}
 Censored / Interrupted:      ${censored.length}
 Still Open at Shutdown:      ${telemetry.openQualifiedWindows}
 Near Misses (Net > 0 <$0.10):${telemetry.nearMissesCount}
-Revalidation Survival Rate:  ${telemetry.revalidationSuccessPct.toFixed(1)}%
+Revalidation Survival Rate:  ${telemetry.revalidationSuccessPct !== null ? telemetry.revalidationSuccessPct.toFixed(1) + '%' : 'N/A'}
 
 ================================================================================
 SECTION C: PROFITABILITY DISTRIBUTION & UNIT ECONOMICS
@@ -292,8 +292,8 @@ Hour    Time Range (AST)      Windows  Best Net (USDC)  Median Dur   Reval %  Co
       const winStr = b.uniqueWindowsCount.toString().padStart(7);
       const bestStr = (b.uniqueWindowsCount > 0 ? `$${b.bestConservativeNetUSDC.toFixed(4)}` : '$0.0000').padStart(15);
       const medDurStr = (b.uniqueWindowsCount > 0 ? formatMs(b.medianObservedDurationMs) : '--').padStart(11);
-      const revalStr = `${b.revalidationSuccessPct.toFixed(1)}%`.padStart(7);
-      const covStr = `${b.healthyCoveragePct.toFixed(1)}%`.padStart(10);
+      const revalStr = (b.revalidationSuccessPct !== null ? `${b.revalidationSuccessPct.toFixed(1)}%` : 'N/A').padStart(7);
+      const covStr = (b.healthyCoveragePct !== null ? `${b.healthyCoveragePct.toFixed(1)}%` : 'Pending').padStart(10);
       const stStr = b.status;
       txt += `${hStr}  ${trStr}  ${winStr}  ${bestStr}  ${medDurStr}  ${revalStr}  ${covStr}  ${stStr}\n`;
     }
@@ -321,7 +321,7 @@ SECTION D.3: MOST ACTIVE PROFITABLE HOURS (VERIFIED OBSERVATIONS ONLY)
         const winStr = a.uniqueWindowsCount.toString().padStart(7);
         const bestStr = `$${a.bestConservativeNetUSDC.toFixed(4)}`.padStart(15);
         const medDurStr = formatMs(a.medianObservedDurationMs).padStart(11);
-        const covStr = `${a.healthyCoveragePct.toFixed(1)}%`.padStart(10);
+        const covStr = (a.healthyCoveragePct !== null ? `${a.healthyCoveragePct.toFixed(1)}%` : 'Pending').padStart(10);
         const stStr = a.status;
         txt += `${rankStr}   ${hourStr}  ${trStr}  ${winStr}  ${bestStr}  ${medDurStr}  ${covStr}  ${stStr}\n`;
       }
