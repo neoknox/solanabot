@@ -166,6 +166,7 @@ export class ArbitrageScanner {
   private isRefreshingSharedPools = false;
   private lastSharedRefreshTime = 0;
   private hasPendingDrain = false;
+  private inFlightRefreshPromise: Promise<void> | null = null;
 
   constructor(
     config: AppConfig,
@@ -317,7 +318,12 @@ export class ArbitrageScanner {
         this.ws.getCurrentSlot(),
         'WebSocket reconnected; refreshing snapshots'
       );
-      await this.refreshAllPoolStates();
+      this.ws.setHydratingPools(true);
+      try {
+        await this.refreshAllPoolStates();
+      } finally {
+        this.ws.setHydratingPools(false);
+      }
       this.latencyTracker.recordReconnectDuration(performance.now() - reconnectStart);
     });
 
@@ -1959,6 +1965,18 @@ export class ArbitrageScanner {
   }
 
   public async refreshAllPoolStates(): Promise<void> {
+    if (this.inFlightRefreshPromise) {
+      return this.inFlightRefreshPromise;
+    }
+    this.inFlightRefreshPromise = this.executeRefreshAllPoolStates();
+    try {
+      await this.inFlightRefreshPromise;
+    } finally {
+      this.inFlightRefreshPromise = null;
+    }
+  }
+
+  private async executeRefreshAllPoolStates(): Promise<void> {
     const pools = this.poolRegistry.getAllPools();
     const pubkeys = pools.map(p => new PublicKey(p.id));
 
@@ -3510,7 +3528,7 @@ export class ArbitrageScanner {
     return this.automaticScout.getMetrics();
   }
 
-  public async reconnectWebSocket(timeoutMs = 12000): Promise<{
+  public async reconnectWebSocket(timeoutMs = 8000): Promise<{
     success: boolean;
     status: 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED' | 'FAILED';
     error?: string;
@@ -3531,16 +3549,22 @@ export class ArbitrageScanner {
       // 1. Manually reconnect WebSocket (safely closes old connection, cancels timers, resubscribes)
       const connected = await this.ws.manualReconnect(timeoutMs);
       if (!connected) {
+        const lastErr = this.ws.getLastError();
         return {
           success: false,
           status: 'FAILED',
-          error: 'WebSocket connection failed to establish or timed out',
+          error: lastErr ? `WebSocket connection failed: ${lastErr}` : 'WebSocket connection failed to establish or timed out',
           durationMs: performance.now() - start
         };
       }
 
-      // 2. Refresh all pool states and revalidate routes
-      await this.refreshAllPoolStates();
+      // 2. Hydrate pool states with stage tracking
+      this.ws.setHydratingPools(true);
+      try {
+        await this.refreshAllPoolStates();
+      } finally {
+        this.ws.setHydratingPools(false);
+      }
 
       return {
         success: true,
@@ -3880,8 +3904,8 @@ export class ArbitrageScanner {
       scannerStatus = 'DEGRADED';
     }
 
-    const wsStatus: 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED' | 'FAILED' | 'STANDBY' =
-      this.isManualReconnecting ? 'RECONNECTING' : (health.wsConnectionState || (health.connectedWs ? 'CONNECTED' : 'DISCONNECTED'));
+    const wsStatus: 'CONNECTED' | 'HEALTHY' | 'CONNECTING' | 'RECONNECTING' | 'RESTORING_SUBSCRIPTIONS' | 'HYDRATING_POOLS' | 'DISCONNECTED' | 'FAILED' | 'STANDBY' =
+      this.isManualReconnecting ? 'RECONNECTING' : (this.ws ? this.ws.getConnectionStage() : (health.wsConnectionState || (health.connectedWs ? 'CONNECTED' : 'DISCONNECTED')));
 
     const rpcStatus: 'ACTIVE' | 'DEGRADED' | 'FAILED' | 'STANDBY' =
       health.connectedRpc ? 'ACTIVE' : 'DEGRADED';
@@ -3892,7 +3916,7 @@ export class ArbitrageScanner {
       scannerStatus,
       scannerOnline: this.isRunning,
       solanaSlot: health.currentSlot,
-      wsConnected: wsStatus === 'CONNECTED',
+      wsConnected: wsStatus === 'CONNECTED' || wsStatus === 'HEALTHY',
       wsStatus,
       rpcStatus,
       sessionUptimeFormatted,

@@ -491,7 +491,7 @@ export class ProfitHudServer {
         scannerStatus,
         scannerState,
         wsStatus,
-        wsConnected: wsStatus === 'CONNECTED',
+        wsConnected: wsStatus === 'CONNECTED' || wsStatus === 'HEALTHY',
         // Legacy compat fields
         qualifiedCount: health ? health.qualifiedCount : 0,
         rejectedCount: health ? health.rejectedCount : 0,
@@ -660,6 +660,9 @@ export class ProfitHudServer {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <title>SolanaBot HUD V2 - Crypto Arbitrage Trading Terminal</title>
   <style>
     :root {
@@ -2107,10 +2110,10 @@ export class ProfitHudServer {
 
       function updateBadge(el, status, greenVal, amberVal, redVal) {
         if (!el) return;
-        el.textContent = status;
-        if (status === greenVal || status === 'ONLINE' || status === 'RUNNING' || status === 'ACTIVE' || status === 'CONNECTED') {
+        el.textContent = status ? status.replace(/_/g, ' ') : '--';
+        if (status === greenVal || status === 'ONLINE' || status === 'RUNNING' || status === 'ACTIVE' || status === 'CONNECTED' || status === 'HEALTHY') {
           el.className = 'status-badge status-online';
-        } else if (status === amberVal || status === 'RECONNECTING' || status === 'DEGRADED' || status === 'STANDBY') {
+        } else if (status === amberVal || status === 'RECONNECTING' || status === 'CONNECTING' || status === 'RESTORING_SUBSCRIPTIONS' || status === 'HYDRATING_POOLS' || status === 'DEGRADED' || status === 'STANDBY') {
           el.className = 'status-badge status-standby';
         } else {
           el.className = 'status-badge status-offline';
@@ -2118,7 +2121,7 @@ export class ProfitHudServer {
       }
 
       function updateWsBadge(status) {
-        updateBadge(telemetryWsBadge, status, 'CONNECTED', 'RECONNECTING', 'DISCONNECTED');
+        updateBadge(telemetryWsBadge, status, 'HEALTHY', 'RECONNECTING', 'DISCONNECTED');
       }
 
       function showAlert(el, msg, isError) {
@@ -2486,8 +2489,8 @@ export class ProfitHudServer {
           const rpcState = data.rpcStatus || 'STANDBY';
           updateBadge(rpcBadge, rpcState, 'ACTIVE', 'DEGRADED', 'OFFLINE');
 
-          const wsState = data.wsStatus || 'STANDBY';
-          telemetryNetwork.textContent = rpcState + ' / ' + wsState;
+          const wsState = data.wsStatus || (data.wsConnected ? 'HEALTHY' : 'STANDBY');
+          telemetryNetwork.textContent = rpcState + ' / ' + (wsState ? wsState.replace(/_/g, ' ') : 'STANDBY');
           if (!isWsReconnecting) {
             updateWsBadge(wsState);
           }

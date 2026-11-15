@@ -10,6 +10,17 @@ export type AccountUpdateHandler = (
 ) => void;
 export type SlotUpdateHandler = (slot: number) => void;
 
+export type WsConnectionStage =
+  | 'STANDBY'
+  | 'CONNECTING'
+  | 'CONNECTED'
+  | 'RESTORING_SUBSCRIPTIONS'
+  | 'HYDRATING_POOLS'
+  | 'HEALTHY'
+  | 'RECONNECTING'
+  | 'DISCONNECTED'
+  | 'FAILED';
+
 export type WsConnectionState = 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED' | 'FAILED';
 
 export interface WsStats {
@@ -20,7 +31,9 @@ export interface WsStats {
   subscriptionCount: number;
   messagesTotal?: number;
   connectionState?: WsConnectionState;
+  connectionStage?: WsConnectionStage;
   isReconnecting?: boolean;
+  lastError?: string | null;
 }
 
 export class SolanaWsProvider {
@@ -36,6 +49,9 @@ export class SolanaWsProvider {
   private backoffMaxMs = 30000;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  private socketGeneration = 0;
+  private stage: WsConnectionStage = 'STANDBY';
+  private lastError: string | null = null;
 
   private currentSlot = 0;
   private lastMessageTime = 0;
@@ -55,8 +71,11 @@ export class SolanaWsProvider {
     this.config = config;
   }
 
-  public connect(timeoutMs = 10000): Promise<boolean> {
+  public connect(timeoutMs = 8000): Promise<boolean> {
     this.isExplicitlyClosed = false;
+    const currentGen = ++this.socketGeneration;
+    this.stage = this.isReconnectingInProgress ? 'RECONNECTING' : 'CONNECTING';
+
     return new Promise((resolve) => {
       let isSettled = false;
       let timer: NodeJS.Timeout | null = null;
@@ -74,17 +93,22 @@ export class SolanaWsProvider {
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           if (!isSettled) {
-            try { this.ws?.terminate(); } catch {}
-            this.handleDisconnect();
+            if (this.socketGeneration === currentGen) {
+              this.lastError = `Connection timeout (${timeoutMs}ms) exceeded`;
+              try { this.ws?.terminate(); } catch {}
+              this.handleDisconnect();
+            }
             finish(false);
           }
         }, timeoutMs);
+        timer.unref();
       }
 
       try {
         this.ws = new WebSocket(this.config.SOLANA_RPC_WS);
 
-        this.ws.on('open', async () => {
+        this.ws.on('open', () => {
+          if (this.socketGeneration !== currentGen) return;
           if (timer) {
             clearTimeout(timer);
             timer = null;
@@ -92,41 +116,64 @@ export class SolanaWsProvider {
           this.reconnectAttempts = 0;
           this.lastManualAttemptFailed = false;
           this.lastMessageTime = Date.now();
+          this.lastError = null;
+          this.stage = 'CONNECTED';
+
+          // 1. Resolve connect promise immediately once transport is open
+          finish(true);
+
+          // 2. Advance to restoring subscriptions
+          this.stage = 'RESTORING_SUBSCRIPTIONS';
           this.subscribeSlot();
-          this.resubscribeAccounts();
+          this.resubscribeAccountsPaced(currentGen);
           this.startHeartbeat();
+
+          // 3. Trigger reconnect callbacks in background without blocking connect()
           for (const cb of this.onReconnectCallbacks) {
             try {
               const res = cb();
               if (res && typeof (res as Promise<any>).then === 'function') {
-                await res;
+                (res as Promise<any>).catch((err) => {
+                  console.warn('[SolanaWsProvider] Reconnect callback error:', err?.message || String(err));
+                });
               }
-            } catch {}
+            } catch (err: any) {
+              console.warn('[SolanaWsProvider] Reconnect callback error:', err?.message || String(err));
+            }
           }
-          finish(true);
         });
 
         this.ws.on('message', (data: WebSocket.RawData) => {
+          if (this.socketGeneration !== currentGen) return;
           this.lastMessageTime = Date.now();
           this.handleMessage(data.toString());
         });
 
-        this.ws.on('error', (_err) => {
-          // Handled in on('close')
+        this.ws.on('error', (err) => {
+          if (this.socketGeneration !== currentGen) return;
+          const errMsg = err instanceof Error ? err.message : String(err);
+          this.lastError = errMsg;
+          console.warn(`[SolanaWsProvider] WebSocket error: ${errMsg}`);
         });
 
         this.ws.on('close', () => {
+          if (this.socketGeneration !== currentGen) return;
+          this.stage = 'DISCONNECTED';
           this.handleDisconnect();
           finish(false);
         });
-      } catch {
-        this.handleDisconnect();
+      } catch (err: any) {
+        if (this.socketGeneration === currentGen) {
+          this.lastError = err?.message || String(err);
+          this.stage = 'DISCONNECTED';
+          this.handleDisconnect();
+        }
         finish(false);
       }
     });
   }
 
-  private handleDisconnect(): void {
+  private handleDisconnect(isManual = false): void {
     this.slotSubId = null;
     this.subIdToPubkey.clear();
     this.reqIdToPubkey.clear();
@@ -140,7 +187,7 @@ export class SolanaWsProvider {
       try { cb(); } catch {}
     }
 
-    if (!this.isExplicitlyClosed && !this.isReconnectingInProgress) {
+    if (!isManual && !this.isExplicitlyClosed && !this.isReconnectingInProgress) {
       this.scheduleAutoReconnect();
     }
   }
@@ -156,10 +203,11 @@ export class SolanaWsProvider {
       this.reconnectTimer = setTimeout(() => {
         this.connect();
       }, delay);
+      this.reconnectTimer.unref();
     }
   }
 
-  public async manualReconnect(timeoutMs = 10000): Promise<boolean> {
+  public async manualReconnect(timeoutMs = 8000): Promise<boolean> {
     if (this.isReconnectingInProgress) {
       if (this.activeReconnectPromise) {
         return this.activeReconnectPromise;
@@ -168,6 +216,7 @@ export class SolanaWsProvider {
     }
 
     this.isReconnectingInProgress = true;
+    this.stage = 'RECONNECTING';
     this.lastManualAttemptFailed = false;
 
     this.activeReconnectPromise = (async () => {
@@ -178,32 +227,36 @@ export class SolanaWsProvider {
           this.reconnectTimer = null;
         }
 
-        // 2. Safely close existing connection
+        // 2. Safely close existing connection and invalidate socket generation
         if (this.ws) {
           const oldWs = this.ws;
           this.ws = null;
+          this.socketGeneration++;
           oldWs.removeAllListeners();
           try {
             oldWs.terminate();
           } catch {}
-          this.handleDisconnect();
+          this.handleDisconnect(true);
         }
 
         // 3. Reset reconnect attempts & mark not explicitly closed
         this.reconnectAttempts = 0;
         this.isExplicitlyClosed = false;
 
-        // 4. Connect fresh WebSocket
+        // 4. Connect fresh WebSocket with bounded timeout
         const connected = await this.connect(timeoutMs);
         if (!connected) {
           this.lastManualAttemptFailed = true;
+          this.stage = 'FAILED';
           this.scheduleAutoReconnect();
         } else {
           this.lastManualAttemptFailed = false;
         }
         return connected;
-      } catch {
+      } catch (err: any) {
         this.lastManualAttemptFailed = true;
+        this.lastError = err instanceof Error ? err.message : String(err);
+        this.stage = 'FAILED';
         this.scheduleAutoReconnect();
         return false;
       } finally {
@@ -215,21 +268,50 @@ export class SolanaWsProvider {
     return this.activeReconnectPromise;
   }
 
-  public getConnectionState(): WsConnectionState {
-    if (this.isReconnectingInProgress) {
-      return 'RECONNECTING';
+  public getConnectionStage(): WsConnectionStage {
+    if (this.isExplicitlyClosed) return 'DISCONNECTED';
+    if (this.isReconnectingInProgress) return 'RECONNECTING';
+    if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+      return this.lastManualAttemptFailed ? 'FAILED' : 'DISCONNECTED';
     }
-    if (this.ws !== null && this.ws.readyState === WebSocket.OPEN) {
+    if (this.ws.readyState === WebSocket.CONNECTING) return 'CONNECTING';
+    if (this.ws.readyState === WebSocket.OPEN) {
+      const isFresh = (Date.now() - this.lastMessageTime) < (this.config.MAX_QUOTE_AGE_MS * 2 || 5000);
+      if (this.currentSlot > 0 && isFresh) {
+        return 'HEALTHY';
+      }
+      if (this.stage === 'RESTORING_SUBSCRIPTIONS' || this.stage === 'HYDRATING_POOLS') {
+        return this.stage;
+      }
       return 'CONNECTED';
     }
-    if (this.lastManualAttemptFailed) {
-      return 'FAILED';
+    return 'DISCONNECTED';
+  }
+
+  public getConnectionState(): WsConnectionState {
+    const stage = this.getConnectionStage();
+    if (stage === 'HEALTHY' || stage === 'CONNECTED') return 'CONNECTED';
+    if (stage === 'RECONNECTING' || stage === 'CONNECTING' || stage === 'RESTORING_SUBSCRIPTIONS' || stage === 'HYDRATING_POOLS') {
+      return 'RECONNECTING';
     }
+    if (stage === 'FAILED') return 'FAILED';
     return 'DISCONNECTED';
   }
 
   public isReconnecting(): boolean {
     return this.isReconnectingInProgress;
+  }
+
+  public setHydratingPools(hydrating: boolean): void {
+    if (hydrating && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.stage = 'HYDRATING_POOLS';
+    } else if (!hydrating && this.stage === 'HYDRATING_POOLS') {
+      this.stage = this.currentSlot > 0 ? 'HEALTHY' : 'CONNECTED';
+    }
+  }
+
+  public getLastError(): string | null {
+    return this.lastError;
   }
 
   private subscribeSlot(): void {
@@ -269,10 +351,40 @@ export class SolanaWsProvider {
     }));
   }
 
-  private resubscribeAccounts(): void {
-    for (const pubkey of this.accountSubscriptions.keys()) {
+  private resubscribeAccountsPaced(gen: number): void {
+    const pubkeys = Array.from(this.accountSubscriptions.keys());
+    if (pubkeys.length === 0) return;
+
+    // Send first batch of up to 10 immediately
+    const immediate = pubkeys.slice(0, 10);
+    for (const pubkey of immediate) {
+      if (this.socketGeneration !== gen || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       this.sendAccountSubscribe(pubkey);
     }
+
+    if (pubkeys.length <= 10) return;
+
+    // Pace remaining subscriptions in batches of 10 every 50ms to prevent RPC socket drops
+    let index = 10;
+    const interval = setInterval(() => {
+      if (this.socketGeneration !== gen || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        clearInterval(interval);
+        return;
+      }
+      const chunk = pubkeys.slice(index, index + 10);
+      for (const pubkey of chunk) {
+        this.sendAccountSubscribe(pubkey);
+      }
+      index += 10;
+      if (index >= pubkeys.length) {
+        clearInterval(interval);
+      }
+    }, 50);
+    interval.unref();
+  }
+
+  private resubscribeAccounts(): void {
+    this.resubscribeAccountsPaced(this.socketGeneration);
   }
 
   private handleMessage(rawMessage: string): void {
@@ -352,9 +464,11 @@ export class SolanaWsProvider {
       const now = Date.now();
       if (now - this.lastMessageTime > 20000 && this.ws && this.ws.readyState === WebSocket.OPEN) {
         // Feed is stalled; terminate to trigger clean reconnection
+        console.warn('[SolanaWsProvider] Feed stalled >20s without messages. Terminating socket for recovery.');
         this.ws.terminate();
       }
     }, 5000);
+    this.heartbeatTimer.unref();
   }
 
   private stopHeartbeat(): void {
@@ -393,7 +507,7 @@ export class SolanaWsProvider {
     if (elapsed > this.config.MAX_QUOTE_AGE_MS * 2) {
       return 'STALE';
     }
-    if (elapsed > 5000) {
+    if (elapsed > 5000 || this.currentSlot === 0) {
       return 'DEGRADED';
     }
     return 'HEALTHY';
@@ -403,12 +517,14 @@ export class SolanaWsProvider {
     return {
       connected: this.ws !== null && this.ws.readyState === WebSocket.OPEN,
       connectionState: this.getConnectionState(),
+      connectionStage: this.getConnectionStage(),
       isReconnecting: this.isReconnectingInProgress,
       reconnectCount: this.reconnectAttempts,
       lastSlot: this.currentSlot,
       lastMessageTime: this.lastMessageTime,
       subscriptionCount: this.accountSubscriptions.size,
-      messagesTotal: this.messagesTotal
+      messagesTotal: this.messagesTotal,
+      lastError: this.lastError
     };
   }
 

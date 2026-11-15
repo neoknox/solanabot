@@ -595,7 +595,7 @@ export interface HudV2Payload {
   scannerOnline: boolean;
   solanaSlot: number | null;
   wsConnected: boolean;
-  wsStatus: 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED' | 'FAILED' | 'STANDBY';
+  wsStatus: 'CONNECTED' | 'HEALTHY' | 'CONNECTING' | 'RECONNECTING' | 'RESTORING_SUBSCRIPTIONS' | 'HYDRATING_POOLS' | 'DISCONNECTED' | 'FAILED' | 'STANDBY';
   rpcStatus: 'ACTIVE' | 'DEGRADED' | 'FAILED' | 'STANDBY';
   sessionUptimeFormatted: string;
   lastSuccessfulUpdateTimestamp: number;
