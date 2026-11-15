@@ -1,0 +1,62 @@
+{
+  "timestamp": "2026-11-15T20:48:44.094Z",
+  "durationSeconds": 10,
+  "connectionHealth": {
+    "wsConnected": false,
+    "uptimePercent": 30,
+    "downtimeEventsCount": 3,
+    "totalDowntimeMs": 8450,
+    "slotGapCount": 2,
+    "totalSlotsSkipped": 52,
+    "maxSlotGap": 28,
+    "confirmedSubscriptionCount": 539,
+    "activeAccountsWithUpdates": 0,
+    "messagesTotal": 189
+  },
+  "rpcMetrics": {
+    "requestsTotal": 41,
+    "requestsFailed": 0,
+    "latencyP50Ms": 381.86,
+    "latencyP95Ms": 4001.62,
+    "latencyP99Ms": 4001.62
+  },
+  "quoteMetrics": {
+    "totalEvaluated": 5930,
+    "quoteValidEvaluations": 436,
+    "quoteValidRatePercent": 7.35,
+    "averageReadyRoutes": 27.85,
+    "peakReadyRoutes": 128,
+    "quoteLatencyP50Us": 27.5,
+    "quoteLatencyP95Us": 23660.2,
+    "quoteLatencyP99Us": 39321
+  },
+  "profitFunnel": {
+    "grossPositive": 0,
+    "positiveAfterModeledFees": 0,
+    "positiveAfterSafetyBuffer": 0,
+    "qualifiedAboveTarget10c": 0,
+    "independentlyRevalidated": 0
+  },
+  "revalidationEvidence": {
+    "totalSamples": 0,
+    "sameCachedSnapshotCount": 0,
+    "independentObservationCount": 0,
+    "marketStateChangedCount": 0,
+    "survivedCount": 0,
+    "survivalRatePercent": 0
+  },
+  "systemHealth": {
+    "rssMb": 302.46,
+    "heapUsedMb": 169.96,
+    "cpuUserMs": 16125,
+    "cpuSystemMs": 1235
+  },
+  "competitorBenchmark": {
+    "analyzedDocumentedTrades": 4,
+    "avgCompetitorNetUSDC": 0.7061,
+    "coverageGapsIdentified": 1,
+    "identifiedGaps": [
+      "METEORA_DLMM (HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR) - Missing in bot catalog"
+    ]
+  }
+}

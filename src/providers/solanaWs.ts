@@ -29,6 +29,13 @@ export interface WsStats {
   lastSlot: number;
   lastMessageTime: number;
   subscriptionCount: number;
+  confirmedSubscriptionCount?: number;
+  activeAccountUpdatesCount?: number;
+  slotGapCount?: number;
+  totalSlotsSkipped?: number;
+  maxSlotGap?: number;
+  totalDowntimeMs?: number;
+  downtimeEventsCount?: number;
   messagesTotal?: number;
   connectionState?: WsConnectionState;
   connectionStage?: WsConnectionStage;
@@ -62,6 +69,16 @@ export class SolanaWsProvider {
   private reqIdForSlot: number | null = null;
   private slotSubId: number | null = null;
   private messagesTotal = 0;
+
+  // Connection reliability & subscription health telemetry
+  private hasConnectedOnce = false;
+  private slotGapCount = 0;
+  private totalSlotsSkipped = 0;
+  private maxSlotGap = 0;
+  private disconnectStartTime = 0;
+  private totalDowntimeMs = 0;
+  private downtimeEventsCount = 0;
+  private activeAccountsWithUpdates = new Set<string>();
 
   private onReconnectCallbacks: Array<() => void | Promise<void>> = [];
   private onDisconnectCallbacks: Array<() => void> = [];
@@ -113,6 +130,10 @@ export class SolanaWsProvider {
             clearTimeout(timer);
             timer = null;
           }
+          if (this.disconnectStartTime > 0) {
+            this.totalDowntimeMs += Date.now() - this.disconnectStartTime;
+            this.disconnectStartTime = 0;
+          }
           this.reconnectAttempts = 0;
           this.lastManualAttemptFailed = false;
           this.lastMessageTime = Date.now();
@@ -128,18 +149,22 @@ export class SolanaWsProvider {
           this.resubscribeAccountsPaced(currentGen);
           this.startHeartbeat();
 
-          // 3. Trigger reconnect callbacks in background without blocking connect()
-          for (const cb of this.onReconnectCallbacks) {
-            try {
-              const res = cb();
-              if (res && typeof (res as Promise<any>).then === 'function') {
-                (res as Promise<any>).catch((err) => {
-                  console.warn('[SolanaWsProvider] Reconnect callback error:', err?.message || String(err));
-                });
+          // 3. Trigger reconnect callbacks in background without blocking connect() ONLY on genuine reconnection
+          if (this.hasConnectedOnce) {
+            for (const cb of this.onReconnectCallbacks) {
+              try {
+                const res = cb();
+                if (res && typeof (res as Promise<any>).then === 'function') {
+                  (res as Promise<any>).catch((err) => {
+                    console.warn('[SolanaWsProvider] Reconnect callback error:', err?.message || String(err));
+                  });
+                }
+              } catch (err: any) {
+                console.warn('[SolanaWsProvider] Reconnect callback error:', err?.message || String(err));
               }
-            } catch (err: any) {
-              console.warn('[SolanaWsProvider] Reconnect callback error:', err?.message || String(err));
             }
+          } else {
+            this.hasConnectedOnce = true;
           }
         });
 
@@ -174,6 +199,10 @@ export class SolanaWsProvider {
   }
 
   private handleDisconnect(isManual = false): void {
+    if (this.disconnectStartTime === 0) {
+      this.disconnectStartTime = Date.now();
+      this.downtimeEventsCount++;
+    }
     this.slotSubId = null;
     this.subIdToPubkey.clear();
     this.reqIdToPubkey.clear();
@@ -417,6 +446,12 @@ export class SolanaWsProvider {
       if (msg.method === 'slotNotification') {
         const slot = msg.params?.result?.slot;
         if (typeof slot === 'number') {
+          if (this.currentSlot > 0 && slot > this.currentSlot + 1) {
+            const gap = slot - this.currentSlot - 1;
+            this.slotGapCount++;
+            this.totalSlotsSkipped += gap;
+            this.maxSlotGap = Math.max(this.maxSlotGap, gap);
+          }
           this.currentSlot = slot;
           for (const cb of this.onSlotCallbacks) {
             try { cb(slot); } catch {}
@@ -436,6 +471,7 @@ export class SolanaWsProvider {
           // Dispatch ONLY to the exact subscribed account handler
           const pubkey = this.subIdToPubkey.get(subId);
           if (pubkey) {
+            this.activeAccountsWithUpdates.add(pubkey);
             const sub = this.accountSubscriptions.get(pubkey);
             if (sub) {
               sub.handler(buffer, slot, receiptMs, receiptMonotonic);
@@ -444,8 +480,9 @@ export class SolanaWsProvider {
           }
 
           // Secondary lookup by matching sub.id
-          for (const sub of this.accountSubscriptions.values()) {
+          for (const [pk, sub] of this.accountSubscriptions.entries()) {
             if (sub.id === subId) {
+              this.activeAccountsWithUpdates.add(pk);
               sub.handler(buffer, slot, receiptMs, receiptMonotonic);
               return;
             }
@@ -514,6 +551,7 @@ export class SolanaWsProvider {
   }
 
   public getStats(): WsStats {
+    const confirmedCount = Array.from(this.accountSubscriptions.values()).filter(s => s.id !== undefined).length;
     return {
       connected: this.ws !== null && this.ws.readyState === WebSocket.OPEN,
       connectionState: this.getConnectionState(),
@@ -523,6 +561,13 @@ export class SolanaWsProvider {
       lastSlot: this.currentSlot,
       lastMessageTime: this.lastMessageTime,
       subscriptionCount: this.accountSubscriptions.size,
+      confirmedSubscriptionCount: confirmedCount,
+      activeAccountUpdatesCount: this.activeAccountsWithUpdates.size,
+      slotGapCount: this.slotGapCount,
+      totalSlotsSkipped: this.totalSlotsSkipped,
+      maxSlotGap: this.maxSlotGap,
+      totalDowntimeMs: this.totalDowntimeMs + (this.disconnectStartTime > 0 ? Date.now() - this.disconnectStartTime : 0),
+      downtimeEventsCount: this.downtimeEventsCount,
       messagesTotal: this.messagesTotal,
       lastError: this.lastError
     };

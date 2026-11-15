@@ -150,17 +150,15 @@ export class ArbitrageProfitCalculator {
     // 6. Multi-stage conservative leg sizing (BigInt floor rounding)
     const leg1ExpectedOutWSOL = leg1Quote.outAmount;
     const slippageBps1 = BigInt(this.config.SLIPPAGE_BPS_LEG1);
-    const slippage1 = (leg1ExpectedOutWSOL * slippageBps1) / 10000n;
-    const leg1ConservativeOutWSOL = params.leg1ConservativeQuote
-      ? params.leg1ConservativeQuote.outAmount - slippage1
-      : leg1ExpectedOutWSOL - slippage1;
+    const leg1BaseForSlippage = params.leg1ConservativeQuote ? params.leg1ConservativeQuote.outAmount : leg1ExpectedOutWSOL;
+    const slippage1 = (leg1BaseForSlippage * slippageBps1) / 10000n;
+    const leg1ConservativeOutWSOL = leg1BaseForSlippage - slippage1;
 
     const leg2ExpectedOutUSDC = leg2Quote.outAmount;
     const slippageBps2 = BigInt(this.config.SLIPPAGE_BPS_LEG2);
-    const slippage2 = (leg2ExpectedOutUSDC * slippageBps2) / 10000n;
-    const leg2ConservativeOutUSDC = params.leg2ConservativeQuote
-      ? params.leg2ConservativeQuote.outAmount - slippage2
-      : leg2ExpectedOutUSDC - slippage2;
+    const leg2BaseForSlippage = params.leg2ConservativeQuote ? params.leg2ConservativeQuote.outAmount : leg2ExpectedOutUSDC;
+    const slippage2 = (leg2BaseForSlippage * slippageBps2) / 10000n;
+    const leg2ConservativeOutUSDC = leg2BaseForSlippage - slippage2;
 
     const finalExpectedUnits = leg2ExpectedOutUSDC;
     const finalConservativeUnits = leg2ConservativeOutUSDC;

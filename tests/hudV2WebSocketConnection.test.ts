@@ -167,6 +167,9 @@ describe('SOLANABOT — HUD V2 WebSocket Connection Architecture & Regression Su
     let callbackSettled = false;
     let callbackStarted = false;
 
+    // Mark that ws has connected once so reconnect callbacks fire on reconnection
+    (ws as any).hasConnectedOnce = true;
+
     // Register a slow 1.5-second reconnect callback (simulating heavy RPC snapshot refresh)
     ws.onReconnect(async () => {
       callbackStarted = true;

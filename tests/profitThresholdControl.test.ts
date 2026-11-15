@@ -161,7 +161,7 @@ describe('Phase 1.3: Profit Threshold HUD & Runtime Control Suite', () => {
     const leg2Conservative = createValidQuote({
       poolId: 'test-pool-2',
       inAmount: 500_000_000n,
-      outAmount: 100_773_673n, // minus 100_673n slippage = 100_673_000n conservative units
+      outAmount: 100_773_774n, // minus 100_773n slippage = 100_673_001n conservative units -> 0.4000 net
       inputMint: CANONICAL_WSOL_MINT,
       outputMint: CANONICAL_USDC_MINT
     });

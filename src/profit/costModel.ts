@@ -8,7 +8,9 @@ export interface FeeEstimateInput {
   solPriceUSDC?: Decimal;
   solPriceTimestamp?: number;
   measuredPriorityFeeLamports?: number;
+  jitoTipLamports?: number;
   tokenTransferFeeBps?: number;
+  tradeSizeUSDC?: number;
   requiresAtaSetup?: boolean;
 }
 
@@ -81,17 +83,21 @@ export class CostModel {
       `Estimated priority fee: ${priorityLamports.toString()} lamports = $${priorityFeeUSDC.toFixed(6)}`
     );
 
-    // 3. Jito validator tip
-    const jitoLamports = new Decimal(this.config.JITO_TIP_LAMPORTS);
+    // 3. Jito validator tip (modeled as scenario cost or configured tip)
+    const jitoLamports = new Decimal(input.jitoTipLamports ?? this.config.JITO_TIP_LAMPORTS);
     const jitoTipUSDC = jitoLamports.div(1e9).mul(solPrice);
     assumptions.push(
-      `Estimated Jito tip: ${jitoLamports.toString()} lamports = $${jitoTipUSDC.toFixed(6)} (Default 0 for read-only)`
+      `Estimated Jito tip: ${jitoLamports.toString()} lamports = $${jitoTipUSDC.toFixed(6)}`
     );
 
     // 4. Token transfer fees (0 for canonical SPL, non-zero for Token-2022 if applicable)
-    const tokenTransferFeesUSDC = new Decimal(0);
+    let tokenTransferFeesUSDC = new Decimal(0);
     if (input.tokenTransferFeeBps && input.tokenTransferFeeBps > 0) {
-      assumptions.push(`Token transfer fee: ${input.tokenTransferFeeBps} bps`);
+      const tradeSize = input.tradeSizeUSDC ? new Decimal(input.tradeSizeUSDC) : new Decimal(100);
+      tokenTransferFeesUSDC = tradeSize.mul(input.tokenTransferFeeBps).div(10000);
+      assumptions.push(
+        `Token transfer fee: ${input.tokenTransferFeeBps} bps on $${tradeSize.toFixed(2)} = $${tokenTransferFeesUSDC.toFixed(6)}`
+      );
     }
 
     // 5. Execution contingency

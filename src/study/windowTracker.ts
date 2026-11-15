@@ -284,8 +284,9 @@ export class OpportunityWindowTracker {
     isWsConnected: boolean,
     isRpcActive: boolean
   ): WindowClosureReason {
-    if (!isWsConnected) return WindowClosureReason.WS_DISCONNECTED;
-    if (!isRpcActive) return WindowClosureReason.RPC_FAILURE;
+    if (!isWsConnected || !isRpcActive) {
+      return WindowClosureReason.UNKNOWN;
+    }
 
     if (candidate.survivalStatus === 'DECAYED') {
       return WindowClosureReason.REVALIDATION_FAILURE;
@@ -341,7 +342,8 @@ export class OpportunityWindowTracker {
       reason === WindowClosureReason.WS_DISCONNECTED ||
       reason === WindowClosureReason.RPC_FAILURE ||
       reason === WindowClosureReason.SCANNER_STOP ||
-      reason === WindowClosureReason.STUDY_COMPLETED;
+      reason === WindowClosureReason.STUDY_COMPLETED ||
+      reason === WindowClosureReason.UNKNOWN;
 
     window.status = isCensored ? 'INTERRUPTED_CENSORED' : 'CLOSED';
     window.closureReason = reason;

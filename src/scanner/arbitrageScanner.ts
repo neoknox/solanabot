@@ -140,6 +140,10 @@ export class ArbitrageScanner {
     totalEvaluated: 0,
     uniqueOpportunities: 0,
     candidatesGrossPositive: 0,
+    candidatesPositiveAfterModeledFees: 0,
+    candidatesPositiveAfterSafetyBuffer: 0,
+    candidatesQualifiedAboveTarget: 0,
+    candidatesIndependentlyRevalidated: 0,
     candidatesConservativeQualified: 0,
     rejectedRoutes: 0,
     quoteValidationFailures: 0,
@@ -1395,7 +1399,7 @@ export class ArbitrageScanner {
     costs: CostBreakdown,
     currentSlot: number,
     t0: number
-  ): { isSurvived: boolean; reason?: string; conservativeNetVal: number } {
+  ): { isSurvived: boolean; reason?: string; conservativeNetVal: number; observationType?: 'SAME_CACHED_SNAPSHOT' | 'INDEPENDENT_OBSERVATION' | 'MARKET_STATE_CHANGED' } {
     try {
       const sizeUSDC = candidate.optimalSizeUSDC || Number(candidate.inputAmountUSDC) / 1e6;
       const now = Date.now();
@@ -1408,7 +1412,11 @@ export class ArbitrageScanner {
 
       // Re-fetch fresh pool states from stateCache
       const freshQuoterLegs: QuoterLeg[] = [];
-      for (const leg of legs) {
+      let isIndependent = false;
+      let isStateChanged = false;
+
+      for (let i = 0; i < legs.length; i++) {
+        const leg = legs[i];
         const pool = this.stateCache.getPoolState(leg.pool.id);
         if (!pool) {
           return { isSurvived: false, reason: 'STATE_CACHE_MISS', conservativeNetVal: 0 };
@@ -1419,25 +1427,40 @@ export class ArbitrageScanner {
         if (pool.slot && Math.abs(currentSlot - pool.slot) > this.config.MAX_SLOT_GAP) {
           return { isSurvived: false, reason: 'SLOT_ADVANCED', conservativeNetVal: 0 };
         }
+        if (pool.receivedAt !== leg.pool.receivedAt || pool.slot !== leg.pool.slot) {
+          isIndependent = true;
+        }
+        if (
+          (pool.stateRevision !== undefined && pool.stateRevision !== leg.pool.stateRevision) ||
+          pool.reserveA !== leg.pool.reserveA ||
+          pool.reserveB !== leg.pool.reserveB ||
+          (pool.extraData as any)?.sqrtPriceX64 !== (leg.pool.extraData as any)?.sqrtPriceX64 ||
+          (pool.extraData as any)?.activeId !== (leg.pool.extraData as any)?.activeId
+        ) {
+          isStateChanged = true;
+        }
         freshQuoterLegs.push({
           ...leg,
           pool
         });
       }
 
+      const observationType: 'SAME_CACHED_SNAPSHOT' | 'INDEPENDENT_OBSERVATION' | 'MARKET_STATE_CHANGED' =
+        isStateChanged ? 'MARKET_STATE_CHANGED' : (isIndependent ? 'INDEPENDENT_OBSERVATION' : 'SAME_CACHED_SNAPSHOT');
+
       const evalRes = this.tradeSizer.evaluateSize(sizeUSDC, freshQuoterLegs, costs, currentSlot);
       const minHurdle = this.profitThresholdManager.getThresholdDecimal();
 
       if (!evalRes.isViable) {
         const reason = evalRes.rejectionReason || 'DEPLETED_LIQUIDITY';
-        return { isSurvived: false, reason, conservativeNetVal: 0 };
+        return { isSurvived: false, reason, conservativeNetVal: 0, observationType };
       }
 
       if (evalRes.conservativeNetUSDC.lt(minHurdle)) {
-        return { isSurvived: false, reason: 'POOL_PRICE_MOVED', conservativeNetVal: evalRes.conservativeNetUSDC.toNumber() };
+        return { isSurvived: false, reason: 'POOL_PRICE_MOVED', conservativeNetVal: evalRes.conservativeNetUSDC.toNumber(), observationType };
       }
 
-      return { isSurvived: true, conservativeNetVal: evalRes.conservativeNetUSDC.toNumber() };
+      return { isSurvived: true, conservativeNetVal: evalRes.conservativeNetUSDC.toNumber(), observationType };
     } catch {
       return { isSurvived: false, reason: 'REVALIDATION_EXCEPTION', conservativeNetVal: 0 };
     }
@@ -1778,9 +1801,24 @@ export class ArbitrageScanner {
       this.latencyTracker.recordSlotLag(Math.max(0, currentSlot - oldestSlot));
     }
 
-    // Track gross profitability
-    if (parseFloat(candidate.expectedNetUSDC) > 0) {
+    // Track 5-stage micro-profitability funnel
+    const expectedNetVal = parseFloat(candidate.expectedNetUSDC);
+    const conservativeNetVal = parseFloat(candidate.minConservativeNetUSDC);
+    const initialUSDC = Number(candidate.inputAmountUSDC) / 1e6;
+    const finalExpectedUSDC = Number(candidate.leg2ExpectedOutUSDC) / 1e6;
+    const isGrossPositive = finalExpectedUSDC > initialUSDC;
+
+    if (isGrossPositive) {
       this.auditMetrics.candidatesGrossPositive++;
+    }
+    if (expectedNetVal > 0) {
+      this.auditMetrics.candidatesPositiveAfterModeledFees = (this.auditMetrics.candidatesPositiveAfterModeledFees || 0) + 1;
+    }
+    if (conservativeNetVal > 0) {
+      this.auditMetrics.candidatesPositiveAfterSafetyBuffer = (this.auditMetrics.candidatesPositiveAfterSafetyBuffer || 0) + 1;
+    }
+    if (candidate.status === 'QUALIFIED_SHADOW') {
+      this.auditMetrics.candidatesQualifiedAboveTarget = (this.auditMetrics.candidatesQualifiedAboveTarget || 0) + 1;
     }
 
     // Deduplicate identical repeated opportunities using route + stateVersion + size
@@ -1834,6 +1872,7 @@ export class ArbitrageScanner {
       if (revalRes.isSurvived) {
         candidate.survivalStatus = 'SURVIVED';
         this.auditMetrics.survivalSurvivedCount = (this.auditMetrics.survivalSurvivedCount || 0) + 1;
+        this.auditMetrics.candidatesIndependentlyRevalidated = (this.auditMetrics.candidatesIndependentlyRevalidated || 0) + 1;
       } else {
         candidate.survivalStatus = 'DECAYED';
         if (revalRes.reason) {
@@ -3928,6 +3967,9 @@ export class ArbitrageScanner {
       sharedVirtualCapitalUSDC: this.config.VIRTUAL_CAPITAL_USDC || 1000,
       profitMonitor: {
         grossPositiveOpportunities: this.auditMetrics.candidatesGrossPositive || 0,
+        positiveAfterModeledFees: this.auditMetrics.candidatesPositiveAfterModeledFees || 0,
+        positiveAfterSafetyBuffer: this.auditMetrics.candidatesPositiveAfterSafetyBuffer || 0,
+        qualifiedAboveTarget: this.auditMetrics.candidatesQualifiedAboveTarget || 0,
         netPositiveOpportunities: this.auditMetrics.candidatesConservativeQualified || 0,
         qualifiedShadowSignals: this.auditMetrics.candidatesConservativeQualified || 0,
         revalidatedSurvivingSignals: this.auditMetrics.survivalSurvivedCount || 0,

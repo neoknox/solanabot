@@ -296,6 +296,10 @@ export interface AuditMetrics {
   totalEvaluated: number;
   uniqueOpportunities: number;
   candidatesGrossPositive: number;
+  candidatesPositiveAfterModeledFees?: number;
+  candidatesPositiveAfterSafetyBuffer?: number;
+  candidatesQualifiedAboveTarget?: number;
+  candidatesIndependentlyRevalidated?: number;
   candidatesConservativeQualified: number;
   rejectedRoutes: number;
   quoteValidationFailures: number;
@@ -606,6 +610,9 @@ export interface HudV2Payload {
   sharedVirtualCapitalUSDC: number;
   profitMonitor: {
     grossPositiveOpportunities: number;
+    positiveAfterModeledFees?: number;
+    positiveAfterSafetyBuffer?: number;
+    qualifiedAboveTarget?: number;
     netPositiveOpportunities: number;
     qualifiedShadowSignals: number;
     revalidatedSurvivingSignals: number;
