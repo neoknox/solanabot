@@ -54,6 +54,7 @@ export interface OpportunityWindowTrackerOptions {
   profitHurdleUSDC?: number; // Default 0.10 USDC
   quoteExpiryMs?: number;    // Default 2500 ms
   repository?: ArbitrageRepository;
+  autoStart?: boolean;
 }
 
 export class OpportunityWindowTracker {
@@ -62,6 +63,7 @@ export class OpportunityWindowTracker {
   private profitHurdleUSDC: number;
   private quoteExpiryMs: number;
   private repository?: ArbitrageRepository;
+  private isActive: boolean;
 
   private startedAt: number;
   private status: 'RUNNING' | 'COMPLETED' | 'INTERRUPTED' = 'RUNNING';
@@ -103,6 +105,7 @@ export class OpportunityWindowTracker {
     this.profitHurdleUSDC = options?.profitHurdleUSDC ?? 0.10;
     this.quoteExpiryMs = options?.quoteExpiryMs ?? 2500;
     this.repository = options?.repository;
+    this.isActive = options?.autoStart ?? true;
 
     this.startedAt = Date.now();
     this.lastUptimeCheck = Date.now();
@@ -111,8 +114,29 @@ export class OpportunityWindowTracker {
       effectiveFromMs: this.startedAt
     });
 
-    // Persist initial session record if repository provided
+    // Persist initial session record if repository provided and study is active
+    if (this.isActive) {
+      this.saveSession();
+    }
+  }
+
+  public isStudyActive(): boolean {
+    return this.isActive;
+  }
+
+  public startStudy(sessionId?: string): void {
+    this.isActive = true;
+    this.status = 'RUNNING';
+    this.startedAt = Date.now();
+    this.lastUptimeCheck = Date.now();
+    if (sessionId) this.sessionId = sessionId;
     this.saveSession();
+  }
+
+  public stopStudy(): void {
+    if (!this.isActive) return;
+    this.completeStudy('SCANNER_STOP');
+    this.isActive = false;
   }
 
   public getProfitHurdle(): number {
@@ -793,7 +817,7 @@ export class OpportunityWindowTracker {
   }
 
   private saveSession(endedAt?: number): void {
-    if (!this.repository) return;
+    if (!this.repository || (!this.isActive && endedAt === undefined)) return;
     try {
       const now = Date.now();
       const sessionRecord: StudySessionRecord = {

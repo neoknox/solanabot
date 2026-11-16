@@ -62,6 +62,7 @@ import {
   RAYDIUM_CLMM_AMM_CONFIG_SIZE
 } from '../dex/raydiumClmmAmmConfig.js';
 import { KNOWN_PROGRAM_IDS } from '../config/index.js';
+import { HeliusCreditTracker } from '../hud/heliusCreditTracker.js';
 
 export type CandidateListener = (candidate: ArbitrageCandidate) => void;
 
@@ -88,6 +89,7 @@ export class ArbitrageScanner {
   private routeIndex: RouteIndex;
   private eventQueue: BoundedEventQueue;
   private latencyTracker: LatencyTracker;
+  private creditTracker: HeliusCreditTracker;
   private automaticScout: AutomaticScout;
   private isDrainingQueue = false;
   private isDrainScheduled = false;
@@ -150,6 +152,7 @@ export class ArbitrageScanner {
   private currentQuoteProducingWindowStart = 0;
   private totalQuoteProducingDurationMs = 0;
   private lastValidQuoteTimestamp = 0;
+  private lastFreshPoolUpdateTimestamp = 0;
 
   private auditMetrics: AuditMetrics = {
     totalEvaluated: 0,
@@ -217,8 +220,10 @@ export class ArbitrageScanner {
     this.opportunityTracker = new OpportunityTracker();
     this.windowTracker = customWindowTracker || new OpportunityWindowTracker({
       profitHurdleUSDC: this.profitThresholdManager.getThresholdUSDC(),
-      repository: this.repository
+      repository: this.repository,
+      autoStart: false
     });
+    this.creditTracker = new HeliusCreditTracker({ config: this.config });
 
     // Hook threshold changes to immediately reclassify active shadow opportunities and unify study hurdle
     this.profitThresholdManager.onThresholdChange((newUSDC) => {
@@ -491,6 +496,7 @@ export class ArbitrageScanner {
 
     // 7. Start Automatic Scout scheduler
     this.automaticScout.start();
+    this.creditTracker.startPolling();
 
     // Mark scanner fully initialized and scan-ready
     this.isInitialized = true;
@@ -567,6 +573,7 @@ export class ArbitrageScanner {
 
       // 2. Identify affected routes: capture T3 AFTER lookup
       if (modifiedPools.size > 0) {
+        this.lastFreshPoolUpdateTimestamp = Date.now();
         for (const [poolId, meta] of modifiedPools.entries()) {
           const tLookupStart = performance.now();
           const routes = this.routeIndex.getRoutesAffectedByPool(poolId, true);
@@ -2584,6 +2591,7 @@ export class ArbitrageScanner {
 
         this.stateCache.setPoolState(pool);
       }
+      this.lastFreshPoolUpdateTimestamp = Date.now();
 
       // Initial route evaluation for all verified pools upon snapshot hydration
       for (const pool of decodedPools) {
@@ -3124,9 +3132,14 @@ export class ArbitrageScanner {
       await this.refreshAllPoolStates();
     }
 
-    const allRoutes = this.routeIndex.getAllRoutes();
-    for (const route of allRoutes) {
+    const eligibleRoutes = this.routeIndex.getVerifiedRoutes();
+    let count = 0;
+    for (const route of eligibleRoutes) {
       this.evaluateIndexedRoute(route);
+      count++;
+      if (count % 25 === 0) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
     }
     this.repository.recordAuditMetrics(this.auditMetrics);
   }
@@ -3963,12 +3976,13 @@ export class ArbitrageScanner {
       totalCostsUSDC: candidate.costs.totalCostsUSDC,
       slotGap: candidate.slotGap,
       revalidationStatus: candidate.survivalStatus || 'UNCHECKED',
+      exactRejectionReason: candidate.rejectionReasons?.length ? candidate.rejectionReasons.join('; ') : (candidate.status === 'REJECTED' ? 'Did not meet hurdle or risk criteria' : 'None'),
       timestamp: candidate.timestamp || Date.now()
     };
 
     const bufferKey = `${route.routeId}:${inputUSDCNum}`;
     this.profitWatchBuffer.set(bufferKey, watchItem);
-    if (this.profitWatchBuffer.size > 100) {
+    if (this.profitWatchBuffer.size > 20) {
       const oldestKey = this.profitWatchBuffer.keys().next().value;
       if (oldestKey) this.profitWatchBuffer.delete(oldestKey);
     }
@@ -3976,32 +3990,41 @@ export class ArbitrageScanner {
 
   public getProfitWatchTable(limit = 10): ProfitWatchItem[] {
     const now = Date.now();
-    let items = Array.from(this.profitWatchBuffer.values())
-      .filter(i => now - i.timestamp <= 60000);
-
-    if (items.length < limit) {
-      items = Array.from(this.profitWatchBuffer.values())
-        .filter(i => now - i.timestamp <= 300000);
+    // Prune stale items older than 60s from memory
+    for (const [key, item] of this.profitWatchBuffer.entries()) {
+      if (now - item.timestamp > 60000) {
+        this.profitWatchBuffer.delete(key);
+      }
     }
 
+    let items = Array.from(this.profitWatchBuffer.values()).map(item => {
+      const quoteAgeMs = Math.max(0, now - item.timestamp);
+      let status = item.status;
+      if (quoteAgeMs > 5000 && status !== 'STALE') {
+        status = 'STALE';
+      }
+      return {
+        ...item,
+        quoteAgeMs,
+        status
+      };
+    });
+
     items.sort((a, b) => {
-      const classRank = { QUALIFIED: 0, NEAR_MISS: 1, REJECTED: 2 };
-      if (classRank[a.classification] !== classRank[b.classification]) {
-        return classRank[a.classification] - classRank[b.classification];
-      }
-      if (a.classification === 'QUALIFIED') {
-        return b.conservativeNetUSDC - a.conservativeNetUSDC;
-      }
-      if (a.classification === 'NEAR_MISS') {
-        return a.shortfallToTargetUSDC - b.shortfallToTargetUSDC;
-      }
-      return b.expectedNetUSDC - a.expectedNetUSDC;
+      const aStale = a.status === 'STALE';
+      const bStale = b.status === 'STALE';
+      if (aStale !== bStale) return aStale ? 1 : -1;
+
+      const aPos = a.conservativeNetUSDC > 0;
+      const bPos = b.conservativeNetUSDC > 0;
+      if (aPos !== bPos) return aPos ? -1 : 1;
+
+      return b.conservativeNetUSDC - a.conservativeNetUSDC;
     });
 
     const top = items.slice(0, limit);
     top.forEach((item, idx) => {
       item.rank = idx + 1;
-      item.quoteAgeMs = Math.max(0, Date.now() - item.timestamp);
     });
     return top;
   }
@@ -4214,22 +4237,40 @@ export class ArbitrageScanner {
     const rpcStatus: 'ACTIVE' | 'DEGRADED' | 'FAILED' | 'STANDBY' =
       health.connectedRpc ? 'ACTIVE' : 'DEGRADED';
 
+    const rpcStats = this.rpc?.getStats?.();
+    if (rpcStats || wsStats) {
+      this.creditTracker.setLocalTelemetry(
+        rpcStats?.requestsTotal || 0,
+        wsStats?.totalBytesReceived || 0
+      );
+    }
+
     return {
       success: true,
       mode: 'READ-ONLY / SHADOW MODE',
       scannerStatus,
+      scannerState: this.getScannerState(),
       scannerOnline: this.isRunning && this.isInitialized,
+      creditMeter: this.creditTracker.getCreditMeterData(),
       initializationStage: this.isInitialized ? 'READY' : this.initializationStage,
       initializationTimings: {
         elapsedMs: { ...this.initializationElapsedMs },
         rpcFailures: { ...this.initializationRpcFailures }
       },
+      rpcInfo: this.getSafeRpcInfo(),
       solanaSlot: health.currentSlot,
       wsConnected: wsStatus === 'CONNECTED' || wsStatus === 'HEALTHY',
       wsStatus,
       rpcStatus,
       sessionUptimeFormatted,
       lastSuccessfulUpdateTimestamp: now,
+      lastFreshPoolUpdateTimestamp: this.lastFreshPoolUpdateTimestamp,
+      cost: {
+        actualCredits: 'NOT AVAILABLE',
+        rpcRequestRate: Math.round(((this.rpc?.getStats?.()?.requestsTotal || 0) / Math.max(1, (now - this.sessionStartTime) / 1000)) * 10) / 10,
+        wsMegabytes: Math.round(((this.ws as any)?.getBytesReceived?.() || 0) / (1024 * 1024) * 100) / 100,
+        wsTrafficBytes: (this.ws as any)?.getBytesReceived?.() || 0
+      },
       thresholdUSDC: activeThreshold,
       thresholdCents: Math.round(activeThreshold * 100),
       formattedThreshold: this.profitThresholdManager ? this.profitThresholdManager.getFormattedThreshold() : `$${activeThreshold.toFixed(2)} USDC`,
@@ -4305,6 +4346,63 @@ export class ArbitrageScanner {
       elapsedMs: { ...this.initializationElapsedMs },
       rpcFailures: { ...this.initializationRpcFailures }
     };
+  }
+
+  public getScannerState(): 'INITIALIZING' | 'SCANNING' | 'DEGRADED' | 'DISCONNECTED' | 'ERROR' | 'OFFLINE' | 'STANDBY' {
+    if (!this.isScannerRunning()) {
+      return 'OFFLINE';
+    }
+    if (!this.isScannerInitialized()) {
+      return 'INITIALIZING';
+    }
+    const health = this.getHealthStatus();
+    if (!health.connectedWs) {
+      return 'DISCONNECTED';
+    }
+    const rpcStats = this.rpc?.getStats?.();
+    const isDegraded = !health.connectedRpc || (rpcStats && (rpcStats.requestsFailed > 10 && rpcStats.requestsFailed / Math.max(1, rpcStats.requestsTotal) > 0.2));
+    if (isDegraded) {
+      return 'DEGRADED';
+    }
+    return 'SCANNING';
+  }
+
+  public getSafeRpcInfo(): { provider: 'HELIUS' | 'PUBLIC'; rpcHost: string; wsHost: string } {
+    let rpcHost = 'unknown';
+    let wsHost = 'unknown';
+    try {
+      if (this.config.SOLANA_RPC_HTTP) {
+        rpcHost = new URL(this.config.SOLANA_RPC_HTTP).hostname;
+      }
+    } catch {}
+    try {
+      if (this.config.SOLANA_RPC_WS) {
+        wsHost = new URL(this.config.SOLANA_RPC_WS).hostname;
+      }
+    } catch {}
+
+    const isHelius = rpcHost.toLowerCase().includes('helius') || wsHost.toLowerCase().includes('helius');
+    return {
+      provider: isHelius ? 'HELIUS' : 'PUBLIC',
+      rpcHost,
+      wsHost
+    };
+  }
+
+  public getCreditTracker(): HeliusCreditTracker {
+    return this.creditTracker;
+  }
+
+  public start24hStudy(sessionId?: string): void {
+    this.windowTracker.startStudy(sessionId);
+  }
+
+  public stop24hStudy(): void {
+    this.windowTracker.stopStudy();
+  }
+
+  public isStudyActive(): boolean {
+    return this.windowTracker.isStudyActive();
   }
 
   private recordValidQuoteProduced(now: number = Date.now()): void {
@@ -4415,6 +4513,7 @@ export class ArbitrageScanner {
     }
     this.windowTracker.completeStudy('SCANNER_STOP');
     this.automaticScout.stop();
+    this.creditTracker.stopPolling();
     if (this.scanTimer) {
       clearInterval(this.scanTimer);
       this.scanTimer = null;

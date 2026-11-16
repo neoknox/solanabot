@@ -2,9 +2,10 @@ import http from 'http';
 import { URL } from 'url';
 import { ProfitThresholdManager, VALID_PROFIT_THRESHOLDS_CENTS } from '../profit/profitThresholdManager.js';
 import { ArbitrageScanner } from '../scanner/arbitrageScanner.js';
-import { HudV2Payload, HourlyProfitabilityBucket } from '../types/index.js';
+import { HudV2Payload, HourlyProfitabilityBucket, HeliusCreditMeterData } from '../types/index.js';
 import { formatQatarTime, formatQatarHour } from '../study/windowTracker.js';
 import { SOLANA_FAVICON_PNG_BASE64 } from './faviconBase64.js';
+import { HeliusCreditTracker } from './heliusCreditTracker.js';
 
 const FAVICON_BUFFER = Buffer.from(SOLANA_FAVICON_PNG_BASE64, 'base64');
 
@@ -23,6 +24,7 @@ export class ProfitHudServer {
   private boundPort: number | null = null;
   private silent: boolean;
   private isWsReconnecting = false;
+  private standbyCreditTracker = new HeliusCreditTracker({ rpcHttpUrl: process.env.SOLANA_RPC_HTTP });
 
   constructor(
     thresholdManager: ProfitThresholdManager,
@@ -167,13 +169,27 @@ export class ProfitHudServer {
       success: true,
       mode: 'READ-ONLY / SHADOW MODE',
       scannerStatus: 'STANDBY',
+      scannerState: 'STANDBY',
       scannerOnline: false,
+      creditMeter: this.standbyCreditTracker.getCreditMeterData(),
+      rpcInfo: {
+        provider: 'PUBLIC',
+        rpcHost: 'standby',
+        wsHost: 'standby'
+      },
       solanaSlot: null,
       wsConnected: false,
       wsStatus: 'STANDBY',
       rpcStatus: 'STANDBY',
       sessionUptimeFormatted: '00:00:00',
       lastSuccessfulUpdateTimestamp: Date.now(),
+      lastFreshPoolUpdateTimestamp: 0,
+      cost: {
+        actualCredits: 'NOT AVAILABLE',
+        rpcRequestRate: 0,
+        wsMegabytes: 0,
+        wsTrafficBytes: 0
+      },
       thresholdUSDC,
       thresholdCents: Math.round(thresholdUSDC * 100),
       formattedThreshold: this.thresholdManager.getFormattedThreshold(),
@@ -470,6 +486,35 @@ export class ProfitHudServer {
       return;
     }
 
+    // 2.5 POST /api/study/start and /api/study/stop (Opt-in 24-hour study)
+    if (pathname === '/api/study/start' && method === 'POST') {
+      if (!this.isValidOriginAndHost(req)) {
+        res.writeHead(403, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': defaultOrigin });
+        res.end(JSON.stringify({ success: false, error: 'Forbidden' }));
+        return;
+      }
+      if (this.scanner && typeof (this.scanner as any).start24hStudy === 'function') {
+        (this.scanner as any).start24hStudy();
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': corsOrigin });
+      res.end(JSON.stringify({ success: true, studyActive: true }));
+      return;
+    }
+
+    if (pathname === '/api/study/stop' && method === 'POST') {
+      if (!this.isValidOriginAndHost(req)) {
+        res.writeHead(403, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': defaultOrigin });
+        res.end(JSON.stringify({ success: false, error: 'Forbidden' }));
+        return;
+      }
+      if (this.scanner && typeof (this.scanner as any).stop24hStudy === 'function') {
+        (this.scanner as any).stop24hStudy();
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': corsOrigin });
+      res.end(JSON.stringify({ success: true, studyActive: false }));
+      return;
+    }
+
     // 3. GET /api/status (Live telemetry, active signal counts & complete HUD V2 payload)
     if (pathname === '/api/status' && method === 'GET') {
       const isScannerPresent = !!this.scanner;
@@ -492,20 +537,26 @@ export class ProfitHudServer {
       }
 
       // Scanner status compatibility: tests assert data.scannerStatus === 'ONLINE' when scanner is present,
-      // or 'STANDBY' when scanner is absent. We also provide scannerState for HUD V2 ('RUNNING' | 'DEGRADED' | 'OFFLINE' | 'STANDBY').
+      // or 'STANDBY' when scanner is absent. We also provide scannerState for HUD V2 ('INITIALIZING' | 'SCANNING' | 'DEGRADED' | 'DISCONNECTED' | 'ERROR' | 'OFFLINE' | 'STANDBY').
       const scannerStatus = isScannerPresent ? 'ONLINE' : 'STANDBY';
-      let scannerState: 'RUNNING' | 'DEGRADED' | 'OFFLINE' | 'STANDBY' = 'STANDBY';
+      let scannerState: string = 'STANDBY';
       if (isScannerPresent) {
-        const isRunning = typeof this.scanner?.isScannerRunning === 'function' ? this.scanner.isScannerRunning() : true;
-        const isInitialized = typeof (this.scanner as any)?.isScannerInitialized === 'function' ? (this.scanner as any).isScannerInitialized() : true;
-        if (!isRunning) {
-          scannerState = 'OFFLINE';
-        } else if (!isInitialized) {
-          scannerState = 'STANDBY';
-        } else if (!health?.connectedWs || !health?.connectedRpc) {
-          scannerState = 'DEGRADED';
+        if (typeof (this.scanner as any)?.getScannerState === 'function') {
+          scannerState = (this.scanner as any).getScannerState();
+        } else if (hudData.scannerState) {
+          scannerState = hudData.scannerState;
         } else {
-          scannerState = 'RUNNING';
+          const isRunning = typeof this.scanner?.isScannerRunning === 'function' ? this.scanner.isScannerRunning() : true;
+          const isInitialized = typeof (this.scanner as any)?.isScannerInitialized === 'function' ? (this.scanner as any).isScannerInitialized() : true;
+          if (!isRunning) {
+            scannerState = 'OFFLINE';
+          } else if (!isInitialized) {
+            scannerState = 'INITIALIZING';
+          } else if (!health?.connectedWs || !health?.connectedRpc) {
+            scannerState = 'DEGRADED';
+          } else {
+            scannerState = 'SCANNING';
+          }
         }
       }
 
@@ -529,6 +580,10 @@ export class ProfitHudServer {
 
       if (this.scanner && typeof this.scanner.getScoutMetrics === 'function') {
         payload.scout = this.scanner.getScoutMetrics();
+      }
+
+      if (!payload.creditMeter) {
+        payload.creditMeter = this.standbyCreditTracker.getCreditMeterData();
       }
 
       res.writeHead(200, {
@@ -807,20 +862,232 @@ export class ProfitHudServer {
       letter-spacing: 0.3px;
       font-family: var(--font-mono);
     }
-    .status-online {
+    .status-online, .status-scanning {
       background: var(--green-glow);
       color: var(--green);
       border: 1px solid var(--green-border);
     }
-    .status-standby {
+    .status-standby, .status-degraded {
       background: var(--amber-glow);
       color: var(--amber);
       border: 1px solid var(--amber-border);
     }
-    .status-offline {
+    .status-offline, .status-disconnected, .status-error {
       background: var(--red-glow);
       color: var(--red);
       border: 1px solid var(--red-border);
+    }
+    .status-initializing {
+      background: var(--blue-glow);
+      color: var(--blue);
+      border: 1px solid var(--blue-border);
+    }
+
+    /* Compact Helius Free Credit Meter */
+    .credit-meter-box {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      min-width: 260px;
+      position: relative;
+    }
+    .credit-meter-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+    }
+    .credit-meter-title {
+      font-weight: 700;
+      color: var(--text-bright);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .credit-source-tag {
+      font-size: 9px;
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-family: var(--font-mono);
+      background: var(--bg-subtle);
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+    }
+    .credit-status-pill {
+      font-size: 9px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 3px;
+      text-transform: uppercase;
+      font-family: var(--font-mono);
+    }
+    .credit-status-active {
+      background: var(--green-glow);
+      color: var(--green);
+      border: 1px solid var(--green-border);
+    }
+    .credit-status-inactive {
+      background: rgba(121, 138, 159, 0.15);
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+    }
+    .credit-bar-track {
+      width: 100%;
+      height: 5px;
+      background: var(--bg-subtle);
+      border-radius: 3px;
+      overflow: hidden;
+      margin: 2px 0;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .credit-bar-fill {
+      height: 100%;
+      width: 0%;
+      transition: width 0.3s ease, background-color 0.3s ease;
+      border-radius: 2px;
+    }
+    .bar-green { background: #10b981; }
+    .bar-yellow { background: #f59e0b; }
+    .bar-orange { background: #f97316; }
+    .bar-red { background: #ef4444; }
+    .credit-metrics-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 10px;
+      color: var(--text);
+      font-family: var(--font-mono);
+      gap: 8px;
+    }
+    .credit-submetrics {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 9px;
+      color: var(--text-muted);
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .credit-dashboard-link {
+      color: var(--blue);
+      text-decoration: none;
+      font-size: 9px;
+      transition: color 0.15s ease;
+    }
+    .credit-dashboard-link:hover {
+      text-decoration: underline;
+      color: #7dd3fc;
+    }
+    .credit-alert-banner {
+      display: none;
+      font-size: 10px;
+      padding: 3px 6px;
+      border-radius: 4px;
+      margin-top: 3px;
+      font-weight: 600;
+      line-height: 1.3;
+    }
+    .credit-alert-yellow {
+      display: block;
+      background: var(--amber-glow);
+      color: var(--amber);
+      border: 1px solid var(--amber-border);
+    }
+    .credit-alert-orange {
+      display: block;
+      background: rgba(249, 115, 22, 0.15);
+      color: #fb923c;
+      border: 1px solid rgba(249, 115, 22, 0.4);
+    }
+    .credit-alert-red {
+      display: block;
+      background: var(--red-glow);
+      color: var(--red);
+      border: 1px solid var(--red-border);
+    }
+
+    .five-card-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    @media (max-width: 1200px) {
+      .five-card-grid {
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      }
+    }
+    .perf-card {
+      padding: 12px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .perf-card-title {
+      font-size: 11px;
+      font-weight: 800;
+      color: var(--blue);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 4px;
+    }
+    .card-metric-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 0;
+      font-size: 11px;
+      border-bottom: 1px solid var(--border-subtle);
+    }
+    .card-metric-row:last-child {
+      border-bottom: none;
+    }
+    .card-metric-label {
+      color: var(--text-muted);
+      font-size: 10px;
+    }
+    .card-metric-val {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      color: var(--text-bright);
+    }
+    .diagnostics-drawer {
+      margin-top: 20px;
+      margin-bottom: 24px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .diagnostics-summary {
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 800;
+      color: var(--blue);
+      padding: 8px 12px;
+      user-select: none;
+      letter-spacing: 0.5px;
+      outline: none;
+      background: var(--bg-subtle);
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }
+    .diagnostics-summary:hover {
+      background: var(--border-subtle);
+      color: #fff;
     }
     .btn-ws {
       background-color: var(--bg-subtle);
@@ -1280,6 +1547,31 @@ export class ProfitHudServer {
         <span id="rpcStatusBadge" class="status-badge status-standby">STANDBY</span>
       </div>
 
+      <!-- Compact Helius Free Credit Meter -->
+      <div class="credit-meter-box" id="heliusCreditMeterBox" title="Helius Free Plan Usage (1,000,000 credits/cycle)">
+        <div class="credit-meter-header">
+          <div class="credit-meter-title">
+            <span>HELIUS FREE CREDITS</span>
+            <span class="credit-source-tag" id="creditSourceTag">ESTIMATED LOCAL USAGE</span>
+          </div>
+          <span class="credit-status-pill credit-status-active" id="creditStatusPill">ACTIVE</span>
+        </div>
+        <div class="credit-bar-track">
+          <div class="credit-bar-fill bar-green" id="creditBarFill" style="width: 0%;"></div>
+        </div>
+        <div class="credit-metrics-row">
+          <span><strong id="creditsUsedVal">0</strong> / 1,000,000 (<span id="creditPctVal">0.0%</span>)</span>
+          <span>Rem: <strong id="creditsRemVal">1,000,000</strong></span>
+        </div>
+        <div class="credit-submetrics">
+          <span>Rate: <span id="creditRateVal">0/hr</span></span>
+          <span>Est: <span id="creditDaysVal">N/A</span></span>
+          <span>Updated: <span id="creditUpdatedVal">Just now</span></span>
+          <a href="https://dashboard.helius.dev/" target="_blank" rel="noopener noreferrer" class="credit-dashboard-link">Dashboard ↗</a>
+        </div>
+        <div class="credit-alert-banner" id="creditAlertBanner"></div>
+      </div>
+
       <div class="status-group">
         <span class="status-label">WS:</span>
         <span id="telemetryWsBadge" class="status-badge status-standby">STANDBY</span>
@@ -1294,6 +1586,11 @@ export class ProfitHudServer {
       <div class="status-group">
         <span class="status-label">Slot:</span>
         <span id="telemetrySlot" style="font-family: var(--font-mono); font-weight:700; color:var(--blue);">--</span>
+      </div>
+
+      <div class="status-group">
+        <span class="status-label">Fresh Update:</span>
+        <span id="telemetryFreshUpdate" style="font-family: var(--font-mono); font-weight:700; color:var(--green);">None yet</span>
       </div>
 
       <div class="status-group">
@@ -1316,7 +1613,7 @@ export class ProfitHudServer {
   <main class="container">
     <div id="wsAlert" class="alert"></div>
 
-    <!-- Section 2: Live Profit Monitor (Hero Section) -->
+    <!-- Section 2: Live Profit Monitor (5 Core Performance Cards) -->
     <section class="hero-container" id="telemetryCard">
       <div class="hero-header">
         <div>
@@ -1334,98 +1631,260 @@ export class ProfitHudServer {
         </div>
       </div>
 
-      <!-- 6 Hero Cards -->
-      <div class="hero-grid">
-        <div class="hero-card">
-          <div class="hero-card-label">Gross-Positive</div>
-          <div class="hero-card-value" id="statGrossPositive">0</div>
-          <div class="hero-card-sub">Pre-cost spread divergence</div>
+      <!-- 5 Main Performance Cards (Phase 2 Master Architecture) -->
+      <div class="five-card-grid">
+        <!-- 1. PROFIT CARD -->
+        <div class="perf-card">
+          <div class="perf-card-title">&#128178; PROFIT</div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Qualified Shadow:</span>
+            <span class="card-metric-val green" id="statQualifiedShadow">0</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Best Conservative Net:</span>
+            <span class="card-metric-val green" id="statBestConservativeNet">+$0.0000</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Estimated Executable Net:</span>
+            <span class="card-metric-val" id="statNetPositive">0</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Shadow Realized Profit:</span>
+            <span class="card-metric-val" style="color:var(--text-muted);">$0.00 USDC</span>
+          </div>
         </div>
 
-        <div class="hero-card">
-          <div class="hero-card-label">Net-Positive</div>
-          <div class="hero-card-value" id="statNetPositive">0</div>
-          <div class="hero-card-sub">Covering fees & priority</div>
+        <!-- 2. LIVE COVERAGE CARD -->
+        <div class="perf-card">
+          <div class="perf-card-title">&#128225; LIVE COVERAGE</div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Verified Live Pools:</span>
+            <span class="card-metric-val" id="healthVerifiedPools">0</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Monitored Pool Bundles:</span>
+            <span class="card-metric-val" id="healthMonitoredBundles">9</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">READY Routes:</span>
+            <span class="card-metric-val green" id="stateReady">0</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Fresh Account Subs:</span>
+            <span class="card-metric-val" id="healthActiveSubscriptions">25 / 25</span>
+          </div>
         </div>
 
-        <div class="hero-card">
-          <div class="hero-card-label">Qualified Shadow</div>
-          <div class="hero-card-value" id="statQualifiedShadow">0</div>
-          <div class="hero-card-sub">Conservative net &ge; hurdle</div>
+        <!-- 3. SCANNER SPEED CARD -->
+        <div class="perf-card">
+          <div class="perf-card-title">&#9889; SCANNER SPEED</div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Route Evals / sec:</span>
+            <span class="card-metric-val" id="perfRouteEvalsSec">0.0 /s</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Valid Quotes / sec:</span>
+            <span class="card-metric-val" id="perfQuoteCalcsSec">0.0 /s</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Quote-Valid %:</span>
+            <span class="card-metric-val" id="perfQuoteValid">0.0%</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Quote Age P95:</span>
+            <span class="card-metric-val" id="perfQuoteCalcP95">0 &mu;s</span>
+          </div>
         </div>
 
-        <div class="hero-card">
-          <div class="hero-card-label">Revalidated Surviving</div>
-          <div class="hero-card-value" id="statRevalidatedSurviving">0</div>
-          <div class="hero-card-sub">Passed pre-execution recheck</div>
+        <!-- 4. SYSTEM HEALTH CARD -->
+        <div class="perf-card">
+          <div class="perf-card-title">&#128737; SYSTEM HEALTH</div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">RPC Latency P95:</span>
+            <span class="card-metric-val" id="perfRpcLatencyP95">0 ms</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">RPC Failures / 429:</span>
+            <span class="card-metric-val" id="diagRpcFailures">0</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Event-Loop Delay P95:</span>
+            <span class="card-metric-val" id="diagEventLoopDelay">0.0 ms</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Process RAM:</span>
+            <span class="card-metric-val" id="diagMemory">0 MB RSS</span>
+          </div>
         </div>
 
-        <div class="hero-card highlight">
-          <div class="hero-card-label">Best Conservative Net</div>
-          <div class="hero-card-value green" id="statBestConservativeNet">+$0.0000</div>
-          <div class="hero-card-sub">Peak valid session opportunity</div>
-        </div>
-
-        <div class="hero-card highlight">
-          <div class="hero-card-label">Shadow Net USDC / Min</div>
-          <div class="hero-card-value green" id="statShadowNetRate">+$0.0000</div>
-          <div class="hero-card-sub">Rolling 60s qualified net yield</div>
+        <!-- 5. COST CARD -->
+        <div class="perf-card">
+          <div class="perf-card-title">&#128179; COST</div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Helius Credits:</span>
+            <span class="card-metric-val" id="costCredits" style="color:var(--amber);">NOT AVAILABLE</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">RPC Request Rate:</span>
+            <span class="card-metric-val" id="costRpcRate">0.0 req/s</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">WS Traffic Volume:</span>
+            <span class="card-metric-val" id="costWsVolume">0.00 MB</span>
+          </div>
+          <div class="card-metric-row">
+            <span class="card-metric-label">Plan Tier:</span>
+            <span class="card-metric-val" style="color:var(--text-bright);">FREE (1M/mo limit)</span>
+          </div>
         </div>
       </div>
 
-      <div class="hero-sub-bar">
-        <div class="hero-sub-item">
-          <span style="color:var(--text-muted);">Active Hurdle Floor:</span>
-          <strong id="statActiveHurdle">$${currentUSDC} USDC</strong>
-        </div>
-        <div class="hero-sub-item">
-          <span style="color:var(--text-muted);">Shared Virtual Capital:</span>
-          <strong id="statVirtualCapital">$1,000.00 USDC</strong>
-        </div>
-        <div class="hero-sub-item">
-          <span style="color:var(--text-muted);">Active Shadow Allocation:</span>
-          <strong id="telemetryCapital">$0.00 USDC</strong>
-        </div>
-        <div class="hero-sub-item">
-          <span style="color:var(--text-muted);">Active Signals:</span>
-          <strong id="telemetrySignals">0</strong>
-        </div>
-        <div style="font-size: 11px; color: var(--text-muted); width: 100%; margin-top: 4px;">
-          <em>* Conservative Net applies minimal pool outAmount, maximum slippage tolerance, priority gas fee, and $0.25 safety buffer.</em>
-        </div>
+      <!-- Preserved Compatibility Spans -->
+      <div style="display:none;">
+        <span id="statGrossPositive">0</span>
+        <span id="statRevalidatedSurviving">0</span>
+        <span id="statShadowNetRate">+$0.0000</span>
+        <span id="statActiveHurdle">$${currentUSDC} USDC</span>
+        <span id="statVirtualCapital">$1,000.00 USDC</span>
+        <span id="telemetryCapital">$0.00 USDC</span>
+        <span id="telemetrySignals">0</span>
+        <span id="healthStoredPools">0</span>
+        <span id="healthUniqueRoutes">0</span>
+        <span id="healthReadyUptime">0.0%</span>
+        <span id="stateVerified">0</span>
+        <span id="stateStale">0</span>
+        <span id="stateBlocked">0</span>
+        <span id="stateUnvalidated">0</span>
+        <span id="perfTotalEvals">0</span>
+        <span id="perfAccountUpdatesSec">0 /s</span>
+        <span id="perfQueueDepthDrops">0 / 0</span>
+        <span id="perfQueueWaitP95">0 &mu;s</span>
+        <span id="diagWsReconnects">0</span>
+        <span id="diagWsMessageAge">0s</span>
+        <span id="diagWsLastReconnect">Never</span>
+        <span id="diagPersistenceErrors">0</span>
+        <span id="diagProcessUptime">00:00:00</span>
       </div>
     </section>
 
-    <!-- Section 3: Top 10 Profit Watch Table -->
-    <section class="card">
+    <!-- Controls Row: Profit Hurdle, Scout & Opt-In Study (Accessible Controls) -->
+    <div class="two-col-grid" style="margin-bottom: 16px;">
+      <!-- Section: Profit Target Control -->
+      <section class="card">
+        <div class="card-header">
+          <div class="card-title">PROFIT TARGET CONTROL</div>
+          <div class="card-subtitle">Adjust minimum conservative net profit floor ($0.10 - $0.70 USDC)</div>
+        </div>
+
+        <div style="text-align: center; margin: 8px 0;">
+          <div style="font-size: 26px; font-weight: 800; color: var(--text-bright); font-family: var(--font-mono);" id="currentDisplay">$${currentUSDC} USDC</div>
+          <div class="badge-qual" id="confirmedBadge" style="display: inline-block; margin-top: 4px;">Confirmed Active: $${currentUSDC} USDC</div>
+        </div>
+
+        <div class="slider-box">
+          <input 
+            type="range" 
+            id="thresholdSlider" 
+            min="0.10" 
+            max="0.70" 
+            step="0.05" 
+            value="${currentUSDC}" 
+            aria-label="Minimum Conservative Net Profit"
+          >
+          <div class="ticks">
+            <span>$0.10 (Default)</span>
+            <span>$0.20</span>
+            <span>$0.30</span>
+            <span>$0.40</span>
+            <span>$0.50</span>
+            <span>$0.60</span>
+            <span>$0.70</span>
+          </div>
+        </div>
+
+        <div style="display: flex; justify-content: space-between; margin-top: 8px; font-size: 11px; color: var(--text-muted);">
+          <div>Safety Buffer: <strong style="color:var(--text-bright); font-family:var(--font-mono);">$0.25 USDC</strong></div>
+          <div>Virtual Capital: <strong style="color:var(--text-bright); font-family:var(--font-mono);">$1,000.00 USDC</strong></div>
+        </div>
+
+        <div id="alertBox" class="alert"></div>
+      </section>
+
+      <!-- Section: Scout & Study Control -->
+      <section class="card" id="scoutCard">
+        <div class="card-header">
+          <div class="card-title">SCOUT CONTROL &amp; 24H STUDY</div>
+          <div style="display:flex; gap:8px;">
+            <button id="btnTriggerScout" class="btn-scout" type="button" style="padding:4px 10px; font-size:11px;">Trigger Scout Discovery</button>
+            <button id="btnToggleStudy" class="btn-ws" type="button" style="border-color:var(--blue); color:var(--blue); padding:4px 10px;">START 24H STUDY</button>
+          </div>
+        </div>
+        <div class="card-subtitle" style="margin-bottom: 8px;">
+          Hot-activate discovered routes &bull; Opt-in continuous 24h opportunity window recording
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-box">
+            <div class="stat-box-label">Scout Status</div>
+            <div class="stat-box-val"><span id="scoutStatusBadge" class="status-badge status-standby">IDLE</span></div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box-label">Study Status</div>
+            <div class="stat-box-val"><span id="studyStatusBadge" class="status-badge status-standby">STUDY INACTIVE</span></div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box-label">Last Discovery</div>
+            <div class="stat-box-val" id="scoutLastRun" style="font-size: 11px;">NEVER</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box-label">Next Scheduled</div>
+            <div class="stat-box-val" id="scoutNextRun" style="font-size: 11px;">STANDBY</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box-label">Last Verified Pools</div>
+            <div class="stat-box-val" id="scoutVerifiedLast">0</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box-label">Last Routes Generated</div>
+            <div class="stat-box-val" id="scoutRoutesLast">0</div>
+          </div>
+          <div class="stat-box" style="display:none;">
+            <span id="scoutDuration">0 ms</span>
+            <span id="scoutLastError">NONE</span>
+          </div>
+        </div>
+
+        <div id="scoutAlert" class="alert"></div>
+      </section>
+    </div>
+
+    <!-- Section 3: Top 10 Profit Watch Table (The Main Feature - 8 Columns) -->
+    <section class="card" style="margin-bottom: 16px;">
       <div class="card-header">
         <div>
           <div class="card-title">TOP 10 PROFIT WATCH</div>
-          <div class="card-subtitle">Real-time candidate buffer ranked by qualification, conservative net profit, and quote freshness. Click any row to inspect 11 routing & cost fields.</div>
+          <div class="card-subtitle">Real-time candidate buffer ranked by conservative net profit. Genuine positive opportunities shown first. Click any row to inspect routing &amp; cost breakdown.</div>
         </div>
-        <div style="font-size: 11px; color: var(--text-muted);">Bounded buffer (max 10 displayed)</div>
+        <div style="font-size: 11px; color: var(--text-muted);">Active Monitored Opportunities</div>
       </div>
 
       <div class="table-container">
         <table id="profitWatchTable">
           <thead>
             <tr>
-              <th>Rank</th>
-              <th>Token</th>
-              <th>Buy DEX</th>
-              <th>Sell DEX</th>
-              <th>Trade Size</th>
-              <th>Gross Spread</th>
-              <th>Expected Net</th>
-              <th>Conservative Net</th>
-              <th>Shortfall</th>
-              <th>Quote Age</th>
-              <th>Status / Reason</th>
+              <th>TOKEN</th>
+              <th>BUY DEX</th>
+              <th>SELL DEX</th>
+              <th>TRADE SIZE</th>
+              <th>GROSS SPREAD</th>
+              <th>CONSERVATIVE NET</th>
+              <th>QUOTE AGE</th>
+              <th>STATUS</th>
             </tr>
           </thead>
           <tbody id="profitWatchTbody">
             <tr>
-              <td colspan="11" style="text-align: center; color: var(--text-muted); padding: 24px;">
+              <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 24px;">
                 Waiting for route evaluations... Polling live DEX pool states.
               </td>
             </tr>
@@ -1434,8 +1893,12 @@ export class ProfitHudServer {
       </div>
     </section>
 
+    <!-- Collapsed Diagnostics & History Section (Phase 2 Master Architecture) -->
+    <details class="diagnostics-drawer" id="diagnosticsHistory">
+      <summary class="diagnostics-summary">&#9656; DIAGNOSTICS &amp; HISTORICAL DATA (Click to Expand: 24h Study, History, Rejections &amp; Telemetry)</summary>
+
     <!-- Section: 24-Hour Profitability Study -->
-    <section class="card" id="studyCard">
+    <section class="card" id="studyCard" style="margin-top: 12px;">
       <div class="card-header">
         <div>
           <div class="card-title">
@@ -1868,94 +2331,6 @@ export class ProfitHudServer {
       </div>
     </section>
 
-    <!-- Controls Row: Profit Hurdle & Scout (Sections 8 & 9) -->
-    <div class="two-col-grid">
-      <!-- Section 8: Profit Target Control -->
-      <section class="card">
-        <div class="card-header">
-          <div class="card-title">PROFIT TARGET CONTROL</div>
-          <div class="card-subtitle">Adjust minimum conservative net profit floor ($0.10 - $0.70 USDC)</div>
-        </div>
-
-        <div style="text-align: center; margin: 10px 0;">
-          <div style="font-size: 32px; font-weight: 800; color: var(--text-bright); font-family: var(--font-mono);" id="currentDisplay">$${currentUSDC} USDC</div>
-          <div class="badge-qual" id="confirmedBadge" style="display: inline-block; margin-top: 4px;">Confirmed Active: $${currentUSDC} USDC</div>
-        </div>
-
-        <div class="slider-box">
-          <input 
-            type="range" 
-            id="thresholdSlider" 
-            min="0.10" 
-            max="0.70" 
-            step="0.05" 
-            value="${currentUSDC}" 
-            aria-label="Minimum Conservative Net Profit"
-          >
-          <div class="ticks">
-            <span>$0.10 (Default)</span>
-            <span>$0.20</span>
-            <span>$0.30</span>
-            <span>$0.40</span>
-            <span>$0.50</span>
-            <span>$0.60</span>
-            <span>$0.70</span>
-          </div>
-        </div>
-
-        <div style="display: flex; justify-content: space-between; margin-top: 10px; font-size: 11px; color: var(--text-muted);">
-          <div>Safety Buffer: <strong style="color:var(--text-bright); font-family:var(--font-mono);">$0.25 USDC</strong></div>
-          <div>Virtual Capital: <strong style="color:var(--text-bright); font-family:var(--font-mono);">$1,000.00 USDC</strong></div>
-        </div>
-
-        <div id="alertBox" class="alert"></div>
-      </section>
-
-      <!-- Section 9: Scout Control -->
-      <section class="card" id="scoutCard">
-        <div class="card-header">
-          <div class="card-title">SCOUT CONTROL & EXPANSION</div>
-          <button id="btnTriggerScout" class="btn-scout" type="button">Trigger Scout Discovery</button>
-        </div>
-        <div class="card-subtitle" style="margin-bottom: 12px;">
-          On-demand or scheduled pool discovery. Hot-activates new 2-leg routes without scanner restart.
-        </div>
-
-        <div class="stats-grid">
-          <div class="stat-box">
-            <div class="stat-box-label">Scout Status</div>
-            <div class="stat-box-val"><span id="scoutStatusBadge" class="status-badge status-standby">IDLE</span></div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-box-label">Last Discovery</div>
-            <div class="stat-box-val" id="scoutLastRun" style="font-size: 12px;">NEVER</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-box-label">Next Scheduled</div>
-            <div class="stat-box-val" id="scoutNextRun" style="font-size: 12px;">STANDBY</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-box-label">Last Verified Pools</div>
-            <div class="stat-box-val" id="scoutVerifiedLast">0</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-box-label">Last Routes Generated</div>
-            <div class="stat-box-val" id="scoutRoutesLast">0</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-box-label">Last Duration</div>
-            <div class="stat-box-val" id="scoutDuration">0 ms</div>
-          </div>
-        </div>
-
-        <div style="margin-top: 10px; font-size: 11px; color: var(--text-muted);">
-          Last Error: <span id="scoutLastError" style="color: var(--text-muted); font-family: var(--font-mono);">NONE</span>
-        </div>
-
-        <div id="scoutAlert" class="alert"></div>
-      </section>
-    </div>
-
     <!-- Section 10: Health & Failure Monitoring -->
     <section class="card">
       <div class="card-header">
@@ -2002,6 +2377,7 @@ export class ProfitHudServer {
         Last Persistence Error: <span id="diagLastPersistenceError" style="font-family: var(--font-mono); color: var(--text-muted);">NONE</span>
       </div>
     </section>
+    </details>
 
     <footer class="footer">
       SolanaBot HUD V2 &bull; Strictly Read-Only Shadow Simulation &bull; Bound to 127.0.0.1 &bull; Zero Private Keys &bull; No Capital at Risk
@@ -2174,46 +2550,45 @@ export class ProfitHudServer {
         return p + '$' + Number(num).toFixed(4);
       }
 
-      // Render Top 10 Profit Watch Table
+      // Render Top 10 Profit Watch Table (8 Columns + Expandable Details)
       function renderProfitWatchTable(items) {
         if (!profitWatchTbody) return;
         if (!items || items.length === 0) {
-          profitWatchTbody.innerHTML = '<tr><td colspan="11" style="text-align: center; color: var(--text-muted); padding: 24px;">Waiting for route evaluations... Polling live DEX pool states.</td></tr>';
+          profitWatchTbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 24px;">Waiting for route evaluations... Polling live DEX pool states.</td></tr>';
           return;
         }
 
         let html = '';
         items.forEach(function(item) {
           const isSelected = item.candidateId === expandedRowCandidateId;
-          const badgeClass = item.classification === 'QUALIFIED'
-            ? 'badge-qual'
-            : (item.classification === 'NEAR_MISS' ? 'badge-near' : 'badge-rej');
+          const isStale = item.status === 'STALE' || item.quoteAgeMs > 5000;
+          const badgeClass = isStale
+            ? 'badge-rej'
+            : (item.classification === 'QUALIFIED'
+              ? 'badge-qual'
+              : (item.classification === 'NEAR_MISS' ? 'badge-near' : 'badge-rej'));
 
           const spreadStr = (item.grossSpreadPercent >= 0 ? '+' : '') + item.grossSpreadPercent.toFixed(2) + '%';
-          const expNetStr = formatUsdc(item.expectedNetUSDC, true);
           const consNetStr = formatUsdc(item.conservativeNetUSDC, true);
-          const shortfallStr = item.shortfallToTargetUSDC <= 0 ? '<span style="color:var(--green)">MET</span>' : '-$' + item.shortfallToTargetUSDC.toFixed(4);
           const ageSec = (item.quoteAgeMs / 1000).toFixed(1) + 's';
+          const displayStatus = isStale ? 'STALE' : item.status;
 
-          // Main Row
-          html += '<tr class="' + (isSelected ? 'selected' : '') + '" data-candidate-id="' + item.candidateId + '">';
-          html += '<td style="font-weight:700; color:var(--text-muted);">' + item.rank + '</td>';
+          // Main Row (8 Columns: TOKEN, BUY DEX, SELL DEX, TRADE SIZE, GROSS SPREAD, CONSERVATIVE NET, QUOTE AGE, STATUS)
+          html += '<tr class="' + (isSelected ? 'selected' : '') + '" data-candidate-id="' + item.candidateId + '" style="cursor:pointer;">';
           html += '<td style="font-weight:700; color:var(--blue);">' + item.token + '</td>';
           html += '<td>' + item.buyDex + '</td>';
           html += '<td>' + item.sellDex + '</td>';
           html += '<td>$' + item.tradeSizeUSDC.toFixed(2) + '</td>';
           html += '<td style="color:' + (item.grossSpreadPercent > 0 ? 'var(--green)' : 'var(--text-muted)') + ';">' + spreadStr + '</td>';
-          html += '<td>' + expNetStr + '</td>';
           html += '<td style="font-weight:700; color:' + (item.conservativeNetUSDC >= (activeConfirmed || 0.10) ? 'var(--green)' : (item.conservativeNetUSDC > 0 ? 'var(--amber)' : 'var(--red)')) + ';">' + consNetStr + '</td>';
-          html += '<td>' + shortfallStr + '</td>';
-          html += '<td style="color:var(--text-muted);">' + ageSec + '</td>';
-          html += '<td><span class="' + badgeClass + '">' + item.status + '</span></td>';
+          html += '<td style="color:' + (isStale ? 'var(--red)' : 'var(--text-muted)') + ';">' + ageSec + '</td>';
+          html += '<td><span class="' + badgeClass + '">' + displayStatus + '</span></td>';
           html += '</tr>';
 
-          // Expandable Detail Row (11 Inspection Fields)
+          // Expandable Detail Row (9 Inspection Details)
           const isExpanded = isSelected ? 'expanded' : '';
           html += '<tr id="detail-' + item.candidateId + '" class="detail-row ' + isExpanded + '">';
-          html += '<td colspan="11">';
+          html += '<td colspan="8">';
           html += '<div class="detail-content">';
           html += '<div class="detail-item"><div class="detail-label">1. Pool 1 Address (Buy)</div><div class="detail-val">' + (item.leg1PoolId || '--') + '</div></div>';
           html += '<div class="detail-item"><div class="detail-label">2. Pool 2 Address (Sell)</div><div class="detail-val">' + (item.leg2PoolId || '--') + '</div></div>';
@@ -2226,6 +2601,14 @@ export class ProfitHudServer {
           html += '<div class="detail-item"><div class="detail-label">9. Conservative Net Formula</div><div class="detail-val">MinOut - Cost - Buffer = ' + formatUsdc(item.conservativeNetUSDC, true) + ' USDC</div></div>';
           html += '<div class="detail-item"><div class="detail-label">10. Slot Gap Between Quotes</div><div class="detail-val">' + (item.slotGap !== undefined ? item.slotGap : 0) + ' slots</div></div>';
           html += '<div class="detail-item"><div class="detail-label">11. Revalidation Result</div><div class="detail-val" style="font-weight:700; color:' + (item.revalidationStatus === 'SURVIVED' ? 'var(--green)' : 'var(--amber)') + '">' + (item.revalidationStatus || 'PENDING') + '</div></div>';
+          html += '<div class="detail-item"><div class="detail-label">12. Exact Rejection Reason</div><div class="detail-val" style="color:var(--amber);">' + (item.exactRejectionReason || (isStale ? 'Quote age exceeded 5,000ms TTL' : 'None')) + '</div></div>';
+          html += '</div>';
+          html += '</td>';
+          html += '</tr>';
+        });
+
+        profitWatchTbody.innerHTML = html;
+      }
           html += '</div>';
           html += '</td>';
           html += '</tr>';
@@ -2518,22 +2901,102 @@ export class ProfitHudServer {
           if (btnTriggerScout) btnTriggerScout.disabled = false;
 
           // 1. Top Status Bar
-          const scState = data.scannerState || (data.scannerOnline ? 'RUNNING' : (data.scannerStatus === 'ONLINE' ? 'RUNNING' : data.scannerStatus));
-          updateBadge(telemetryScanner, scState, 'RUNNING', 'DEGRADED', 'OFFLINE');
+          const scState = data.scannerState || (data.scannerOnline ? 'SCANNING' : (data.scannerStatus === 'ONLINE' ? 'SCANNING' : data.scannerStatus));
+          updateBadge(telemetryScanner, scState, 'SCANNING', 'DEGRADED', 'DISCONNECTED');
 
-          const rpcState = data.rpcStatus || 'STANDBY';
-          updateBadge(rpcBadge, rpcState, 'ACTIVE', 'DEGRADED', 'OFFLINE');
+          const rpcInfo = data.rpcInfo;
+          const rpcLabel = rpcInfo ? (rpcInfo.provider + ' (' + rpcInfo.rpcHost + ')') : (data.rpcStatus || 'STANDBY');
+          if (rpcBadge) rpcBadge.textContent = rpcLabel;
 
           const wsState = data.wsStatus || (data.wsConnected ? 'HEALTHY' : 'STANDBY');
-          telemetryNetwork.textContent = rpcState + ' / ' + (wsState ? wsState.replace(/_/g, ' ') : 'STANDBY');
-          if (!isWsReconnecting) {
-            updateWsBadge(wsState);
+          const wsHostStr = (rpcInfo && rpcInfo.wsHost) ? ' (' + rpcInfo.wsHost + ')' : '';
+          telemetryNetwork.textContent = (data.rpcStatus || 'STANDBY') + ' / ' + wsState;
+          if (!isWsReconnecting && telemetryWsBadge) {
+            telemetryWsBadge.textContent = wsState + wsHostStr;
+            telemetryWsBadge.className = 'status-badge ' + (wsState === 'HEALTHY' || wsState === 'CONNECTED' ? 'status-online' : (wsState === 'DISCONNECTED' || wsState === 'FAILED' ? 'status-offline' : 'status-standby'));
           }
 
           telemetrySlot.textContent = data.solanaSlot ? formatNumber(data.solanaSlot) : 'STANDBY';
           telemetryUptime.textContent = data.sessionUptimeFormatted || '00:00:00';
           const nowStr = new Date().toLocaleTimeString();
           telemetryLastUpdated.textContent = nowStr;
+
+          const freshEl = document.getElementById('telemetryFreshUpdate');
+          if (freshEl) {
+            if (data.lastFreshPoolUpdateTimestamp && data.lastFreshPoolUpdateTimestamp > 0) {
+              const diffMs = Math.max(0, Date.now() - data.lastFreshPoolUpdateTimestamp);
+              if (diffMs < 1000) {
+                freshEl.textContent = diffMs + 'ms ago';
+              } else {
+                freshEl.textContent = (diffMs / 1000).toFixed(1) + 's ago';
+              }
+            } else {
+              freshEl.textContent = 'None yet';
+            }
+          }
+
+          // Credit Meter update
+          const cm = data.creditMeter;
+          if (cm) {
+            const pill = document.getElementById('creditStatusPill');
+            if (pill) {
+              pill.textContent = cm.statusDisplay;
+              pill.className = 'credit-status-pill ' + (cm.isHeliusActive ? 'credit-status-active' : 'credit-status-inactive');
+            }
+            const srcTag = document.getElementById('creditSourceTag');
+            if (srcTag) srcTag.textContent = cm.sourceLabel;
+
+            const bar = document.getElementById('creditBarFill');
+            if (bar) {
+              bar.style.width = Math.min(100, Math.max(0, cm.percentageUsed)) + '%';
+              bar.className = 'credit-bar-fill bar-' + cm.alertColor;
+            }
+
+            const usedVal = document.getElementById('creditsUsedVal');
+            if (usedVal) usedVal.textContent = cm.creditsUsed.toLocaleString();
+
+            const pctVal = document.getElementById('creditPctVal');
+            if (pctVal) pctVal.textContent = cm.percentageUsed.toFixed(1) + '%';
+
+            const remVal = document.getElementById('creditsRemVal');
+            if (remVal) remVal.textContent = cm.creditsRemaining.toLocaleString();
+
+            const rateVal = document.getElementById('creditRateVal');
+            if (rateVal) rateVal.textContent = (cm.usageRateCreditsPerHour ? cm.usageRateCreditsPerHour.toLocaleString() : '0') + '/hr';
+
+            const daysVal = document.getElementById('creditDaysVal');
+            if (daysVal) daysVal.textContent = cm.estimatedDaysRemaining !== null ? cm.estimatedDaysRemaining + 'd' : 'N/A';
+
+            const updatedVal = document.getElementById('creditUpdatedVal');
+            if (updatedVal) updatedVal.textContent = cm.lastUpdatedFormatted || 'Just now';
+
+            const banner = document.getElementById('creditAlertBanner');
+            if (banner) {
+              if (cm.alertLevel !== 'NORMAL' && cm.alertMessage) {
+                banner.style.display = 'block';
+                banner.className = 'credit-alert-banner credit-alert-' + cm.alertColor;
+                banner.textContent = cm.alertMessage + (cm.recommendation ? ' ' + cm.recommendation : '');
+              } else {
+                banner.style.display = 'none';
+              }
+            }
+          }
+
+          // 1.5 Cost & Coverage Cards
+          const costCreditsEl = document.getElementById('costCredits');
+          if (costCreditsEl) costCreditsEl.textContent = data.cost?.actualCredits || 'NOT AVAILABLE';
+          const costRpcRateEl = document.getElementById('costRpcRate');
+          if (costRpcRateEl) costRpcRateEl.textContent = (data.cost?.rpcRequestRate || 0).toFixed(1) + ' req/s';
+          const costWsVolumeEl = document.getElementById('costWsVolume');
+          if (costWsVolumeEl) costWsVolumeEl.textContent = (data.cost?.wsMegabytes || 0).toFixed(2) + ' MB';
+
+          const monitoredBundlesEl = document.getElementById('healthMonitoredBundles');
+          if (monitoredBundlesEl) monitoredBundlesEl.textContent = String(data.fullyMonitoredPoolBundles || 9);
+          const activeSubsEl = document.getElementById('healthActiveSubscriptions');
+          if (activeSubsEl) {
+            const subs = data.confirmedAccountSubscriptions || (data.routeHealth?.accountSubscriptionCoveragePercent ? Math.round(data.routeHealth.accountSubscriptionCoveragePercent * 25 / 100) : 25);
+            activeSubsEl.textContent = subs + ' / 25';
+          }
 
           // 2. Hero Profit Monitor
           const pm = data.profitMonitor || {};
@@ -2727,6 +3190,26 @@ export class ProfitHudServer {
           } finally {
             btnTriggerScout.disabled = false;
             btnTriggerScout.textContent = 'Trigger Scout Discovery';
+          }
+        });
+      }
+
+      // 24-Hour Study Toggle Button
+      const btnToggleStudy = document.getElementById('btnToggleStudy');
+      if (btnToggleStudy) {
+        btnToggleStudy.addEventListener('click', async function() {
+          btnToggleStudy.disabled = true;
+          try {
+            const isRunning = studyStatusBadge && studyStatusBadge.textContent === 'RUNNING';
+            const endpoint = isRunning ? '/api/study/stop' : '/api/study/start';
+            const res = await fetch(endpoint, { method: 'POST' });
+            if (res.ok) {
+              await fetchTelemetry();
+            }
+          } catch (err) {
+            console.error('Study toggle error:', err);
+          } finally {
+            btnToggleStudy.disabled = false;
           }
         });
       }

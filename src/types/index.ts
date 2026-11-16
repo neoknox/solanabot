@@ -539,6 +539,7 @@ export interface ProfitWatchItem {
   totalCostsUSDC: string;
   slotGap: number;
   revalidationStatus: string;
+  exactRejectionReason?: string;
   timestamp: number;
 }
 
@@ -592,11 +593,51 @@ export interface ScannerDiagnostics {
   sessionUptimeSeconds: number;
 }
 
+export type CreditMeterSource = 'REAL_BILLING_API' | 'ESTIMATED_LOCAL';
+export type CreditAlertLevel = 'NORMAL' | 'WARNING_50' | 'WARNING_80' | 'WARNING_90' | 'LIMIT_REACHED';
+
+export interface HeliusCreditMeterData {
+  enabled: boolean;
+  isHeliusActive: boolean;
+  providerDisplay: 'HELIUS' | 'PUBLIC SOLANA';
+  statusDisplay: 'ACTIVE' | 'HELIUS INACTIVE';
+  source: CreditMeterSource;
+  sourceLabel: string; // e.g. "ESTIMATED LOCAL USAGE" or "HELIUS PROJECT BILLING"
+  creditsUsed: number;
+  creditsRemaining: number;
+  creditsLimit: number; // 1,000,000
+  percentageUsed: number;
+  usageRateCreditsPerHour: number;
+  estimatedDaysRemaining: number | null;
+  billingCycleResetDate: string | null;
+  lastUpdatedTimestamp: number;
+  lastUpdatedFormatted: string;
+  alertLevel: CreditAlertLevel;
+  alertColor: 'green' | 'yellow' | 'orange' | 'red';
+  alertMessage?: string;
+  recommendation?: string;
+  dashboardUrl: string; // "https://dashboard.helius.dev/"
+}
+
 export interface HudV2Payload {
   success: boolean;
   mode: string;
   scannerStatus: 'RUNNING' | 'DEGRADED' | 'OFFLINE' | 'STANDBY';
+  scannerState?: 'INITIALIZING' | 'SCANNING' | 'DEGRADED' | 'DISCONNECTED' | 'ERROR' | 'RUNNING' | 'OFFLINE' | 'STANDBY';
   scannerOnline: boolean;
+  creditMeter?: HeliusCreditMeterData;
+  rpcInfo?: {
+    provider: 'HELIUS' | 'PUBLIC';
+    rpcHost: string;
+    wsHost: string;
+  };
+  lastFreshPoolUpdateTimestamp?: number;
+  cost?: {
+    actualCredits: string;
+    rpcRequestRate: number;
+    wsMegabytes: number;
+    wsTrafficBytes: number;
+  };
   initializationStage?: string;
   initializationTimings?: {
     elapsedMs: Record<string, number>;

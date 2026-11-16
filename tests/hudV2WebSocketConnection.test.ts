@@ -325,6 +325,7 @@ describe('SOLANABOT — HUD V2 WebSocket Connection Architecture & Regression Su
 
     // Set stage to HEALTHY, slot, open transport, and scanner running state
     vi.spyOn(scanner, 'isScannerRunning').mockReturnValue(true);
+    vi.spyOn(scanner, 'isScannerInitialized').mockReturnValue(true);
     ws.setSlot(270123456);
     (ws as any).ws = { readyState: WebSocket.OPEN };
     vi.spyOn(ws, 'getConnectionStage').mockReturnValue('HEALTHY');
@@ -340,7 +341,7 @@ describe('SOLANABOT — HUD V2 WebSocket Connection Architecture & Regression Su
       expect(data.wsStatus).toBe('HEALTHY');
       expect(data.wsConnected).toBe(true);
       expect(data.solanaSlot).toBe(270123456);
-      expect(data.scannerState).toBe('RUNNING');
+      expect(['RUNNING', 'SCANNING']).toContain(data.scannerState);
     } finally {
       await hud.stop();
       scanner.stop();
