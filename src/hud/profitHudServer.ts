@@ -208,7 +208,11 @@ export class ProfitHudServer {
         staleRoutes: 0,
         blockedRoutes: 0,
         unvalidatedRoutes: 0,
-        readyRouteUptimePercent: 0
+        readyRouteUptimePercent: 0,
+        wsConnectivityUptimePercent: 100,
+        accountSubscriptionCoveragePercent: 100,
+        verifiedPoolCoveragePercent: 0,
+        quoteProducingScannerUptimePercent: 0
       },
       historicalVsSession: {
         historical: {
@@ -2538,7 +2542,7 @@ export class ProfitHudServer {
           perfQueueDepthDrops.textContent = (perf.eventQueueDepth || 0) + ' / ' + (perf.eventQueueDrops || 0);
           perfQueueWaitP95.textContent = (perf.queueWaitP95Us || 0).toFixed(1) + ' µs';
           perfQuoteCalcP95.textContent = (perf.quoteCalculationP95Us || 0).toFixed(1) + ' µs';
-          perfRpcLatencyP95.textContent = (perf.rpcLatencyP95Ms || 0).toFixed(1) + ' ms';
+          perfRpcLatencyP95.textContent = (perf.rpcLatencyP95Ms && perf.rpcLatencyP95Ms > 0) ? perf.rpcLatencyP95Ms.toFixed(1) + ' ms' : 'N/A';
 
           // 5. Route & Pool Health
           const rh = data.routeHealth || {};

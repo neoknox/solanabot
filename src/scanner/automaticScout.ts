@@ -336,6 +336,8 @@ export class AutomaticScout {
             this.totalRejectedCount++;
           }
         }
+        // Yield cooperatively to the event loop between candidate verification chunks
+        await new Promise<void>(resolve => setImmediate(resolve));
       }
 
       // Step 4.6: Atomically persist newly verified pools to JSON file

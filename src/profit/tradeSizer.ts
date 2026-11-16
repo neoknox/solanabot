@@ -67,8 +67,8 @@ export class TradeSizer {
     currentSlot: number
   ): SizeEvaluation {
     const inputUnits = BigInt(Math.floor(sizeUSDC * 1e6));
-    const consumedCostsDecimal = new Decimal(costs.consumedCostUSDC || costs.totalCostsUSDC || '0');
-    const safetyBufferDecimal = new Decimal(costs.safetyBufferUSDC || '0');
+    const consumedCostsDecimal = new Decimal(costs?.consumedCostUSDC || costs?.totalCostsUSDC || '0');
+    const safetyBufferDecimal = new Decimal(costs?.safetyBufferUSDC || '0');
     const initialDecimal = new Decimal(sizeUSDC);
 
     // 1. EXPECTED OUTPUT PATH (Exact chained quotes without slippage deduction)
@@ -196,7 +196,8 @@ export class TradeSizer {
       }
 
       conservativeQuotes.push(q);
-      const slippage = (q.outAmount * BigInt(leg.slippageBps)) / 10000n;
+      const slippageBps = leg.slippageBps !== undefined ? BigInt(leg.slippageBps) : 10n;
+      const slippage = (q.outAmount * slippageBps) / 10000n;
       currentConservativeUnits = q.outAmount - slippage;
     }
 

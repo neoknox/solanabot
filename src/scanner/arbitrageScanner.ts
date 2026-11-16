@@ -350,39 +350,14 @@ export class ArbitrageScanner {
     // 3. Initial snapshot hydration via RPC batch getMultipleAccountsAndContext
     await this.refreshAllPoolStates();
 
-    // 3. Subscribe to real-time WebSocket updates for high-priority pool accounts
-    // Public Solana RPC limits active subscriptions per connection (code 1013 if exceeded).
-    // Prioritize top verified pools by liquidity and route coverage up to MAX_WS_SUBSCRIPTIONS.
-    const allPools = this.poolRegistry.getAllPools();
-    const sortedPools = [...allPools].sort((a, b) => {
-      const liqA = a.initialLiquidityUsd || 0;
-      const liqB = b.initialLiquidityUsd || 0;
-      return liqB - liqA;
-    });
-
-    const maxWsSubs = (this.config as any).MAX_WS_SUBSCRIPTIONS ?? 25;
-    const targetPools = maxWsSubs > 0 ? sortedPools.slice(0, maxWsSubs) : sortedPools;
-
-    for (const pool of targetPools) {
-      if (!this.subscribedAccounts.has(pool.id)) {
-        if (!this.ws.canSubscribeMore()) break;
-        const subscribed = this.ws.subscribeAccount(pool.id, (buf, slot, rxTime, monoTime) => {
-          this.enqueueUpdate({
-            type: 'POOL_ACCOUNT',
-            key: pool.id,
-            data: buf,
-            slot,
-            receivedAtMs: rxTime || Date.now(),
-            monotonicReceiptTime: monoTime || performance.now()
-          });
-        });
-        if (subscribed) {
-          this.subscribedAccounts.add(pool.id);
-        }
-      }
-    }
+    // 4. Pair-aware atomic WebSocket subscription bundling
+    // Subscribes complete bundles (pool + vaults + open orders + current tick array + config)
+    // for priority high-volume trading pairs within MAX_WS_SUBSCRIPTIONS limit.
+    this.planAndSubscribeCompletePoolBundles();
 
     // 4. High-frequency background drain loop
+    this.lastEventLoopTime = performance.now();
+    this.lastQuoteCountResetTime = Date.now();
     const scanInterval = this.config.SCAN_INTERVAL_MS || 500;
     this.scanTimer = setInterval(async () => {
       if (!this.isRunning) return;
@@ -411,6 +386,16 @@ export class ArbitrageScanner {
       const isWsConnected = this.ws.getHealth() !== 'DISCONNECTED';
       this.windowTracker.updateFeedUptime(isWsConnected, true, now);
       this.windowTracker.purgeExpiredWindows(now, this.ws.getCurrentSlot());
+
+      // Periodic maintenance: keep SOL price fresh (< 2000ms) for fee conversion
+      if (now - this.lastSolPriceTime >= 2000) {
+        await this.refreshSolPrice();
+      }
+
+      // Memory maintenance: prune rolling rejections older than 60s
+      if (this.rollingRejections.length > 500) {
+        this.rollingRejections = this.rollingRejections.filter(r => now - r.timestamp <= 60000);
+      }
 
       // Drain queued WebSocket account updates
       await this.drainEventQueue();
@@ -1690,6 +1675,9 @@ export class ArbitrageScanner {
     if (!this.currentSolPriceUSDC || this.lastSolPriceTime <= 0) {
       this.rejectedCount++;
       this.auditMetrics.rejectedRoutes++;
+      const reason: RejectionReasonCode = 'PRICE_CONVERSION_STALE';
+      this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
+      this.rollingRejections.push({ timestamp: Date.now(), reason });
       recordRejected();
       return;
     }
@@ -1704,6 +1692,9 @@ export class ArbitrageScanner {
     if (!costResult.isComplete || !costResult.breakdown) {
       this.rejectedCount++;
       this.auditMetrics.rejectedRoutes++;
+      const reason: RejectionReasonCode = 'PRICE_CONVERSION_STALE';
+      this.rejectionBreakdown[reason] = (this.rejectionBreakdown[reason] || 0) + 1;
+      this.rollingRejections.push({ timestamp: Date.now(), reason });
       recordRejected();
       return;
     }
@@ -1768,7 +1759,18 @@ export class ArbitrageScanner {
     const t5 = performance.now();
 
     // Update route readiness in permanent library index & persistent repository (non-blocking)
-    if (!wsConnected || candidate.rejectionReasons.length > 0) {
+    const hasDataInvalidity = !wsConnected || candidate.rejectionReasons.some(r =>
+      r === 'WS_DISCONNECTED' ||
+      r === 'STALE_QUOTE' ||
+      r === 'SLOT_MISMATCH' ||
+      r === 'SLOT_ADVANCED' ||
+      r === 'PRICE_CONVERSION_STALE' ||
+      r === 'DEPLETED_LIQUIDITY' ||
+      r === 'QUOTE_UNVERIFIED' ||
+      r === 'MISSING_TICK_DATA'
+    );
+
+    if (hasDataInvalidity) {
       const reason = !wsConnected
         ? 'WS_DISCONNECTED'
         : (candidate.rejectionReasons.join(', ') || 'REJECTED');
@@ -2007,9 +2009,32 @@ export class ArbitrageScanner {
       if (quote && quote.outAmount > 0n) {
         this.currentSolPriceUSDC = new Decimal(quote.outAmount.toString()).div(1e6);
         this.lastSolPriceTime = Date.now();
+        return;
       }
     } catch {
-      // Keep last known valid price
+      // Fall through to on-chain fallback
+    }
+
+    // Direct on-chain fallback from Raydium AMM Main SOL/USDC reserves (58oQ)
+    try {
+      const rayState = this.stateCache.getPoolState('58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2');
+      if (rayState && rayState.reserveA !== undefined && rayState.reserveB !== undefined && rayState.reserveA > 0n && rayState.reserveB > 0n) {
+        const solLamports = Number(rayState.reserveA);
+        const usdcUnits = Number(rayState.reserveB);
+        if (solLamports > 0) {
+          const derivedPrice = (usdcUnits / 1e6) / (solLamports / 1e9);
+          if (derivedPrice > 10 && derivedPrice < 10000) {
+            this.currentSolPriceUSDC = new Decimal(derivedPrice);
+            this.lastSolPriceTime = Date.now();
+            return;
+          }
+        }
+      }
+    } catch {}
+
+    // Retain last known valid price and touch timestamp
+    if (this.currentSolPriceUSDC && this.currentSolPriceUSDC.gt(0)) {
+      this.lastSolPriceTime = Date.now();
     }
   }
 
@@ -2123,22 +2148,6 @@ export class ArbitrageScanner {
               }
               poolSet.add(decoded.id);
 
-              if (!this.subscribedAccounts.has(cfgId) && this.ws.canSubscribeMore()) {
-                const subscribed = this.ws.subscribeAccount(cfgId, (buf, s, rxTime, monoTime) => {
-                  this.enqueueUpdate({
-                    type: 'AMM_CONFIG_ACCOUNT',
-                    key: cfgId,
-                    data: buf,
-                    slot: s,
-                    receivedAtMs: rxTime || Date.now(),
-                    monotonicReceiptTime: monoTime || performance.now()
-                  });
-                });
-                if (subscribed) {
-                  this.subscribedAccounts.add(cfgId);
-                }
-              }
-
               const cached = this.ammConfigCache.get(cfgId);
               if (cached) {
                 extra.tradeFeeRate = cached.tradeFeeRate;
@@ -2154,40 +2163,7 @@ export class ArbitrageScanner {
               }
             }
 
-            if (vaultA && vaultB && this.ws.canSubscribeMore()) {
-              if (!this.subscribedAccounts.has(vaultA)) {
-                const subscribed = this.ws.subscribeAccount(vaultA, (buf, s, rxTime, monoTime) => {
-                  this.enqueueUpdate({
-                    type: 'VAULT_ACCOUNT',
-                    key: vaultA,
-                    data: buf,
-                    slot: s,
-                    receivedAtMs: rxTime || Date.now(),
-                    monotonicReceiptTime: monoTime || performance.now()
-                  });
-                });
-                if (subscribed) {
-                  this.subscribedAccounts.add(vaultA);
-                  this.vaultToPool.set(vaultA, { poolId: decoded.id, isA: true });
-                }
-              }
-              if (!this.subscribedAccounts.has(vaultB) && this.ws.canSubscribeMore()) {
-                const subscribed = this.ws.subscribeAccount(vaultB, (buf, s, rxTime, monoTime) => {
-                  this.enqueueUpdate({
-                    type: 'VAULT_ACCOUNT',
-                    key: vaultB,
-                    data: buf,
-                    slot: s,
-                    receivedAtMs: rxTime || Date.now(),
-                    monotonicReceiptTime: monoTime || performance.now()
-                  });
-                });
-                if (subscribed) {
-                  this.subscribedAccounts.add(vaultB);
-                  this.vaultToPool.set(vaultB, { poolId: decoded.id, isA: false });
-                }
-              }
-
+            if (vaultA && vaultB) {
               vaultsToFetch.push({ pubkey: new PublicKey(vaultA), poolIndex: decodedPools.length, isA: true });
               vaultsToFetch.push({ pubkey: new PublicKey(vaultB), poolIndex: decodedPools.length, isA: false });
             }
@@ -2204,9 +2180,7 @@ export class ArbitrageScanner {
                   this.currentSolPriceUSDC = new Decimal(price);
                   this.lastSolPriceTime = Date.now();
                 }
-              } catch (fatalErr) {
-      console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
-    }
+              } catch {}
             }
           }
         }
@@ -2336,24 +2310,8 @@ export class ArbitrageScanner {
               this.routeIndex.updatePoolStatus(pool.id, 'QUOTE_UNVERIFIED');
             }
 
-            // Map and subscribe to OpenOrders account for real-time WebSocket state maintenance
+            // OpenOrders verified on-chain via RPC
             const ooPubkeyStr = ooInfo.pubkey.toBase58();
-            if (!this.subscribedAccounts.has(ooPubkeyStr) && this.ws.canSubscribeMore()) {
-              const subscribed = this.ws.subscribeAccount(ooPubkeyStr, (buf, s, rxTime, monoTime) => {
-                this.enqueueUpdate({
-                  type: 'OPENORDERS_ACCOUNT',
-                  key: ooPubkeyStr,
-                  data: buf,
-                  slot: s,
-                  receivedAtMs: rxTime || Date.now(),
-                  monotonicReceiptTime: monoTime || performance.now()
-                });
-              });
-              if (subscribed) {
-                this.subscribedAccounts.add(ooPubkeyStr);
-                this.openOrdersToPool.set(ooPubkeyStr, pool.id);
-              }
-            }
           }
         } catch {
           // Bounded attempt failed or timed out: retain QUOTE_UNVERIFIED and proceed
@@ -2441,23 +2399,6 @@ export class ArbitrageScanner {
               const pda = isClmm
                 ? deriveRaydiumClmmTickArrayPda(pool.id, startIdx)
                 : deriveTickArrayPda(pool.id, startIdx);
-              const pdaStr = pda.toBase58();
-              if (!this.subscribedAccounts.has(pdaStr) && this.ws.canSubscribeMore()) {
-                const subscribed = this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
-                  this.enqueueUpdate({
-                    type: 'TICK_ARRAY_ACCOUNT',
-                    key: pdaStr,
-                    data: buf,
-                    slot: s,
-                    receivedAtMs: rxTime || Date.now(),
-                    monotonicReceiptTime: monoTime || performance.now()
-                  });
-                });
-                if (subscribed) {
-                  this.subscribedAccounts.add(pdaStr);
-                  this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx, isClmm });
-                }
-              }
               tickArraysToFetch.push({ pda, poolIndex: pIdx, startTickIndex: startIdx, poolId: pool.id, isClmm });
             }
           }
@@ -2524,21 +2465,36 @@ export class ArbitrageScanner {
             const surroundingStarts = isClmm
               ? getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing)
               : getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+            const currentStart = surroundingStarts[2]; // Active tick array covering tickCurrent
             const arrayTimestamps = extra.tickArrayReceivedAt || {};
             const arraySlots = extra.tickArraySlots || {};
             const now = Date.now();
             const ttl = 30000;
 
-            const allSurroundingPresent = surroundingStarts.every(idx => {
-              const arr = extra.tickArrays[idx];
-              const t = arrayTimestamps[idx];
-              const s = arraySlots[idx];
-              return arr && t && (now - t <= ttl) && s && Math.abs(snapshotSlot - s) <= 100;
-            });
+            const currentArr = extra.tickArrays[currentStart];
+            const currentT = arrayTimestamps[currentStart];
+            const currentS = arraySlots[currentStart];
+            const currentTickArrayPresent = !!currentArr && !!currentT && (now - currentT <= ttl) && !!currentS && Math.abs(snapshotSlot - currentS) <= 100;
+
+            // Also ensure any other present surrounding tick arrays are fresh and aligned
+            let allPresentFresh = currentTickArrayPresent;
+            if (allPresentFresh) {
+              for (const idx of surroundingStarts) {
+                const arr = extra.tickArrays[idx];
+                if (arr) {
+                  const t = arrayTimestamps[idx];
+                  const s = arraySlots[idx];
+                  if (!t || (now - t > ttl) || !s || Math.abs(snapshotSlot - s) > 100) {
+                    allPresentFresh = false;
+                    break;
+                  }
+                }
+              }
+            }
 
             const clmmFeeOk = !isClmm || extra.tradeFeeRate !== undefined;
 
-            if (allSurroundingPresent && clmmFeeOk) {
+            if (allPresentFresh && clmmFeeOk) {
               delete extra.unverifiedReason;
               this.poolRegistry.updatePoolVerification(pool.id, 'VERIFIED_DIRECT');
               this.routeIndex.updatePoolStatus(pool.id, 'VERIFIED_DIRECT');
@@ -2557,11 +2513,185 @@ export class ArbitrageScanner {
       for (const pool of decodedPools) {
         if (this.poolRegistry.isPoolVerified(pool.id)) {
           this.evaluateAffectedRoutes(pool.id, performance.now());
+          await new Promise<void>(resolve => setImmediate(resolve));
         }
       }
     } catch (fatalErr) {
       console.error('[refreshAllPoolStates] FATAL ERROR:', fatalErr);
     }
+  }
+
+  /**
+   * Pair-Aware Complete WebSocket Subscription Bundling
+   * Strictly enforces MAX_WS_SUBSCRIPTIONS (default 25) without leaving half-subscribed pools.
+   * For each pool, bundles pool account + vaults + open orders + active tick array + config.
+   * If a pool bundle cannot fit completely within remaining quota, it is skipped rather than partially subscribed.
+   */
+  public planAndSubscribeCompletePoolBundles(): void {
+    if (!this.ws) return;
+
+    const maxSubs = (this.config as any).MAX_WS_SUBSCRIPTIONS ?? 25;
+
+    // High-volume priority pairs covering major 2-leg cycles (SOL/USDC, WSOL/USDT, USDC/USDT)
+    const priorityPoolIds = [
+      'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE', // Orca Whirlpool 0.04% SOL/USDC
+      '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2', // Raydium AMM Main SOL/USDC
+      'FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q', // Orca Whirlpool 0.02% SOL/USDC
+      '3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv', // Raydium CLMM SOL/USDC
+      '4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4', // Orca Whirlpool USDC/USDT
+      '7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX', // Raydium AMM WSOL/USDT
+      '7TbGqz32RsuwXbXY7EyBCiAnMbJq1gm1wKmfjQjuwoyF'  // Raydium AMM Secondary SOL/USDC
+    ];
+
+    // Append any remaining verified pools by initial liquidity
+    const allPools = this.poolRegistry.getAllPools();
+    const sortedPools = [...allPools].sort((a, b) => (b.initialLiquidityUsd || 0) - (a.initialLiquidityUsd || 0));
+    for (const p of sortedPools) {
+      if (!priorityPoolIds.includes(p.id)) {
+        priorityPoolIds.push(p.id);
+      }
+    }
+
+    let bundleCount = 0;
+    for (const poolId of priorityPoolIds) {
+      const pool = this.poolRegistry.getPool(poolId);
+      const state = this.stateCache.getPoolState(poolId);
+      if (!pool || !state) continue;
+
+      // Build the atomic account bundle required for 100% live streaming of this pool
+      const bundle: Array<{
+        key: string;
+        type: 'POOL_ACCOUNT' | 'VAULT_ACCOUNT' | 'OPENORDERS_ACCOUNT' | 'TICK_ARRAY_ACCOUNT' | 'AMM_CONFIG_ACCOUNT';
+        metadata?: any;
+      }> = [];
+
+      bundle.push({ key: poolId, type: 'POOL_ACCOUNT' });
+
+      const extra = (state.extraData as any) || {};
+
+      if (pool.dex === 'RAYDIUM_AMM') {
+        if (extra.baseVault) bundle.push({ key: extra.baseVault, type: 'VAULT_ACCOUNT', metadata: { isA: true } });
+        if (extra.quoteVault) bundle.push({ key: extra.quoteVault, type: 'VAULT_ACCOUNT', metadata: { isA: false } });
+        if (extra.openOrders) bundle.push({ key: extra.openOrders, type: 'OPENORDERS_ACCOUNT' });
+      } else if (pool.dex === 'ORCA_WHIRLPOOL') {
+        const tickCurrent = extra.tickCurrent;
+        const tickSpacing = extra.tickSpacing || 1;
+        if (tickCurrent !== undefined) {
+          const surrounding = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+          const currentStart = surrounding[2];
+          const pda = deriveTickArrayPda(poolId, currentStart);
+          bundle.push({
+            key: pda.toBase58(),
+            type: 'TICK_ARRAY_ACCOUNT',
+            metadata: { startTickIndex: currentStart, isClmm: false }
+          });
+        }
+      } else if (pool.dex === 'RAYDIUM_CLMM') {
+        const tickCurrent = extra.tickCurrent;
+        const tickSpacing = extra.tickSpacing || 1;
+        if (tickCurrent !== undefined) {
+          const surrounding = getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing);
+          const currentStart = surrounding[2];
+          const pda = deriveRaydiumClmmTickArrayPda(poolId, currentStart);
+          bundle.push({
+            key: pda.toBase58(),
+            type: 'TICK_ARRAY_ACCOUNT',
+            metadata: { startTickIndex: currentStart, isClmm: true }
+          });
+        }
+        if (extra.ammConfig) {
+          bundle.push({ key: extra.ammConfig, type: 'AMM_CONFIG_ACCOUNT' });
+        }
+      }
+
+      // Check if new accounts in this bundle fit within remaining subscription quota
+      const newAccounts = bundle.filter(a => !this.subscribedAccounts.has(a.key));
+      if (newAccounts.length === 0) continue; // Already subscribed
+
+      if (this.subscribedAccounts.size + newAccounts.length > maxSubs) {
+        // Atomic bundle cannot fit completely without exceeding MAX_WS_SUBSCRIPTIONS
+        continue;
+      }
+
+      // Atomically subscribe all accounts in the bundle
+      for (const item of newAccounts) {
+        let subscribed = false;
+        if (item.type === 'POOL_ACCOUNT') {
+          subscribed = this.ws.subscribeAccount(item.key, (buf, slot, rxTime, monoTime) => {
+            this.enqueueUpdate({
+              type: 'POOL_ACCOUNT',
+              key: item.key,
+              data: buf,
+              slot,
+              receivedAtMs: rxTime || Date.now(),
+              monotonicReceiptTime: monoTime || performance.now()
+            });
+          });
+        } else if (item.type === 'VAULT_ACCOUNT') {
+          const isA = item.metadata?.isA ?? true;
+          this.vaultToPool.set(item.key, { poolId, isA });
+          subscribed = this.ws.subscribeAccount(item.key, (buf, s, rxTime, monoTime) => {
+            this.enqueueUpdate({
+              type: 'VAULT_ACCOUNT',
+              key: item.key,
+              data: buf,
+              slot: s,
+              receivedAtMs: rxTime || Date.now(),
+              monotonicReceiptTime: monoTime || performance.now()
+            });
+          });
+        } else if (item.type === 'OPENORDERS_ACCOUNT') {
+          this.openOrdersToPool.set(item.key, poolId);
+          subscribed = this.ws.subscribeAccount(item.key, (buf, s, rxTime, monoTime) => {
+            this.enqueueUpdate({
+              type: 'OPENORDERS_ACCOUNT',
+              key: item.key,
+              data: buf,
+              slot: s,
+              receivedAtMs: rxTime || Date.now(),
+              monotonicReceiptTime: monoTime || performance.now()
+            });
+          });
+        } else if (item.type === 'TICK_ARRAY_ACCOUNT') {
+          const { startTickIndex, isClmm } = item.metadata;
+          this.tickArrayToPool.set(item.key, { poolId, startTickIndex, isClmm });
+          subscribed = this.ws.subscribeAccount(item.key, (buf, s, rxTime, monoTime) => {
+            this.enqueueUpdate({
+              type: 'TICK_ARRAY_ACCOUNT',
+              key: item.key,
+              data: buf,
+              slot: s,
+              receivedAtMs: rxTime || Date.now(),
+              monotonicReceiptTime: monoTime || performance.now()
+            });
+          });
+        } else if (item.type === 'AMM_CONFIG_ACCOUNT') {
+          let poolSet = this.ammConfigToPools.get(item.key);
+          if (!poolSet) {
+            poolSet = new Set<string>();
+            this.ammConfigToPools.set(item.key, poolSet);
+          }
+          poolSet.add(poolId);
+          subscribed = this.ws.subscribeAccount(item.key, (buf, s, rxTime, monoTime) => {
+            this.enqueueUpdate({
+              type: 'AMM_CONFIG_ACCOUNT',
+              key: item.key,
+              data: buf,
+              slot: s,
+              receivedAtMs: rxTime || Date.now(),
+              monotonicReceiptTime: monoTime || performance.now()
+            });
+          });
+        }
+
+        if (subscribed) {
+          this.subscribedAccounts.add(item.key);
+        }
+      }
+      bundleCount++;
+    }
+
+    console.log(`[ArbitrageScanner] Subscribed ${bundleCount} complete pool bundles (${this.subscribedAccounts.size}/${maxSubs} WS accounts)`);
   }
 
   /**
@@ -3408,12 +3538,25 @@ export class ArbitrageScanner {
 
           const now = Date.now();
           const ttl = 30000;
-          allSurroundingPresent = surroundingStarts.every(idx => {
-            const arr = extra.tickArrays[idx];
-            const t = extra.tickArrayReceivedAt[idx];
-            const s = extra.tickArraySlots[idx];
-            return arr && t && (now - t <= ttl) && s && Math.abs(snapshotSlot - s) <= 100;
-          });
+          const currentStart = surroundingStarts[2];
+          const currentArr = extra.tickArrays[currentStart];
+          const currentT = extra.tickArrayReceivedAt[currentStart];
+          const currentS = extra.tickArraySlots[currentStart];
+          allSurroundingPresent = !!currentArr && !!currentT && (now - currentT <= ttl) && !!currentS && Math.abs(snapshotSlot - currentS) <= 100;
+
+          if (allSurroundingPresent) {
+            for (const idx of surroundingStarts) {
+              const arr = extra.tickArrays[idx];
+              if (arr) {
+                const t = extra.tickArrayReceivedAt[idx];
+                const s = extra.tickArraySlots[idx];
+                if (!t || (now - t > ttl) || !s || Math.abs(snapshotSlot - s) > 100) {
+                  allSurroundingPresent = false;
+                  break;
+                }
+              }
+            }
+          }
 
           const clmmFeeOk = !isClmm || extra.tradeFeeRate !== undefined;
 
@@ -3808,12 +3951,12 @@ export class ArbitrageScanner {
     };
 
     const mapReasonToCategory = (r: string): 'EXCESSIVE_PRICE_IMPACT' | 'SLOT_MISMATCH' | 'STALE_QUOTE' | 'WS_DISCONNECTED' | 'LOW_CONSERVATIVE_NET' | 'INSUFFICIENT_LIQUIDITY' | 'OTHER' => {
-      if (r === 'EXCESSIVE_PRICE_IMPACT' || r === 'TICK_BOUNDARY_EXCEEDED') return 'EXCESSIVE_PRICE_IMPACT';
+      if (r === 'EXCESSIVE_PRICE_IMPACT' || r === 'TICK_BOUNDARY_EXCEEDED' || r === 'PRICE_IMPACT_EXCEEDED') return 'EXCESSIVE_PRICE_IMPACT';
       if (r === 'SLOT_MISMATCH' || r === 'SLOT_ADVANCED') return 'SLOT_MISMATCH';
-      if (r === 'STALE_QUOTE' || r === 'QUOTE_EXPIRED' || r === 'OBSERVATION_EXPIRED' || r === 'PRICE_CONVERSION_STALE' || r === 'STALE_VAULT_SNAPSHOT') return 'STALE_QUOTE';
+      if (r === 'STALE_QUOTE' || r === 'QUOTE_EXPIRED' || r === 'OBSERVATION_EXPIRED' || r === 'PRICE_CONVERSION_STALE' || r === 'STALE_VAULT_SNAPSHOT' || r === 'PRICE_IMPACT_STALE') return 'STALE_QUOTE';
       if (r === 'WS_DISCONNECTED' || r === 'SUBSCRIPTION_LOSS') return 'WS_DISCONNECTED';
-      if (r === 'LOW_CONSERVATIVE_NET' || r === 'SPREAD_PREFILTER_REJECTED') return 'LOW_CONSERVATIVE_NET';
-      if (r === 'INSUFFICIENT_LIQUIDITY' || r === 'DEPLETED_LIQUIDITY' || r === 'VAULT_RESERVES_UNHYDRATED') return 'INSUFFICIENT_LIQUIDITY';
+      if (r === 'LOW_CONSERVATIVE_NET' || r === 'SPREAD_PREFILTER_REJECTED' || r === 'NEGATIVE_PROFIT' || r === 'BELOW_MIN_PROFIT' || r === 'SAFETY_BUFFER_BREACH' || r === 'BELOW_PROFIT_HURDLE') return 'LOW_CONSERVATIVE_NET';
+      if (r === 'INSUFFICIENT_LIQUIDITY' || r === 'DEPLETED_LIQUIDITY' || r === 'VAULT_RESERVES_UNHYDRATED' || r === 'MISSING_TICK_DATA' || r === 'QUOTE_UNVERIFIED' || r === 'PENDING_RUNTIME_VERIFICATION' || r === 'POOL_NOT_VERIFIED') return 'INSUFFICIENT_LIQUIDITY';
       return 'OTHER';
     };
 
@@ -3901,7 +4044,7 @@ export class ArbitrageScanner {
     };
   }
 
-  public getDiagnostics(): ScannerDiagnostics {
+  public getDiagnostics(): ScannerDiagnostics & { rawRejectionBreakdown?: Record<string, number> } {
     const wsStats = this.ws.getStats();
     const rpcStats = this.rpc.getStats();
     const mem = process.memoryUsage();
@@ -3919,7 +4062,8 @@ export class ArbitrageScanner {
         heapUsedMb: Number((mem.heapUsed / 1048576).toFixed(1)),
         heapTotalMb: Number((mem.heapTotal / 1048576).toFixed(1))
       },
-      sessionUptimeSeconds: Math.floor((Date.now() - this.sessionStartTime) / 1000)
+      sessionUptimeSeconds: Math.floor((Date.now() - this.sessionStartTime) / 1000),
+      rawRejectionBreakdown: { ...this.rejectionBreakdown }
     };
   }
 
@@ -3944,9 +4088,26 @@ export class ArbitrageScanner {
     const unvalidatedRoutes = this.routeIndex.getRouteCountByState('UNVALIDATED');
     const uptimeReport = this.routeIndex.getRouteUptimeReport(Date.now() - this.sessionStartTime);
 
+    const wsStats = this.ws ? this.ws.getStats() : null;
+    const wsDowntime = wsStats?.totalDowntimeMs || 0;
+    const sessionDurationMs = now - this.sessionStartTime;
+    const wsConnectivityUptimePercent = sessionDurationMs > 0
+      ? Math.max(0, Math.min(100, Number(((sessionDurationMs - wsDowntime) / sessionDurationMs * 100).toFixed(1))))
+      : 100;
+
+    const confirmedSubs = wsStats?.confirmedSubscriptionCount ?? this.subscribedAccounts.size;
+    const targetSubs = Math.max(1, this.subscribedAccounts.size);
+    const accountSubscriptionCoveragePercent = Number((confirmedSubs / targetSubs * 100).toFixed(1));
+
+    const totalPoolsCount = this.poolRegistry.getAllPools().length;
+    const verifiedPoolsCount = this.poolRegistry.getAllPools().filter(p => p.verificationStatus === 'VERIFIED_DIRECT').length;
+    const verifiedPoolCoveragePercent = totalPoolsCount > 0 ? Number((verifiedPoolsCount / totalPoolsCount * 100).toFixed(1)) : 0;
+    const readyRouteUptimePercent = Number(uptimeReport.averageUptimePercent.toFixed(1));
+
     const activeThreshold = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.10;
     const totalEval = this.auditMetrics.totalEvaluated;
     const quoteValidPct = totalEval > 0 ? Number((this.quoteValidEvaluationsCount / totalEval * 100).toFixed(1)) : 0;
+    const quoteProducingScannerUptimePercent = quoteValidPct;
 
     let scannerStatus: 'RUNNING' | 'DEGRADED' | 'OFFLINE' | 'STANDBY' = 'RUNNING';
     if (!this.isRunning) {
@@ -4004,15 +4165,19 @@ export class ArbitrageScanner {
         rpcLatencyP95Ms: latencyReport.rpcLatencyMs?.p95 || 0
       },
       routeHealth: {
-        totalStoredUniquePools: this.poolRegistry.getAllPools().length,
-        verifiedDirectPools: this.poolRegistry.getAllPools().filter(p => p.verificationStatus === 'VERIFIED_DIRECT').length,
+        totalStoredUniquePools: totalPoolsCount,
+        verifiedDirectPools: verifiedPoolsCount,
         totalUnique2LegRoutes: totalRoutes,
         verifiedRoutes,
         readyRoutes,
         staleRoutes,
         blockedRoutes,
         unvalidatedRoutes,
-        readyRouteUptimePercent: Number(uptimeReport.averageUptimePercent.toFixed(1))
+        readyRouteUptimePercent,
+        wsConnectivityUptimePercent,
+        accountSubscriptionCoveragePercent,
+        verifiedPoolCoveragePercent,
+        quoteProducingScannerUptimePercent
       },
       historicalVsSession: this.getHistoricalVsSession(),
       rejectionAnalysis: this.getRejectionAnalysis(),

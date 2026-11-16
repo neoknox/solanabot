@@ -644,6 +644,10 @@ export interface HudV2Payload {
     blockedRoutes: number;
     unvalidatedRoutes: number;
     readyRouteUptimePercent: number;
+    wsConnectivityUptimePercent?: number;
+    accountSubscriptionCoveragePercent?: number;
+    verifiedPoolCoveragePercent?: number;
+    quoteProducingScannerUptimePercent?: number;
   };
   historicalVsSession: HistoricalVsSessionReport;
   rejectionAnalysis: RejectionAnalysisReport;
