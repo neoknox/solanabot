@@ -58,6 +58,8 @@ async function runBenchmark(durationSeconds = 600) {
 
   let wsDropsObserved = 0;
   let maxReadyWhileDisconnected = 0;
+  let peakRssMb = 0;
+  let peakHeapMb = 0;
   const samples: Array<{
     elapsedSec: number;
     wsConnected: boolean;
@@ -74,6 +76,13 @@ async function runBenchmark(durationSeconds = 600) {
     const elapsedSec = Math.floor((Date.now() - startTime) / 1000);
     const hud = scanner.getHudV2Data();
     const wsStats = scanner.getWsStats();
+
+    // Resource tracking
+    const mem = process.memoryUsage();
+    const currentRssMb = Number((mem.rss / 1024 / 1024).toFixed(1));
+    const currentHeapMb = Number((mem.heapUsed / 1024 / 1024).toFixed(1));
+    if (currentRssMb > peakRssMb) peakRssMb = currentRssMb;
+    if (currentHeapMb > peakHeapMb) peakHeapMb = currentHeapMb;
 
     const wsConnected = hud.wsConnected;
     const readyRoutes = hud.routeHealth?.readyRoutes || 0;
@@ -176,6 +185,10 @@ async function runBenchmark(durationSeconds = 600) {
     console.log(`  Rejected Account Subs:          ${coverage.rejectedAccountSubscriptions}`);
     console.log(`  Pools Lacking Fresh Live Data:  ${coverage.poolsLackingFreshLiveData}`);
     console.log(`  Routes Genuinely READY:         ${coverage.routesGenuinelyReady} (Peak READY: ${peakReadyRoutes})`);
+    const rpcStats = scanner.getRpc().getStats();
+    const validQuotesPerSec = Number(((hud.performance?.quoteValidEvaluations || 0) / (totalElapsedMs / 1000)).toFixed(2));
+    const estimatedHeliusCredits = rpcStats.requestsTotal + (wsStats.confirmedSubscriptionCount || 0);
+
     console.log('----------------------------------------------------------------');
     console.log('ROUTE & EVALUATION TELEMETRY:');
     console.log(`  Stored Route Records (DB):      ${finalRouteCount} (Initial: ${initialRouteCount}, Preserved: ${finalRouteCount >= initialRouteCount})`);
@@ -185,8 +198,11 @@ async function runBenchmark(durationSeconds = 600) {
     console.log(`  Quote-Producing Scanner Uptime: ${hud.routeHealth?.quoteProducingScannerUptimePercent?.toFixed(1) || 0}%`);
     console.log(`  Quote-Valid Rate:               ${hud.performance?.quoteValidPercentage?.toFixed(1) || 0}%`);
     console.log(`  Quote-Valid Evaluations:        ${hud.performance?.quoteValidEvaluations || 0} / ${hud.performance?.totalEvaluationsSession || 0}`);
+    console.log(`  Valid Quotes Per Second:        ${validQuotesPerSec} /s`);
     console.log(`  Event-Loop Delay:               Median: ${loopMedian.toFixed(2)}ms | p95: ${loopP95.toFixed(2)}ms | Max: ${loopMax.toFixed(2)}ms`);
-    console.log(`  RPC p95 Latency:                ${hud.performance?.rpcLatencyP95Ms?.toFixed(1) || 0} ms`);
+    console.log(`  RPC p95 Latency & Failures:     ${hud.performance?.rpcLatencyP95Ms?.toFixed(1) || 0} ms (${rpcStats.requestsTotal} requests, ${rpcStats.requestsFailed} failed)`);
+    console.log(`  CPU & Memory Profile:           Peak RSS: ${peakRssMb} MB | Peak Heap: ${peakHeapMb} MB`);
+    console.log(`  Helius Credits Consumed (Est.): ${estimatedHeliusCredits} credits`);
     console.log(`  Profit Hurdle (Unified):        $${studyTelem.profitHurdleUSDC.toFixed(2)} USDC (HUD: $${hud.thresholdUSDC.toFixed(2)} USDC)`);
     console.log(`  Study Qualified Windows:        ${studyTelem.totalQualifiedWindows} (${studyTelem.completedQualifiedWindows} completed, ${studyTelem.openQualifiedWindows} open)`);
     console.log(`  Study Revalidation Survival:    ${studyTelem.revalidationSuccessPct !== null ? studyTelem.revalidationSuccessPct.toFixed(1) + '%' : 'N/A'}`);
@@ -203,6 +219,9 @@ async function runBenchmark(durationSeconds = 600) {
       feedUptimePct,
       totalDrops,
       wsStats,
+      rpcStats,
+      resources: { peakRssMb, peakHeapMb },
+      estimatedHeliusCredits,
       audit: {
         coverage,
         activeWsSubscriptions,
@@ -218,7 +237,8 @@ async function runBenchmark(durationSeconds = 600) {
         quoteProducingScannerUptimePercent: hud.routeHealth?.quoteProducingScannerUptimePercent || 0,
         quoteValidPercentage: hud.performance?.quoteValidPercentage || 0,
         quoteValidEvaluations: hud.performance?.quoteValidEvaluations || 0,
-        totalEvaluationsSession: hud.performance?.totalEvaluationsSession || 0
+        totalEvaluationsSession: hud.performance?.totalEvaluationsSession || 0,
+        validQuotesPerSec
       },
       eventLoop: { minMs: loopMin, medianMs: loopMedian, p95Ms: loopP95, maxMs: loopMax },
       rpcLatencyP95Ms: hud.performance?.rpcLatencyP95Ms,

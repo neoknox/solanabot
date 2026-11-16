@@ -104,12 +104,10 @@ describe('SOLANABOT — Final Metric Integrity Correction Suite', () => {
       poolReg.register({
         id: `PoolAccount_${i.toString().padStart(4, '0')}`,
         dex: i % 2 === 0 ? 'RAYDIUM_AMM' : 'ORCA_WHIRLPOOL',
-        tokenA: 'So11111111111111111111111111111111111111112',
-        tokenB: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-        reserveA: 1000000000n,
-        reserveB: 200000000000n,
+        programId: '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+        tokenAMint: 'So11111111111111111111111111111111111111112',
+        tokenBMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
         feeBps: 25,
-        isActive: true,
         verificationStatus: 'VERIFIED_DIRECT'
       });
     }
