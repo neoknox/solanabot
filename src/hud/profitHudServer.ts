@@ -4,6 +4,9 @@ import { ProfitThresholdManager, VALID_PROFIT_THRESHOLDS_CENTS } from '../profit
 import { ArbitrageScanner } from '../scanner/arbitrageScanner.js';
 import { HudV2Payload, HourlyProfitabilityBucket } from '../types/index.js';
 import { formatQatarTime, formatQatarHour } from '../study/windowTracker.js';
+import { SOLANA_FAVICON_PNG_BASE64 } from './faviconBase64.js';
+
+const FAVICON_BUFFER = Buffer.from(SOLANA_FAVICON_PNG_BASE64, 'base64');
 
 export interface ProfitHudServerOptions {
   port?: number;
@@ -355,6 +358,18 @@ export class ProfitHudServer {
       return;
     }
 
+    // Favicon: GET /favicon.ico and GET /favicon.png
+    if ((pathname === '/favicon.ico' || pathname === '/favicon.png') && method === 'GET') {
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Length': FAVICON_BUFFER.length,
+        'Cache-Control': 'public, max-age=86400',
+        'Access-Control-Allow-Origin': corsOrigin
+      });
+      res.end(FAVICON_BUFFER);
+      return;
+    }
+
     // 1. GET /api/threshold
     if (pathname === '/api/threshold' && method === 'GET') {
       const payload = {
@@ -668,6 +683,8 @@ export class ProfitHudServer {
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
+  <link rel="icon" type="image/png" href="data:image/png;base64,${SOLANA_FAVICON_PNG_BASE64}">
+  <link rel="shortcut icon" type="image/png" href="/favicon.png">
   <title>SolanaBot HUD V2 - Crypto Arbitrage Trading Terminal</title>
   <style>
     :root {

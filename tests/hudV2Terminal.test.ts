@@ -331,4 +331,35 @@ describe('SOLANABOT — HUD V2 Professional Trading Terminal Suite', () => {
       scanner.stop();
     }
   });
+
+  // 4. Browser Tab Favicon: Serves custom Solana icon and embeds in HTML head
+  it('Favicon: Serves custom Solana tab icon on /favicon.ico and /favicon.png and renders in HTML head', async () => {
+    const { thresholdFile } = getUniqueTestFiles();
+    const manager = new ProfitThresholdManager({ filePath: thresholdFile, silent: true });
+    const hud = new ProfitHudServer(manager, undefined, { port: 0, silent: true });
+    const info = await hud.start();
+
+    try {
+      // 1. Check HTML head contains favicon links
+      const htmlRes = await makeHttpRequest(`http://127.0.0.1:${info.port}/`, 'GET');
+      expect(htmlRes.statusCode).toBe(200);
+      expect(htmlRes.body).toContain('<link rel="icon" type="image/png"');
+      expect(htmlRes.body).toContain('href="data:image/png;base64,');
+      expect(htmlRes.body).toContain('<link rel="shortcut icon" type="image/png" href="/favicon.png">');
+
+      // 2. Check /favicon.png
+      const pngRes = await makeHttpRequest(`http://127.0.0.1:${info.port}/favicon.png`, 'GET');
+      expect(pngRes.statusCode).toBe(200);
+      expect(pngRes.headers['content-type']).toBe('image/png');
+      expect(parseInt(pngRes.headers['content-length'] || '0', 10)).toBe(2954);
+
+      // 3. Check /favicon.ico
+      const icoRes = await makeHttpRequest(`http://127.0.0.1:${info.port}/favicon.ico`, 'GET');
+      expect(icoRes.statusCode).toBe(200);
+      expect(icoRes.headers['content-type']).toBe('image/png');
+      expect(parseInt(icoRes.headers['content-length'] || '0', 10)).toBe(2954);
+    } finally {
+      await hud.stop();
+    }
+  });
 });
