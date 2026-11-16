@@ -1,4 +1,4 @@
-import { config } from '../config/index.js';
+import { config, maskEndpoint } from '../config/index.js';
 import { ArbitrageScanner } from '../scanner/arbitrageScanner.js';
 import { ProfitHudServer } from '../hud/profitHudServer.js';
 
@@ -8,8 +8,8 @@ async function main() {
   console.log('  COMPETITIVE OPPORTUNITY INTELLIGENCE & 2-LEG ARBITRAGE        ');
   console.log('  (Strictly Read-Only: No Private Keys, No Execution, No Funds) ');
   console.log('================================================================');
-  console.log(`Connecting to Solana RPC: ${config.SOLANA_RPC_HTTP}`);
-  console.log(`Connecting to Solana WS:  ${config.SOLANA_RPC_WS}`);
+  console.log(`Connecting to Solana RPC: ${maskEndpoint(config.SOLANA_RPC_HTTP)}`);
+  console.log(`Connecting to Solana WS:  ${maskEndpoint(config.SOLANA_RPC_WS)}`);
   console.log(`WebSocket Commitment:     ${config.WS_COMMITMENT || 'processed'}\n`);
 
   const cpuStart = process.cpuUsage();

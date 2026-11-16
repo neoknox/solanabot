@@ -24,6 +24,7 @@ export class SolanaRpcProvider {
   };
   private minIntervalMs: number;
   private lastRequestTime = 0;
+  private requestQueue: Promise<void> = Promise.resolve();
 
   constructor(config: AppConfig, customConnection?: Connection) {
     this.config = config;
@@ -61,47 +62,54 @@ export class SolanaRpcProvider {
   }
 
   private async throttle(): Promise<void> {
-    const now = Date.now();
-    const elapsed = now - this.lastRequestTime;
-    if (elapsed < this.minIntervalMs) {
-      await new Promise(resolve => setTimeout(resolve, this.minIntervalMs - elapsed));
+    const run = async () => {
+      const now = Date.now();
+      const elapsed = now - this.lastRequestTime;
+      if (elapsed < this.minIntervalMs) {
+        await new Promise(resolve => setTimeout(resolve, this.minIntervalMs - elapsed));
+      }
+      this.lastRequestTime = Date.now();
+    };
+    this.requestQueue = this.requestQueue.then(run, run);
+    await this.requestQueue;
+  }
+
+  private async executeWithRetry<T>(opName: string, fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+    let attempt = 0;
+    while (true) {
+      await this.throttle();
+      const start = Date.now();
+      try {
+        this.stats.requestsTotal++;
+        const result = await this.withTimeout(fn(), DEFAULT_RPC_TIMEOUT_MS, opName);
+        this.stats.lastLatencyMs = Date.now() - start;
+        return result;
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        const isRateLimit = message.includes('429') || message.includes('Too many requests');
+        if (isRateLimit) {
+          this.stats.rateLimitHits++;
+        }
+        if (attempt < maxRetries && (isRateLimit || message.includes('ECONNRESET') || message.includes('ETIMEDOUT') || message.includes('fetch failed'))) {
+          attempt++;
+          const backoffMs = isRateLimit ? (attempt * 600 + Math.floor(Math.random() * 200)) : (attempt * 300);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+          continue;
+        }
+        this.stats.requestsFailed++;
+        throw err;
+      }
     }
-    this.lastRequestTime = Date.now();
   }
 
   public async getSlot(): Promise<number> {
-    await this.throttle();
-    const start = Date.now();
-    try {
-      this.stats.requestsTotal++;
-      const slot = await this.withTimeout(this.connection.getSlot('confirmed'), DEFAULT_RPC_TIMEOUT_MS, 'GET_SLOT');
-      this.stats.lastSlot = slot;
-      this.stats.lastLatencyMs = Date.now() - start;
-      return slot;
-    } catch (err: unknown) {
-      this.stats.requestsFailed++;
-      const message = err instanceof Error ? err.message : String(err);
-      if (message.includes('429') || message.includes('Too many requests')) {
-        this.stats.rateLimitHits++;
-      }
-      throw err;
-    }
+    const slot = await this.executeWithRetry('GET_SLOT', () => this.connection.getSlot('confirmed'));
+    this.stats.lastSlot = slot;
+    return slot;
   }
 
   public async getAccountInfo(pubkey: PublicKey): Promise<AccountInfo<Buffer> | null> {
-    await this.throttle();
-    const start = Date.now();
-    try {
-      this.stats.requestsTotal++;
-      const info = await this.withTimeout(this.connection.getAccountInfo(pubkey, 'confirmed'), DEFAULT_RPC_TIMEOUT_MS, 'GET_ACCOUNT_INFO');
-      this.stats.lastLatencyMs = Date.now() - start;
-      return info;
-    } catch (err: unknown) {
-      this.stats.requestsFailed++;
-      const message = err instanceof Error ? err.message : String(err);
-      if (message.includes('429')) this.stats.rateLimitHits++;
-      throw err;
-    }
+    return await this.executeWithRetry('GET_ACCOUNT_INFO', () => this.connection.getAccountInfo(pubkey, 'confirmed'));
   }
 
   public async getMultipleAccounts(pubkeys: PublicKey[]): Promise<(AccountInfo<Buffer> | null)[]> {
@@ -130,46 +138,24 @@ export class SolanaRpcProvider {
       };
     }
 
-    await this.throttle();
-    const start = Date.now();
-    try {
-      this.stats.requestsTotal++;
-      const res = await this.withTimeout(
-        this.connection.getMultipleAccountsInfoAndContext(pubkeys, 'confirmed'),
-        DEFAULT_RPC_TIMEOUT_MS,
-        'GET_MULTIPLE_ACCOUNTS'
-      );
-      this.stats.lastLatencyMs = Date.now() - start;
-      this.stats.lastSlot = res.context.slot;
-      return {
-        slot: res.context.slot,
-        value: res.value
-      };
-    } catch (err: unknown) {
-      this.stats.requestsFailed++;
-      const message = err instanceof Error ? err.message : String(err);
-      if (message.includes('429')) this.stats.rateLimitHits++;
-      throw err;
-    }
+    const res = await this.executeWithRetry('GET_MULTIPLE_ACCOUNTS', () =>
+      this.connection.getMultipleAccountsInfoAndContext(pubkeys, 'confirmed')
+    );
+    this.stats.lastSlot = res.context.slot;
+    return {
+      slot: res.context.slot,
+      value: res.value
+    };
   }
 
   public async getTokenAccountBalance(pubkey: PublicKey): Promise<{ amount: bigint; decimals: number }> {
-    await this.throttle();
-    try {
-      this.stats.requestsTotal++;
-      const balance = await this.withTimeout(
-        this.connection.getTokenAccountBalance(pubkey, 'confirmed'),
-        DEFAULT_RPC_TIMEOUT_MS,
-        'GET_TOKEN_BALANCE'
-      );
-      return {
-        amount: BigInt(balance.value.amount),
-        decimals: balance.value.decimals
-      };
-    } catch (err: unknown) {
-      this.stats.requestsFailed++;
-      throw err;
-    }
+    const balance = await this.executeWithRetry('GET_TOKEN_BALANCE', () =>
+      this.connection.getTokenAccountBalance(pubkey, 'confirmed')
+    );
+    return {
+      amount: BigInt(balance.value.amount),
+      decimals: balance.value.decimals
+    };
   }
 
   public async getEstimatePriorityFee(): Promise<number> {

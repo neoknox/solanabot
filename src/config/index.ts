@@ -152,4 +152,18 @@ export function loadConfig(envOverrides: Record<string, string | undefined> = {}
   };
 }
 
+export function maskEndpoint(urlStr?: string): string {
+  if (!urlStr) return '(not set)';
+  try {
+    const parsed = new URL(urlStr);
+    const hasKey = parsed.searchParams.has('api-key');
+    if (hasKey) {
+      return `${parsed.protocol}//${parsed.hostname}${parsed.pathname}?api-key=***`;
+    }
+    return urlStr.replace(/api-key=[^&]+/i, 'api-key=***');
+  } catch {
+    return urlStr ? urlStr.replace(/api-key=[^&]+/i, 'api-key=***') : '(not set)';
+  }
+}
+
 export const config = loadConfig();

@@ -170,7 +170,6 @@ export class SolanaWsProvider {
           this.reconnectAttempts = 0;
           this.lastManualAttemptFailed = false;
           this.lastMessageTime = Date.now();
-          this.lastHealthyFeedTime = Date.now();
           this.lastReconnectResult = 'SUCCESS';
           this.lastError = null;
           this.stage = 'CONNECTED';
@@ -209,14 +208,12 @@ export class SolanaWsProvider {
         this.ws.on('message', (data: WebSocket.RawData) => {
           if (this.socketGeneration !== currentGen) return;
           this.lastMessageTime = Date.now();
-          this.lastHealthyFeedTime = Date.now();
           this.handleMessage(data.toString());
         });
 
         this.ws.on('pong', () => {
           if (this.socketGeneration !== currentGen) return;
           this.lastMessageTime = Date.now();
-          this.lastHealthyFeedTime = Date.now();
         });
 
         this.ws.on('error', (err) => {
@@ -581,6 +578,7 @@ export class SolanaWsProvider {
       if (msg.method === 'slotNotification') {
         const slot = msg.params?.result?.slot;
         if (typeof slot === 'number') {
+          this.lastHealthyFeedTime = Date.now();
           if (this.currentSlot > 0 && slot > this.currentSlot + 1) {
             const gap = slot - this.currentSlot - 1;
             this.slotGapCount++;
@@ -596,6 +594,7 @@ export class SolanaWsProvider {
       }
 
       if (msg.method === 'accountNotification') {
+        this.lastHealthyFeedTime = Date.now();
         const receiptMonotonic = performance.now();
         const receiptMs = Date.now();
         const subId = msg.params?.subscription;
@@ -686,7 +685,10 @@ export class SolanaWsProvider {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return 'DISCONNECTED';
     }
-    const elapsed = Date.now() - this.lastMessageTime;
+    if (this.lastHealthyFeedTime === 0) {
+      return 'DEGRADED';
+    }
+    const elapsed = Date.now() - this.lastHealthyFeedTime;
     if (elapsed > this.config.MAX_QUOTE_AGE_MS * 2) {
       return 'STALE';
     }

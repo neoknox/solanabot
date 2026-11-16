@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { ArbitrageScanner } from '../src/scanner/arbitrageScanner.js';
-import { loadConfig } from '../src/config/index.js';
+import { loadConfig, maskEndpoint } from '../src/config/index.js';
 import { CompetitorResearchAuditor } from '../src/competition/competitorResearch.js';
 
 interface BoundedBenchmarkReport {
@@ -91,8 +91,8 @@ async function runBoundedBenchmark() {
   const startTime = Date.now();
   const DURATION_SECONDS = 10;
 
-  console.log(`[INIT] Connecting to RPC: ${config.SOLANA_RPC_HTTP}`);
-  console.log(`[INIT] Connecting to WS:  ${config.SOLANA_RPC_WS}`);
+  console.log(`[INIT] Connecting to RPC: ${maskEndpoint(config.SOLANA_RPC_HTTP)}`);
+  console.log(`[INIT] Connecting to WS:  ${maskEndpoint(config.SOLANA_RPC_WS)}`);
 
   const scanner = new ArbitrageScanner(config);
   await scanner.start();

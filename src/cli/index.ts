@@ -1,5 +1,5 @@
 import path from 'path';
-import { config, AppConfig } from '../config/index.js';
+import { config, AppConfig, maskEndpoint } from '../config/index.js';
 import { ArbitrageScanner } from '../scanner/arbitrageScanner.js';
 import { ProfitHudServer } from '../hud/profitHudServer.js';
 import { ArbitrageCandidate } from '../types/index.js';
@@ -35,8 +35,8 @@ export async function startConnectedScanner(customConfig: AppConfig = config) {
   console.log('  SOLANA ARBITRAGE BOT - PHASE 1: READ-ONLY SCANNER + HUD       ');
   console.log('  (Strictly Read-Only: No Private Keys, No Execution, No Funds) ');
   console.log('================================================================');
-  console.log(`RPC HTTP:            ${customConfig.SOLANA_RPC_HTTP}`);
-  console.log(`RPC WS:              ${customConfig.SOLANA_RPC_WS}`);
+  console.log(`RPC HTTP:            ${maskEndpoint(customConfig.SOLANA_RPC_HTTP)}`);
+  console.log(`RPC WS:              ${maskEndpoint(customConfig.SOLANA_RPC_WS)}`);
   console.log(`Tokens Monitored:    ${customConfig.SCAN_TOKENS} (WSOL & USDC Canonical)`);
   console.log(`Simulated Sizes:     $${customConfig.parsedTradeSizesUSDC.join(', $')} USDC`);
   console.log(`Min Net Target:      ${thresholdManager.getFormattedThreshold()} (Live Adjustable via HUD)`);
