@@ -131,8 +131,10 @@ export class HeliusCreditTracker {
   }
 
   private calculateLocalEstimate(): number {
-    // 1 credit per RPC request + 1 credit per ~1KB of WS telemetry
-    const wsCredits = Math.floor(this.wsBytesTotal / 1024);
+    // Official Helius Free Pricing:
+    // 1 credit per HTTP RPC request
+    // 2 credits per 0.1 MB (20 credits per 1 MB) of WebSocket data transfer
+    const wsCredits = this.wsBytesTotal > 0 ? Math.ceil((this.wsBytesTotal / (100 * 1024)) * 2) : 0;
     return Math.min(this.creditLimit, this.rpcRequestsTotal + wsCredits);
   }
 
@@ -281,6 +283,20 @@ export class HeliusCreditTracker {
     const elapsedMs = Math.max(0, Date.now() - timestamp);
     const lastUpdatedFormatted = this.formatRelativeTime(elapsedMs);
 
+    const burnRateCreditsPerHour = usageRateCreditsPerHour;
+    let projectedExhaustionHours: number | null = null;
+    let projectedExhaustionDate: string | null = null;
+
+    if (burnRateCreditsPerHour > 0 && creditsRemaining > 0) {
+      projectedExhaustionHours = Math.round((creditsRemaining / burnRateCreditsPerHour) * 10) / 10;
+      projectedExhaustionDate = new Date(Date.now() + projectedExhaustionHours * 3600_000).toISOString();
+    }
+
+    // 24/7 scanning sustainable limit on Free (1,000,000 credits / 732 hours in 30.5-day month = 1,366.1 credits/hr)
+    const MAX_FREE_24X7_HOURLY_RATE = 1366.1;
+    const is24x7SustainableOnFree = burnRateCreditsPerHour <= MAX_FREE_24X7_HOURLY_RATE;
+    const requiredMonthlyCreditsFor24x7 = Math.round(burnRateCreditsPerHour * 732);
+
     return {
       enabled: true,
       isHeliusActive: this.isHeliusActive,
@@ -301,7 +317,12 @@ export class HeliusCreditTracker {
       alertColor,
       alertMessage,
       recommendation,
-      dashboardUrl: 'https://dashboard.helius.dev/'
+      dashboardUrl: 'https://dashboard.helius.dev/',
+      burnRateCreditsPerHour,
+      projectedExhaustionDate,
+      projectedExhaustionHours,
+      is24x7SustainableOnFree,
+      requiredMonthlyCreditsFor24x7
     };
   }
 

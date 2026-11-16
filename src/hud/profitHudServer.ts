@@ -1733,6 +1733,10 @@ export class ProfitHudServer {
             <span class="card-metric-val" id="costWsVolume">0.00 MB</span>
           </div>
           <div class="card-metric-row">
+            <span class="card-metric-label">Burn Rate / 24h:</span>
+            <span class="card-metric-val" id="costBurnRate">0/hr (Sustainable)</span>
+          </div>
+          <div class="card-metric-row">
             <span class="card-metric-label">Plan Tier:</span>
             <span class="card-metric-val" style="color:var(--text-bright);">FREE (1M/mo limit)</span>
           </div>
@@ -2984,7 +2988,20 @@ export class ProfitHudServer {
 
           // 1.5 Cost & Coverage Cards
           const costCreditsEl = document.getElementById('costCredits');
-          if (costCreditsEl) costCreditsEl.textContent = data.cost?.actualCredits || 'NOT AVAILABLE';
+          if (costCreditsEl) {
+            if (cm) {
+              costCreditsEl.textContent = cm.creditsUsed.toLocaleString() + ' / ' + (cm.creditsLimit / 1e6) + 'M (' + cm.percentageUsed.toFixed(1) + '%)';
+              costCreditsEl.style.color = cm.alertColor === 'green' ? 'var(--green)' : (cm.alertColor === 'yellow' ? 'var(--amber)' : 'var(--red)');
+            } else {
+              costCreditsEl.textContent = data.cost?.actualCredits || 'NOT AVAILABLE';
+            }
+          }
+          const costBurnRateEl = document.getElementById('costBurnRate');
+          if (costBurnRateEl && cm) {
+            const statusLabel = cm.is24x7SustainableOnFree ? 'Sustainable' : 'Exceeds Free';
+            costBurnRateEl.textContent = (cm.burnRateCreditsPerHour || 0).toLocaleString() + '/hr (' + statusLabel + ')';
+            costBurnRateEl.style.color = cm.is24x7SustainableOnFree ? 'var(--green)' : 'var(--amber)';
+          }
           const costRpcRateEl = document.getElementById('costRpcRate');
           if (costRpcRateEl) costRpcRateEl.textContent = (data.cost?.rpcRequestRate || 0).toFixed(1) + ' req/s';
           const costWsVolumeEl = document.getElementById('costWsVolume');

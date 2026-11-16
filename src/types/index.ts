@@ -617,6 +617,11 @@ export interface HeliusCreditMeterData {
   alertMessage?: string;
   recommendation?: string;
   dashboardUrl: string; // "https://dashboard.helius.dev/"
+  burnRateCreditsPerHour?: number;
+  projectedExhaustionDate?: string | null;
+  projectedExhaustionHours?: number | null;
+  is24x7SustainableOnFree?: boolean;
+  requiredMonthlyCreditsFor24x7?: number;
 }
 
 export interface HudV2Payload {

@@ -82,14 +82,14 @@ describe('SOLANABOT — HUD V2 Helius Credit Meter & Tracking Suite', () => {
     const pollResult = await tracker.pollProjectUsage();
     expect(pollResult).toBe(false);
 
-    // Record local RPC and WebSocket telemetry
-    tracker.setLocalTelemetry(120, 204800); // 120 RPC reqs + 200 KB WS (~200 credits) => 320 credits
+    // Record local RPC and WebSocket telemetry (120 RPC reqs @ 1 credit + 200 KB WS @ 2 credits/0.1MB = 124 credits)
+    tracker.setLocalTelemetry(120, 204800);
 
     const data = tracker.getCreditMeterData();
     expect(data.source).toBe('ESTIMATED_LOCAL');
     expect(data.sourceLabel).toBe('ESTIMATED LOCAL USAGE');
-    expect(data.creditsUsed).toBe(320);
-    expect(data.creditsRemaining).toBe(1000000 - 320);
+    expect(data.creditsUsed).toBe(124);
+    expect(data.creditsRemaining).toBe(1000000 - 124);
     expect(data.dashboardUrl).toBe('https://dashboard.helius.dev/');
   });
 
@@ -135,9 +135,9 @@ describe('SOLANABOT — HUD V2 Helius Credit Meter & Tracking Suite', () => {
     expect(tracker.getCreditMeterData().statusDisplay).toBe('ACTIVE');
 
     tracker.recordRpcRequest(10);
-    tracker.recordWsTraffic(10240); // 10 credits
+    tracker.recordWsTraffic(102400); // 100 KB @ 2 credits/0.1MB = 2 credits
     const data = tracker.getCreditMeterData();
-    expect(data.creditsUsed).toBe(20);
+    expect(data.creditsUsed).toBe(12);
   });
 
   // 5. Stale Billing Data & Relative Timestamp Formatting
