@@ -38,6 +38,8 @@ export interface WsStats {
   lastMessageTime: number;
   subscriptionCount: number;
   confirmedSubscriptionCount?: number;
+  rejectedSubscriptionCount?: number;
+  maxSubscriptions?: number;
   activeAccountUpdatesCount?: number;
   slotGapCount?: number;
   totalSlotsSkipped?: number;
@@ -106,6 +108,7 @@ export class SolanaWsProvider {
   private onDisconnectCallbacks: Array<() => void> = [];
   private onSlotCallbacks: Array<SlotUpdateHandler> = [];
   private maxSubscriptions: number;
+  private rejectedSubscriptionCount = 0;
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -438,6 +441,7 @@ export class SolanaWsProvider {
   public subscribeAccount(pubkey: string, handler: AccountUpdateHandler): boolean {
     if (!this.accountSubscriptions.has(pubkey)) {
       if (this.maxSubscriptions > 0 && this.accountSubscriptions.size >= this.maxSubscriptions) {
+        this.rejectedSubscriptionCount++;
         return false;
       }
       this.accountSubscriptions.set(pubkey, { handler });
@@ -714,6 +718,8 @@ export class SolanaWsProvider {
       lastMessageTime: this.lastMessageTime,
       subscriptionCount: this.accountSubscriptions.size,
       confirmedSubscriptionCount: confirmedCount,
+      rejectedSubscriptionCount: this.rejectedSubscriptionCount,
+      maxSubscriptions: this.maxSubscriptions,
       activeAccountUpdatesCount: this.activeAccountsWithUpdates.size,
       slotGapCount: this.slotGapCount,
       totalSlotsSkipped: this.totalSlotsSkipped,

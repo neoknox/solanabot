@@ -187,4 +187,53 @@ describe('SOLANABOT — Critical Stability and Study Fix Suite', () => {
     const watchTable = scanner.getProfitWatchTable(10);
     expect(watchTable).toEqual([]); // Clean empty array, no fake rows with -0.25!
   });
+
+  // REQUIREMENT 4: Never mark pool subscribed when subscribeAccount() returns false
+  it('Requirement 4: Pools and accounts are NOT marked subscribed if subscribeAccount() returns false', () => {
+    const customConfig = loadConfig({
+      MAX_WS_SUBSCRIPTIONS: '2'
+    });
+    const ws = new SolanaWsProvider(customConfig);
+    const subscribedAccounts = new Set<string>();
+
+    const sub1 = ws.subscribeAccount('Account1111111111111111111111111111111111111', () => {});
+    if (sub1) subscribedAccounts.add('Account1111111111111111111111111111111111111');
+
+    const sub2 = ws.subscribeAccount('Account2222222222222222222222222222222222222', () => {});
+    if (sub2) subscribedAccounts.add('Account2222222222222222222222222222222222222');
+
+    // Third attempt exceeds maxSubscriptions (2) -> must return false
+    const sub3 = ws.subscribeAccount('Account3333333333333333333333333333333333333', () => {});
+    if (sub3) subscribedAccounts.add('Account3333333333333333333333333333333333333');
+
+    expect(sub1).toBe(true);
+    expect(sub2).toBe(true);
+    expect(sub3).toBe(false);
+
+    // Account3 MUST NOT be marked subscribed!
+    expect(subscribedAccounts.has('Account3333333333333333333333333333333333333')).toBe(false);
+    expect(subscribedAccounts.size).toBe(2);
+    expect(ws.getStats().subscriptionCount).toBe(2);
+    expect(ws.getStats().rejectedSubscriptionCount).toBe(1);
+    expect(ws.canSubscribeMore()).toBe(false);
+  });
+
+  // REQUIREMENT 5: Dependent accounts stay strictly within provider limits
+  it('Requirement 5: Dependent accounts stay strictly within provider limits (MAX_WS_SUBSCRIPTIONS)', () => {
+    const customConfig = loadConfig({
+      MAX_WS_SUBSCRIPTIONS: '5'
+    });
+    const ws = new SolanaWsProvider(customConfig);
+
+    for (let i = 0; i < 20; i++) {
+      const pubkey = `Acc${i.toString().padStart(41, '0')}`;
+      ws.subscribeAccount(pubkey, () => {});
+    }
+
+    const stats = ws.getStats();
+    expect(stats.subscriptionCount).toBe(5);
+    expect(stats.subscriptionCount).toBeLessThanOrEqual(5);
+    expect(stats.rejectedSubscriptionCount).toBe(15);
+    expect(ws.canSubscribeMore()).toBe(false);
+  });
 });

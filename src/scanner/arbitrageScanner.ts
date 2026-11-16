@@ -366,8 +366,7 @@ export class ArbitrageScanner {
     for (const pool of targetPools) {
       if (!this.subscribedAccounts.has(pool.id)) {
         if (!this.ws.canSubscribeMore()) break;
-        this.subscribedAccounts.add(pool.id);
-        this.ws.subscribeAccount(pool.id, (buf, slot, rxTime, monoTime) => {
+        const subscribed = this.ws.subscribeAccount(pool.id, (buf, slot, rxTime, monoTime) => {
           this.enqueueUpdate({
             type: 'POOL_ACCOUNT',
             key: pool.id,
@@ -377,6 +376,9 @@ export class ArbitrageScanner {
             monotonicReceiptTime: monoTime || performance.now()
           });
         });
+        if (subscribed) {
+          this.subscribedAccounts.add(pool.id);
+        }
       }
     }
 
@@ -2122,8 +2124,7 @@ export class ArbitrageScanner {
               poolSet.add(decoded.id);
 
               if (!this.subscribedAccounts.has(cfgId) && this.ws.canSubscribeMore()) {
-                this.subscribedAccounts.add(cfgId);
-                this.ws.subscribeAccount(cfgId, (buf, s, rxTime, monoTime) => {
+                const subscribed = this.ws.subscribeAccount(cfgId, (buf, s, rxTime, monoTime) => {
                   this.enqueueUpdate({
                     type: 'AMM_CONFIG_ACCOUNT',
                     key: cfgId,
@@ -2133,6 +2134,9 @@ export class ArbitrageScanner {
                     monotonicReceiptTime: monoTime || performance.now()
                   });
                 });
+                if (subscribed) {
+                  this.subscribedAccounts.add(cfgId);
+                }
               }
 
               const cached = this.ammConfigCache.get(cfgId);
@@ -2152,9 +2156,7 @@ export class ArbitrageScanner {
 
             if (vaultA && vaultB && this.ws.canSubscribeMore()) {
               if (!this.subscribedAccounts.has(vaultA)) {
-                this.subscribedAccounts.add(vaultA);
-                this.vaultToPool.set(vaultA, { poolId: decoded.id, isA: true });
-                this.ws.subscribeAccount(vaultA, (buf, s, rxTime, monoTime) => {
+                const subscribed = this.ws.subscribeAccount(vaultA, (buf, s, rxTime, monoTime) => {
                   this.enqueueUpdate({
                     type: 'VAULT_ACCOUNT',
                     key: vaultA,
@@ -2164,11 +2166,13 @@ export class ArbitrageScanner {
                     monotonicReceiptTime: monoTime || performance.now()
                   });
                 });
+                if (subscribed) {
+                  this.subscribedAccounts.add(vaultA);
+                  this.vaultToPool.set(vaultA, { poolId: decoded.id, isA: true });
+                }
               }
               if (!this.subscribedAccounts.has(vaultB) && this.ws.canSubscribeMore()) {
-                this.subscribedAccounts.add(vaultB);
-                this.vaultToPool.set(vaultB, { poolId: decoded.id, isA: false });
-                this.ws.subscribeAccount(vaultB, (buf, s, rxTime, monoTime) => {
+                const subscribed = this.ws.subscribeAccount(vaultB, (buf, s, rxTime, monoTime) => {
                   this.enqueueUpdate({
                     type: 'VAULT_ACCOUNT',
                     key: vaultB,
@@ -2178,6 +2182,10 @@ export class ArbitrageScanner {
                     monotonicReceiptTime: monoTime || performance.now()
                   });
                 });
+                if (subscribed) {
+                  this.subscribedAccounts.add(vaultB);
+                  this.vaultToPool.set(vaultB, { poolId: decoded.id, isA: false });
+                }
               }
 
               vaultsToFetch.push({ pubkey: new PublicKey(vaultA), poolIndex: decodedPools.length, isA: true });
@@ -2331,9 +2339,7 @@ export class ArbitrageScanner {
             // Map and subscribe to OpenOrders account for real-time WebSocket state maintenance
             const ooPubkeyStr = ooInfo.pubkey.toBase58();
             if (!this.subscribedAccounts.has(ooPubkeyStr) && this.ws.canSubscribeMore()) {
-              this.subscribedAccounts.add(ooPubkeyStr);
-              this.openOrdersToPool.set(ooPubkeyStr, pool.id);
-              this.ws.subscribeAccount(ooPubkeyStr, (buf, s, rxTime, monoTime) => {
+              const subscribed = this.ws.subscribeAccount(ooPubkeyStr, (buf, s, rxTime, monoTime) => {
                 this.enqueueUpdate({
                   type: 'OPENORDERS_ACCOUNT',
                   key: ooPubkeyStr,
@@ -2343,6 +2349,10 @@ export class ArbitrageScanner {
                   monotonicReceiptTime: monoTime || performance.now()
                 });
               });
+              if (subscribed) {
+                this.subscribedAccounts.add(ooPubkeyStr);
+                this.openOrdersToPool.set(ooPubkeyStr, pool.id);
+              }
             }
           }
         } catch {
@@ -2433,9 +2443,7 @@ export class ArbitrageScanner {
                 : deriveTickArrayPda(pool.id, startIdx);
               const pdaStr = pda.toBase58();
               if (!this.subscribedAccounts.has(pdaStr) && this.ws.canSubscribeMore()) {
-                this.subscribedAccounts.add(pdaStr);
-                this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx, isClmm });
-                this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
+                const subscribed = this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
                   this.enqueueUpdate({
                     type: 'TICK_ARRAY_ACCOUNT',
                     key: pdaStr,
@@ -2445,6 +2453,10 @@ export class ArbitrageScanner {
                     monotonicReceiptTime: monoTime || performance.now()
                   });
                 });
+                if (subscribed) {
+                  this.subscribedAccounts.add(pdaStr);
+                  this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx, isClmm });
+                }
               }
               tickArraysToFetch.push({ pda, poolIndex: pIdx, startTickIndex: startIdx, poolId: pool.id, isClmm });
             }
@@ -3205,8 +3217,7 @@ export class ArbitrageScanner {
 
     // 2. Prevent duplicate subscriptions for the pool account
     if (!this.subscribedAccounts.has(pool.id)) {
-      this.subscribedAccounts.add(pool.id);
-      this.ws.subscribeAccount(pool.id, (buf, slot, rxTime, monoTime) => {
+      const subscribed = this.ws.subscribeAccount(pool.id, (buf, slot, rxTime, monoTime) => {
         this.enqueueUpdate({
           type: 'POOL_ACCOUNT',
           key: pool.id,
@@ -3216,6 +3227,9 @@ export class ArbitrageScanner {
           monotonicReceiptTime: monoTime || performance.now()
         });
       });
+      if (subscribed) {
+        this.subscribedAccounts.add(pool.id);
+      }
     }
 
     try {
@@ -3288,8 +3302,7 @@ export class ArbitrageScanner {
           poolSet.add(pool.id);
 
           if (!this.subscribedAccounts.has(cfgId) && this.ws.canSubscribeMore()) {
-            this.subscribedAccounts.add(cfgId);
-            this.ws.subscribeAccount(cfgId, (buf, s, rxTime, monoTime) => {
+            const subscribed = this.ws.subscribeAccount(cfgId, (buf, s, rxTime, monoTime) => {
               this.enqueueUpdate({
                 type: 'AMM_CONFIG_ACCOUNT',
                 key: cfgId,
@@ -3299,6 +3312,9 @@ export class ArbitrageScanner {
                 monotonicReceiptTime: monoTime || performance.now()
               });
             });
+            if (subscribed) {
+              this.subscribedAccounts.add(cfgId);
+            }
           }
 
           let cfg = this.ammConfigCache.get(cfgId);
@@ -3344,9 +3360,7 @@ export class ArbitrageScanner {
                 : deriveTickArrayPda(pool.id, startIdx);
               const pdaStr = pda.toBase58();
               if (!this.subscribedAccounts.has(pdaStr) && this.ws.canSubscribeMore()) {
-                this.subscribedAccounts.add(pdaStr);
-                this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx, isClmm });
-                this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
+                const subscribed = this.ws.subscribeAccount(pdaStr, (buf, s, rxTime, monoTime) => {
                   this.enqueueUpdate({
                     type: 'TICK_ARRAY_ACCOUNT',
                     key: pdaStr,
@@ -3356,6 +3370,10 @@ export class ArbitrageScanner {
                     monotonicReceiptTime: monoTime || performance.now()
                   });
                 });
+                if (subscribed) {
+                  this.subscribedAccounts.add(pdaStr);
+                  this.tickArrayToPool.set(pdaStr, { poolId: pool.id, startTickIndex: startIdx, isClmm });
+                }
               }
               pdaPubkeys.push(pda);
               startIndices.push(startIdx);
@@ -3453,9 +3471,7 @@ export class ArbitrageScanner {
         }
 
         if (vaultA && !this.subscribedAccounts.has(vaultA) && this.ws.canSubscribeMore()) {
-          this.subscribedAccounts.add(vaultA);
-          this.vaultToPool.set(vaultA, { poolId: pool.id, isA: true });
-          this.ws.subscribeAccount(vaultA, (buf, s, rxTime, monoTime) => {
+          const subscribed = this.ws.subscribeAccount(vaultA, (buf, s, rxTime, monoTime) => {
             this.enqueueUpdate({
               type: 'VAULT_ACCOUNT',
               key: vaultA,
@@ -3465,12 +3481,14 @@ export class ArbitrageScanner {
               monotonicReceiptTime: monoTime || performance.now()
             });
           });
+          if (subscribed) {
+            this.subscribedAccounts.add(vaultA);
+            this.vaultToPool.set(vaultA, { poolId: pool.id, isA: true });
+          }
         }
 
         if (vaultB && !this.subscribedAccounts.has(vaultB) && this.ws.canSubscribeMore()) {
-          this.subscribedAccounts.add(vaultB);
-          this.vaultToPool.set(vaultB, { poolId: pool.id, isA: false });
-          this.ws.subscribeAccount(vaultB, (buf, s, rxTime, monoTime) => {
+          const subscribed = this.ws.subscribeAccount(vaultB, (buf, s, rxTime, monoTime) => {
             this.enqueueUpdate({
               type: 'VAULT_ACCOUNT',
               key: vaultB,
@@ -3480,6 +3498,10 @@ export class ArbitrageScanner {
               monotonicReceiptTime: monoTime || performance.now()
             });
           });
+          if (subscribed) {
+            this.subscribedAccounts.add(vaultB);
+            this.vaultToPool.set(vaultB, { poolId: pool.id, isA: false });
+          }
         }
 
         // Hydrate vault balances
@@ -3511,9 +3533,7 @@ export class ArbitrageScanner {
         if (openOrders) {
           const ooPubkeyStr = openOrders;
           if (!this.subscribedAccounts.has(ooPubkeyStr) && this.ws.canSubscribeMore()) {
-            this.subscribedAccounts.add(ooPubkeyStr);
-            this.openOrdersToPool.set(ooPubkeyStr, pool.id);
-            this.ws.subscribeAccount(ooPubkeyStr, (buf, s, rxTime, monoTime) => {
+            const subscribed = this.ws.subscribeAccount(ooPubkeyStr, (buf, s, rxTime, monoTime) => {
               this.enqueueUpdate({
                 type: 'OPENORDERS_ACCOUNT',
                 key: ooPubkeyStr,
@@ -3523,6 +3543,10 @@ export class ArbitrageScanner {
                 monotonicReceiptTime: monoTime || performance.now()
               });
             });
+            if (subscribed) {
+              this.subscribedAccounts.add(ooPubkeyStr);
+              this.openOrdersToPool.set(ooPubkeyStr, pool.id);
+            }
           }
 
           try {

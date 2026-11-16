@@ -141,18 +141,59 @@ async function runBenchmark(durationSeconds = 600) {
     // Database route count preservation check
     const finalRouteCount = repository.getRouteCount();
 
+    // Acceptance Gate Audit Metrics
+    const totalMonitoredPools = (scanner as any).poolRegistry.getAllPools().length;
+    const activeWsSubscriptions = wsStats.subscriptionCount || 0;
+    const confirmedSubscriptions = wsStats.confirmedSubscriptionCount || 0;
+    const maxAllowedWsSubs = (config as any).MAX_WS_SUBSCRIPTIONS || 25;
+    const skippedPools = Math.max(0, totalMonitoredPools - activeWsSubscriptions);
+    const totalSkippedOrRejected = (wsStats.rejectedSubscriptionCount || 0) + skippedPools;
+
+    // Stored routes vs genuinely eligible routes vs live verified READY routes
+    const allRoutes = (scanner as any).routeIndex.getAllRoutes();
+    const eligibleRoutesCount = allRoutes.filter((r: any) => r.state !== 'BLOCKED').length;
+    const currentReadyRoutes = hud.routeHealth?.readyRoutes || 0;
+    const peakReadyRoutes = (scanner as any).routeIndex.peakReadyCount || 0;
+
+    // Pools missing required live updates
+    const now = Date.now();
+    const maxAge = config.MAX_QUOTE_AGE_MS || 2500;
+    const currentSlot = wsStats.lastSlot || 0;
+    const stateCache = (scanner as any).stateCache;
+    const poolsMissingUpdates = (scanner as any).poolRegistry.getAllPools().filter((p: any) => {
+      const state = stateCache.getPoolState(p.id);
+      if (!state || !state.receivedAt) return true;
+      const isStale = (now - state.receivedAt) > (maxAge * 2);
+      const isSlotLagging = currentSlot > 0 && state.slot > 0 && (currentSlot - state.slot > (config.MAX_SLOT_GAP || 10));
+      return isStale || isSlotLagging;
+    });
+
+    // READY route uptime across 1-second continuous telemetry samples
+    const samplesWithReady = samples.filter((s: any) => s.readyRoutes > 0).length;
+    const readyRouteUptimePct = samples.length > 0
+      ? Number(((samplesWithReady / samples.length) * 100).toFixed(2))
+      : 0.0;
+
     console.log('\n================================================================');
-    console.log('10-MINUTE STABILITY BENCHMARK RESULTS');
+    console.log('SOLANABOT — FINAL STABILITY ACCEPTANCE GATE BENCHMARK RESULTS');
     console.log('================================================================');
-    console.log(`Elapsed Time:                   ${(totalElapsedMs / 1000).toFixed(1)}s`);
-    console.log(`Feed Uptime:                    ${feedUptimePct}% (${studyTelem.healthyUptimeMs}ms healthy / ${studyTelem.feedDowntimeMs}ms downtime)`);
+    console.log(`Actual Elapsed Runtime:         ${(totalElapsedMs / 1000).toFixed(2)}s (Target: ${durationSeconds}s)`);
+    console.log(`Actual WS Connection Uptime:    ${feedUptimePct}% (${studyTelem.healthyUptimeMs}ms healthy / ${studyTelem.feedDowntimeMs}ms downtime)`);
     console.log(`WebSocket Disconnects:          ${totalDrops} drops`);
     console.log(`Reconnect Attempts / Success:   ${wsStats.sessionTotalReconnectAttempts} / ${wsStats.sessionTotalReconnectSuccesses}`);
+    console.log(`Total Monitored Pool Accounts:  ${totalMonitoredPools}`);
+    console.log(`Active WS Subscriptions:        ${activeWsSubscriptions} / Limit: ${maxAllowedWsSubs} (Within Limit: ${activeWsSubscriptions <= maxAllowedWsSubs})`);
+    console.log(`Confirmed Active Subscriptions: ${confirmedSubscriptions}`);
+    console.log(`Rejected / Skipped WS Subs:     ${totalSkippedOrRejected} (Rejected: ${wsStats.rejectedSubscriptionCount || 0}, Skipped: ${skippedPools})`);
+    console.log(`Pools Missing Live Updates:     ${poolsMissingUpdates.length} / ${totalMonitoredPools}`);
+    console.log(`Stored Route Records (DB):      ${finalRouteCount} (Initial: ${initialRouteCount}, Preserved: ${finalRouteCount >= initialRouteCount})`);
+    console.log(`Routes Eligible for Eval:       ${eligibleRoutesCount} / ${finalRouteCount}`);
+    console.log(`Current READY Routes:           ${currentReadyRoutes} (Peak READY: ${peakReadyRoutes})`);
+    console.log(`READY Route Uptime:             ${readyRouteUptimePct}% (${samplesWithReady} / ${samples.length} samples)`);
+    console.log(`Route Invariant Violations:     ${maxReadyWhileDisconnected} (Target: 0)`);
+    console.log(`Quote-Valid Percentage:         ${hud.performance?.quoteValidPercentage?.toFixed(1) || 0}%`);
     console.log(`Event-Loop Delay:               Median: ${loopMedian.toFixed(2)}ms | p95: ${loopP95.toFixed(2)}ms | Max: ${loopMax.toFixed(2)}ms`);
     console.log(`RPC p95 Latency:                ${hud.performance?.rpcLatencyP95Ms?.toFixed(1) || 0} ms`);
-    console.log(`Route Readiness Invariant:      Violations: ${maxReadyWhileDisconnected} (Target: 0)`);
-    console.log(`Quote-Valid Percentage:         ${hud.performance?.quoteValidPercentage?.toFixed(1) || 0}%`);
-    console.log(`Total Stored Routes (DB):       ${finalRouteCount} (Initial: ${initialRouteCount})`);
     console.log(`Profit Hurdle (Unified):        $${studyTelem.profitHurdleUSDC.toFixed(2)} USDC (HUD: $${hud.thresholdUSDC.toFixed(2)} USDC)`);
     console.log(`Study Qualified Windows:        ${studyTelem.totalQualifiedWindows} (${studyTelem.completedQualifiedWindows} completed, ${studyTelem.openQualifiedWindows} open)`);
     console.log(`Study Revalidation Survival:    ${studyTelem.revalidationSuccessPct !== null ? studyTelem.revalidationSuccessPct.toFixed(1) + '%' : 'N/A'}`);
@@ -163,16 +204,33 @@ async function runBenchmark(durationSeconds = 600) {
     // Save benchmark report JSON to data
     const benchmarkReport = {
       timestamp: new Date().toISOString(),
-      durationSeconds,
-      elapsedMs: totalElapsedMs,
+      configuredTargetSeconds: durationSeconds,
+      actualElapsedSeconds: Number((totalElapsedMs / 1000).toFixed(2)),
+      actualElapsedMs: totalElapsedMs,
       feedUptimePct,
       totalDrops,
       wsStats,
+      audit: {
+        totalMonitoredPools,
+        activeWsSubscriptions,
+        maxAllowedWsSubs,
+        withinProviderLimit: activeWsSubscriptions <= maxAllowedWsSubs,
+        confirmedSubscriptions,
+        rejectedWsSubscriptions: wsStats.rejectedSubscriptionCount || 0,
+        skippedWsSubscriptions: skippedPools,
+        totalSkippedOrRejected,
+        poolsMissingLiveUpdates: poolsMissingUpdates.length,
+        storedRouteRecords: finalRouteCount,
+        storedRoutesPreserved: finalRouteCount >= initialRouteCount,
+        routesEligibleForEvaluation: eligibleRoutesCount,
+        currentReadyRoutes,
+        peakReadyRoutes,
+        readyRouteUptimePct
+      },
       eventLoop: { minMs: loopMin, medianMs: loopMedian, p95Ms: loopP95, maxMs: loopMax },
       rpcLatencyP95Ms: hud.performance?.rpcLatencyP95Ms,
       quoteValidPct: hud.performance?.quoteValidPercentage,
       routeReadinessViolations: maxReadyWhileDisconnected,
-      routesDatabase: { initial: initialRouteCount, final: finalRouteCount, preserved: finalRouteCount >= initialRouteCount },
       hurdleUSDC: studyTelem.profitHurdleUSDC,
       studyTelemetry: studyTelem
     };
