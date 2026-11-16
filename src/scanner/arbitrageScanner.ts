@@ -136,6 +136,17 @@ export class ArbitrageScanner {
   private rollingQualifiedNetProfit: Array<{ timestamp: number; conservativeNetUSDC: number }> = [];
   private rollingRejections: Array<{ timestamp: number; reason: string }> = [];
 
+  // Pool Bundle Subscription Tracking (Distinct from Account Subscriptions)
+  private monitoredPoolBundleCount = 0;
+  private skippedPoolBundleCount = 0;
+  private fullyMonitoredPoolIds = new Set<string>();
+
+  // Quote-Producing Temporal Uptime Tracking (Elapsed Monitoring Time with Genuine Fresh Valid Quotes)
+  private isQuoteProducingActive = false;
+  private currentQuoteProducingWindowStart = 0;
+  private totalQuoteProducingDurationMs = 0;
+  private lastValidQuoteTimestamp = 0;
+
   private auditMetrics: AuditMetrics = {
     totalEvaluated: 0,
     uniqueOpportunities: 0,
@@ -386,6 +397,7 @@ export class ArbitrageScanner {
       const isWsConnected = this.ws.getHealth() !== 'DISCONNECTED';
       this.windowTracker.updateFeedUptime(isWsConnected, true, now);
       this.windowTracker.purgeExpiredWindows(now, this.ws.getCurrentSlot());
+      this.checkQuoteProducingFreshness(now);
 
       // Periodic maintenance: keep SOL price fresh (< 2000ms) for fee conversion
       if (now - this.lastSolPriceTime >= 2000) {
@@ -1737,6 +1749,7 @@ export class ArbitrageScanner {
     // 3. QUOTE-VALID STAGE: Exact quotes successfully produced for all legs on both expected and conservative paths
     this.auditMetrics.quoteValidRouteCount = (this.auditMetrics.quoteValidRouteCount || 0) + 1;
     this.quoteValidEvaluationsCount++;
+    this.recordValidQuoteProduced(Date.now());
 
     // Conservative net profit calculation (T4 -> T5)
     const calcStart = performance.now();
@@ -2552,6 +2565,10 @@ export class ArbitrageScanner {
       }
     }
 
+    this.monitoredPoolBundleCount = 0;
+    this.skippedPoolBundleCount = 0;
+    this.fullyMonitoredPoolIds.clear();
+
     let bundleCount = 0;
     for (const poolId of priorityPoolIds) {
       const pool = this.poolRegistry.getPool(poolId);
@@ -2606,10 +2623,15 @@ export class ArbitrageScanner {
 
       // Check if new accounts in this bundle fit within remaining subscription quota
       const newAccounts = bundle.filter(a => !this.subscribedAccounts.has(a.key));
-      if (newAccounts.length === 0) continue; // Already subscribed
+      if (newAccounts.length === 0) {
+        this.fullyMonitoredPoolIds.add(poolId);
+        bundleCount++;
+        continue; // Already subscribed
+      }
 
       if (this.subscribedAccounts.size + newAccounts.length > maxSubs) {
         // Atomic bundle cannot fit completely without exceeding MAX_WS_SUBSCRIPTIONS
+        this.skippedPoolBundleCount++;
         continue;
       }
 
@@ -2688,9 +2710,11 @@ export class ArbitrageScanner {
           this.subscribedAccounts.add(item.key);
         }
       }
+      this.fullyMonitoredPoolIds.add(poolId);
       bundleCount++;
     }
 
+    this.monitoredPoolBundleCount = bundleCount;
     console.log(`[ArbitrageScanner] Subscribed ${bundleCount} complete pool bundles (${this.subscribedAccounts.size}/${maxSubs} WS accounts)`);
   }
 
@@ -4105,9 +4129,9 @@ export class ArbitrageScanner {
     const readyRouteUptimePercent = Number(uptimeReport.averageUptimePercent.toFixed(1));
 
     const activeThreshold = this.profitThresholdManager ? this.profitThresholdManager.getThresholdUSDC() : 0.10;
-    const totalEval = this.auditMetrics.totalEvaluated;
-    const quoteValidPct = totalEval > 0 ? Number((this.quoteValidEvaluationsCount / totalEval * 100).toFixed(1)) : 0;
-    const quoteProducingScannerUptimePercent = quoteValidPct;
+    const quoteProducingStats = this.getQuoteProducingUptimeStats(now);
+    const quoteValidPct = quoteProducingStats.quoteValidPercentage;
+    const quoteProducingScannerUptimePercent = quoteProducingStats.quoteProducingUptimePercent;
 
     let scannerStatus: 'RUNNING' | 'DEGRADED' | 'OFFLINE' | 'STANDBY' = 'RUNNING';
     if (!this.isRunning) {
@@ -4195,8 +4219,110 @@ export class ArbitrageScanner {
     return this.isRunning;
   }
 
+  private recordValidQuoteProduced(now: number = Date.now()): void {
+    const quoteFreshnessThresholdMs = Math.max(5000, (this.config.MAX_QUOTE_AGE_MS || 2500) * 2);
+    if (!this.isQuoteProducingActive) {
+      this.isQuoteProducingActive = true;
+      this.currentQuoteProducingWindowStart = now;
+    } else if (now - this.lastValidQuoteTimestamp > quoteFreshnessThresholdMs) {
+      const priorEnd = this.lastValidQuoteTimestamp + quoteFreshnessThresholdMs;
+      if (priorEnd > this.currentQuoteProducingWindowStart) {
+        this.totalQuoteProducingDurationMs += (priorEnd - this.currentQuoteProducingWindowStart);
+      }
+      this.currentQuoteProducingWindowStart = now;
+    }
+    this.lastValidQuoteTimestamp = now;
+  }
+
+  private checkQuoteProducingFreshness(now: number = Date.now()): void {
+    const quoteFreshnessThresholdMs = Math.max(5000, (this.config.MAX_QUOTE_AGE_MS || 2500) * 2);
+    if (this.isQuoteProducingActive && (now - this.lastValidQuoteTimestamp > quoteFreshnessThresholdMs)) {
+      const windowEnd = this.lastValidQuoteTimestamp + quoteFreshnessThresholdMs;
+      if (windowEnd > this.currentQuoteProducingWindowStart) {
+        this.totalQuoteProducingDurationMs += (windowEnd - this.currentQuoteProducingWindowStart);
+      }
+      this.isQuoteProducingActive = false;
+    }
+  }
+
+  public getQuoteProducingUptimeStats(now: number = Date.now()): {
+    quoteProducingDurationMs: number;
+    quoteProducingUptimePercent: number;
+    quoteValidEvaluations: number;
+    quoteValidPercentage: number;
+    lastValidQuoteTimestamp: number | null;
+  } {
+    const sessionDurationMs = Math.max(1, now - this.sessionStartTime);
+    const quoteFreshnessThresholdMs = Math.max(5000, (this.config.MAX_QUOTE_AGE_MS || 2500) * 2);
+    
+    let totalMs = this.totalQuoteProducingDurationMs;
+    if (this.isQuoteProducingActive && this.lastValidQuoteTimestamp > 0) {
+      const activeUntil = Math.min(now, this.lastValidQuoteTimestamp + quoteFreshnessThresholdMs);
+      if (activeUntil > this.currentQuoteProducingWindowStart) {
+        totalMs += (activeUntil - this.currentQuoteProducingWindowStart);
+      }
+    }
+
+    const uptimePercent = Math.min(100, Math.max(0, Number(((totalMs / sessionDurationMs) * 100).toFixed(1))));
+    const totalEval = this.auditMetrics.totalEvaluated;
+    const quoteValidPct = totalEval > 0 ? Number((this.quoteValidEvaluationsCount / totalEval * 100).toFixed(1)) : 0;
+
+    return {
+      quoteProducingDurationMs: totalMs,
+      quoteProducingUptimePercent: uptimePercent,
+      quoteValidEvaluations: this.quoteValidEvaluationsCount,
+      quoteValidPercentage: quoteValidPct,
+      lastValidQuoteTimestamp: this.lastValidQuoteTimestamp > 0 ? this.lastValidQuoteTimestamp : null
+    };
+  }
+
+  public getCoverageBreakdown(): {
+    registeredPools: number;
+    onChainVerifiedPools: number;
+    fullyMonitoredPoolBundles: number;
+    confirmedAccountSubscriptions: number;
+    skippedPoolBundles: number;
+    rejectedAccountSubscriptions: number;
+    poolsLackingFreshLiveData: number;
+    routesGenuinelyReady: number;
+  } {
+    const now = Date.now();
+    const maxAge = (this.config.MAX_QUOTE_AGE_MS || 2500) * 2;
+    const currentSlot = this.ws ? this.ws.getCurrentSlot() : 0;
+    const allPools = this.poolRegistry.getAllPools();
+    const verifiedPools = allPools.filter(p => p.verificationStatus === 'VERIFIED_DIRECT');
+    const wsStats = this.ws ? this.ws.getStats() : null;
+
+    const poolsLackingFresh = allPools.filter(p => {
+      const state = this.stateCache.getPoolState(p.id);
+      if (!state || !state.receivedAt) return true;
+      const isStale = (now - state.receivedAt) > maxAge;
+      const isSlotLagging = currentSlot > 0 && state.slot > 0 && (currentSlot - state.slot > (this.config.MAX_SLOT_GAP || 10));
+      return isStale || isSlotLagging;
+    }).length;
+
+    return {
+      registeredPools: allPools.length,
+      onChainVerifiedPools: verifiedPools.length,
+      fullyMonitoredPoolBundles: this.monitoredPoolBundleCount,
+      confirmedAccountSubscriptions: wsStats?.confirmedSubscriptionCount ?? this.subscribedAccounts.size,
+      skippedPoolBundles: this.skippedPoolBundleCount,
+      rejectedAccountSubscriptions: wsStats?.rejectedSubscriptionCount ?? 0,
+      poolsLackingFreshLiveData: poolsLackingFresh,
+      routesGenuinelyReady: this.routeIndex.getReadyRouteCount()
+    };
+  }
+
   public stop(): void {
     this.isRunning = false;
+    if (this.isQuoteProducingActive && this.lastValidQuoteTimestamp > 0) {
+      const quoteFreshnessThresholdMs = Math.max(5000, (this.config.MAX_QUOTE_AGE_MS || 2500) * 2);
+      const windowEnd = Math.min(Date.now(), this.lastValidQuoteTimestamp + quoteFreshnessThresholdMs);
+      if (windowEnd > this.currentQuoteProducingWindowStart) {
+        this.totalQuoteProducingDurationMs += (windowEnd - this.currentQuoteProducingWindowStart);
+      }
+      this.isQuoteProducingActive = false;
+    }
     this.windowTracker.completeStudy('SCANNER_STOP');
     this.automaticScout.stop();
     if (this.scanTimer) {
