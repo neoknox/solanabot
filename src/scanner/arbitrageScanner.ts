@@ -104,6 +104,10 @@ export class ArbitrageScanner {
   private poolLastRpcRefreshTime = new Map<string, number>();
 
   private isRunning = false;
+  private isInitialized = false;
+  private initializationStage: 'UNINITIALIZED' | 'WS_CONNECTING' | 'SOL_PRICE_REFRESH' | 'POOL_HYDRATION' | 'SUBSCRIPTION_PLANNING' | 'WAITING_CONFIRMATIONS' | 'READY' = 'UNINITIALIZED';
+  private initializationElapsedMs: Record<string, number> = {};
+  private initializationRpcFailures: Record<string, number> = {};
   private isManualReconnecting = false;
   private scanTimer: NodeJS.Timeout | null = null;
   private candidateListeners: CandidateListener[] = [];
@@ -348,25 +352,78 @@ export class ArbitrageScanner {
     });
   }
 
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, stageName: string): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`Stage ${stageName} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async waitForSubscriptionConfirmations(timeoutMs: number = 3000): Promise<number> {
+    if (!this.ws) return 0;
+    const tStart = performance.now();
+    while (performance.now() - tStart < timeoutMs) {
+      const stats = this.ws.getStats();
+      const confirmed = stats.confirmedSubscriptionCount || 0;
+      const target = stats.subscriptionCount || 0;
+      if (target > 0 && confirmed >= target) {
+        return confirmed;
+      }
+      await new Promise(r => setTimeout(r, 50));
+    }
+    const stats = this.ws.getStats();
+    return stats.confirmedSubscriptionCount || 0;
+  }
+
   public async start(): Promise<void> {
     if (this.isRunning) return;
     this.isRunning = true;
+    this.isInitialized = false;
+    this.initializationStage = 'WS_CONNECTING';
+    const initStart = performance.now();
+    const rpcFailuresBefore = this.rpc.getStats().requestsFailed;
 
-    // 1. Establish real-time WebSocket connection
-    await this.ws.connect();
+    // 1. Establish real-time WebSocket connection (bounded timeout: 10,000ms)
+    const t0 = performance.now();
+    await this.withTimeout(this.ws.connect(), 10000, 'WS_CONNECTING');
+    this.initializationElapsedMs['WS_CONNECTING'] = Math.round(performance.now() - t0);
 
-    // 2. Fetch fresh live SOL price for non-fictitious fee conversion
-    await this.refreshSolPrice();
+    // 2. Fetch fresh live SOL price for non-fictitious fee conversion (bounded timeout: 4,000ms)
+    this.initializationStage = 'SOL_PRICE_REFRESH';
+    const t1 = performance.now();
+    try {
+      await this.withTimeout(this.refreshSolPrice(), 4000, 'SOL_PRICE_REFRESH');
+    } catch (err) {
+      console.warn('[ArbitrageScanner] SOL price refresh during startup timed out or failed, using fallback:', err);
+    }
+    this.initializationElapsedMs['SOL_PRICE_REFRESH'] = Math.round(performance.now() - t1);
 
-    // 3. Initial snapshot hydration via RPC batch getMultipleAccountsAndContext
-    await this.refreshAllPoolStates();
+    // 3. Initial snapshot hydration via RPC batch getMultipleAccountsAndContext (bounded timeout: 15,000ms)
+    this.initializationStage = 'POOL_HYDRATION';
+    const t2 = performance.now();
+    await this.withTimeout(this.refreshAllPoolStates(), 15000, 'POOL_HYDRATION');
+    this.initializationElapsedMs['POOL_HYDRATION'] = Math.round(performance.now() - t2);
 
     // 4. Pair-aware atomic WebSocket subscription bundling
-    // Subscribes complete bundles (pool + vaults + open orders + current tick array + config)
-    // for priority high-volume trading pairs within MAX_WS_SUBSCRIPTIONS limit.
+    this.initializationStage = 'SUBSCRIPTION_PLANNING';
+    const t3 = performance.now();
     this.planAndSubscribeCompletePoolBundles();
+    this.initializationElapsedMs['SUBSCRIPTION_PLANNING'] = Math.round(performance.now() - t3);
 
-    // 4. High-frequency background drain loop
+    // 5. Subscription confirmations (bounded wait: 3,000ms)
+    this.initializationStage = 'WAITING_CONFIRMATIONS';
+    const t4 = performance.now();
+    await this.waitForSubscriptionConfirmations(3000);
+    this.initializationElapsedMs['WAITING_CONFIRMATIONS'] = Math.round(performance.now() - t4);
+
+    // 6. High-frequency background drain loop
     this.lastEventLoopTime = performance.now();
     this.lastQuoteCountResetTime = Date.now();
     const scanInterval = this.config.SCAN_INTERVAL_MS || 500;
@@ -432,8 +489,14 @@ export class ArbitrageScanner {
       }
     }, scanInterval);
 
-    // 5. Start Automatic Scout scheduler
+    // 7. Start Automatic Scout scheduler
     this.automaticScout.start();
+
+    // Mark scanner fully initialized and scan-ready
+    this.isInitialized = true;
+    this.initializationStage = 'READY';
+    this.initializationElapsedMs['TOTAL_INITIALIZATION'] = Math.round(performance.now() - initStart);
+    this.initializationRpcFailures['TOTAL'] = this.rpc.getStats().requestsFailed - rpcFailuresBefore;
   }
 
   private enqueueUpdate(update: QueuedAccountUpdate): void {
@@ -4139,6 +4202,8 @@ export class ArbitrageScanner {
     let scannerStatus: 'RUNNING' | 'DEGRADED' | 'OFFLINE' | 'STANDBY' = 'RUNNING';
     if (!this.isRunning) {
       scannerStatus = 'OFFLINE';
+    } else if (!this.isInitialized) {
+      scannerStatus = 'STANDBY';
     } else if (!health.connectedWs || !health.connectedRpc) {
       scannerStatus = 'DEGRADED';
     }
@@ -4153,7 +4218,12 @@ export class ArbitrageScanner {
       success: true,
       mode: 'READ-ONLY / SHADOW MODE',
       scannerStatus,
-      scannerOnline: this.isRunning,
+      scannerOnline: this.isRunning && this.isInitialized,
+      initializationStage: this.isInitialized ? 'READY' : this.initializationStage,
+      initializationTimings: {
+        elapsedMs: { ...this.initializationElapsedMs },
+        rpcFailures: { ...this.initializationRpcFailures }
+      },
       solanaSlot: health.currentSlot,
       wsConnected: wsStatus === 'CONNECTED' || wsStatus === 'HEALTHY',
       wsStatus,
@@ -4220,6 +4290,21 @@ export class ArbitrageScanner {
 
   public isScannerRunning(): boolean {
     return this.isRunning;
+  }
+
+  public isScannerInitialized(): boolean {
+    return this.isInitialized;
+  }
+
+  public getInitializationStage(): string {
+    return this.initializationStage;
+  }
+
+  public getInitializationTimings(): { elapsedMs: Record<string, number>; rpcFailures: Record<string, number> } {
+    return {
+      elapsedMs: { ...this.initializationElapsedMs },
+      rpcFailures: { ...this.initializationRpcFailures }
+    };
   }
 
   private recordValidQuoteProduced(now: number = Date.now()): void {
@@ -4318,6 +4403,8 @@ export class ArbitrageScanner {
 
   public stop(): void {
     this.isRunning = false;
+    this.isInitialized = false;
+    this.initializationStage = 'UNINITIALIZED';
     if (this.isQuoteProducingActive && this.lastValidQuoteTimestamp > 0) {
       const quoteFreshnessThresholdMs = Math.max(5000, (this.config.MAX_QUOTE_AGE_MS || 2500) * 2);
       const windowEnd = Math.min(Date.now(), this.lastValidQuoteTimestamp + quoteFreshnessThresholdMs);

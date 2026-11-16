@@ -497,8 +497,11 @@ export class ProfitHudServer {
       let scannerState: 'RUNNING' | 'DEGRADED' | 'OFFLINE' | 'STANDBY' = 'STANDBY';
       if (isScannerPresent) {
         const isRunning = typeof this.scanner?.isScannerRunning === 'function' ? this.scanner.isScannerRunning() : true;
+        const isInitialized = typeof (this.scanner as any)?.isScannerInitialized === 'function' ? (this.scanner as any).isScannerInitialized() : true;
         if (!isRunning) {
           scannerState = 'OFFLINE';
+        } else if (!isInitialized) {
+          scannerState = 'STANDBY';
         } else if (!health?.connectedWs || !health?.connectedRpc) {
           scannerState = 'DEGRADED';
         } else {
@@ -510,6 +513,8 @@ export class ProfitHudServer {
         ...hudData,
         scannerStatus,
         scannerState,
+        scannerOnline: isScannerPresent ? (typeof (this.scanner as any)?.isScannerInitialized === 'function' ? (this.scanner as any).isScannerInitialized() : true) : false,
+        initializationStage: (this.scanner && typeof (this.scanner as any)?.getInitializationStage === 'function') ? (this.scanner as any).getInitializationStage() : undefined,
         wsStatus,
         wsConnected: wsStatus === 'CONNECTED' || wsStatus === 'HEALTHY',
         // Legacy compat fields

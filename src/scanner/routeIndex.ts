@@ -194,9 +194,10 @@ export class RouteIndex {
 
   private setRouteStateInternal(route: IndexedDirectedRoute, newState: RouteState): void {
     const oldState = route.state;
-    if (oldState === newState) return;
-    this.routesByState.get(oldState)?.delete(route.routeId);
-    route.state = newState;
+    if (oldState !== newState) {
+      this.routesByState.get(oldState)?.delete(route.routeId);
+      route.state = newState;
+    }
     let set = this.routesByState.get(newState);
     if (!set) {
       set = new Set<string>();
