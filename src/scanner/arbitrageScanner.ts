@@ -548,7 +548,7 @@ export class ArbitrageScanner {
           item.t3
         );
         evalIdx++;
-        if (evalIdx % 5 === 0) {
+        if (evalIdx % 2 === 0) {
           await new Promise<void>(resolve => setImmediate(resolve));
         }
       }
@@ -2070,7 +2070,7 @@ export class ArbitrageScanner {
     try {
       const rpcStart = performance.now();
       const rpcRes = await this.rpc.getMultipleAccountsAndContext(pubkeys);
-      this.latencyTracker.recordRpcLatency(performance.now() - rpcStart);
+      this.latencyTracker.recordRpcLatency(this.rpc.getStats().lastLatencyMs || (performance.now() - rpcStart));
 
       const snapshotSlot = rpcRes.slot;
       const accounts = rpcRes.value;
@@ -2204,7 +2204,7 @@ export class ArbitrageScanner {
         try {
           const vRpcStart = performance.now();
           const vRpcRes = await this.rpc.getMultipleAccountsAndContext(vaultsToFetch.map(v => v.pubkey));
-          this.latencyTracker.recordRpcLatency(performance.now() - vRpcStart);
+          this.latencyTracker.recordRpcLatency(this.rpc.getStats().lastLatencyMs || (performance.now() - vRpcStart));
           const vaultSlot = vRpcRes.slot;
           const vaultAccounts = vRpcRes.value;
 
@@ -2249,7 +2249,7 @@ export class ArbitrageScanner {
         try {
           const ooStart = performance.now();
           const ooRes = await this.rpc.getMultipleAccountsAndContext(openOrdersToFetch.map(o => o.pubkey));
-          this.latencyTracker.recordRpcLatency(performance.now() - ooStart);
+          this.latencyTracker.recordRpcLatency(this.rpc.getStats().lastLatencyMs || (performance.now() - ooStart));
           const ooSlot = ooRes.slot;
           const ooAccounts = ooRes.value;
 
@@ -2345,7 +2345,7 @@ export class ArbitrageScanner {
         try {
           const cfgStart = performance.now();
           const cfgRes = await this.rpc.getMultipleAccountsAndContext(ammConfigsToFetch.map(c => c.pubkey));
-          this.latencyTracker.recordRpcLatency(performance.now() - cfgStart);
+          this.latencyTracker.recordRpcLatency(this.rpc.getStats().lastLatencyMs || (performance.now() - cfgStart));
           const cfgSlot = cfgRes.slot;
           const cfgAccounts = cfgRes.value;
 
@@ -2422,7 +2422,7 @@ export class ArbitrageScanner {
         try {
           const tRpcStart = performance.now();
           const tRpcRes = await this.rpc.getMultipleAccountsAndContext(tickArraysToFetch.map(t => t.pda));
-          this.latencyTracker.recordRpcLatency(performance.now() - tRpcStart);
+          this.latencyTracker.recordRpcLatency(this.rpc.getStats().lastLatencyMs || (performance.now() - tRpcStart));
           const tSlot = tRpcRes.slot;
           const tAccounts = tRpcRes.value;
 
@@ -2801,7 +2801,7 @@ export class ArbitrageScanner {
 
       const rpcStart = performance.now();
       const rpcRes = await this.rpc.getMultipleAccountsAndContext(pubkeysToFetch);
-      this.latencyTracker.recordRpcLatency(performance.now() - rpcStart);
+      this.latencyTracker.recordRpcLatency(this.rpc.getStats().lastLatencyMs || (performance.now() - rpcStart));
 
       const refreshedSlot = rpcRes.slot;
       const accounts = rpcRes.value;
@@ -2810,6 +2810,9 @@ export class ArbitrageScanner {
 
       let accIndex = 0;
       for (const p of batch) {
+        if (accIndex > 0 && accIndex % 5 === 0) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+        }
         const poolAcc = accounts[accIndex++];
         if (!poolAcc || !poolAcc.data) {
           if (p.dex === 'ORCA_WHIRLPOOL' || p.dex === 'RAYDIUM_CLMM') {
@@ -3039,7 +3042,7 @@ export class ArbitrageScanner {
       for (const route of affectedRoutesMap.values()) {
         this.evaluateIndexedRoute(route, evalNow, evalNow, evalNow, evalNow, evalNow, evalNow);
         refreshEvalIdx++;
-        if (refreshEvalIdx % 5 === 0) {
+        if (refreshEvalIdx % 2 === 0) {
           await new Promise<void>(resolve => setImmediate(resolve));
         }
       }

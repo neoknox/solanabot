@@ -187,7 +187,22 @@ async function runBenchmark(durationSeconds = 600) {
     console.log(`  Routes Genuinely READY:         ${coverage.routesGenuinelyReady} (Peak READY: ${peakReadyRoutes})`);
     const rpcStats = scanner.getRpc().getStats();
     const validQuotesPerSec = Number(((hud.performance?.quoteValidEvaluations || 0) / (totalElapsedMs / 1000)).toFixed(2));
-    const estimatedHeliusCredits = rpcStats.requestsTotal + (wsStats.confirmedSubscriptionCount || 0);
+
+    // Authoritative Helius Credit Measurement:
+    // 1. Standard RPC requests: 1 credit per request (getSlot, getMultipleAccounts, getAccountInfo, etc.)
+    // 2. WebSocket connections: 1 credit per connection
+    // 3. WebSocket data streaming: 2 credits per 0.1 MB (20 credits per 1 MB) uncompressed data
+    const wsBytes = wsStats.totalBytesReceived || ((wsStats.messagesTotal || 0) * 1100);
+    const wsMb = wsBytes / (1024 * 1024);
+    const wsStreamingCredits = Math.ceil((wsBytes / (100 * 1024)) * 2);
+    const wsConnectionCredits = (wsStats.sessionTotalReconnectSuccesses || 0) + 1;
+    const rpcCredits = rpcStats.requestsTotal;
+    const measuredHeliusCredits = rpcCredits + wsConnectionCredits + wsStreamingCredits;
+    const elapsedHours = totalElapsedMs / (1000 * 3600);
+    const measuredCreditsPerHour = elapsedHours > 0 ? Number((measuredHeliusCredits / elapsedHours).toFixed(1)) : 0;
+    const projectedMonthlyCredits = Number((measuredCreditsPerHour * 24 * 30).toFixed(0));
+    const monthlyFreeLimit = 1000000;
+    const exceedsFreeLimit = projectedMonthlyCredits > monthlyFreeLimit;
 
     console.log('----------------------------------------------------------------');
     console.log('ROUTE & EVALUATION TELEMETRY:');
@@ -202,7 +217,17 @@ async function runBenchmark(durationSeconds = 600) {
     console.log(`  Event-Loop Delay:               Median: ${loopMedian.toFixed(2)}ms | p95: ${loopP95.toFixed(2)}ms | Max: ${loopMax.toFixed(2)}ms`);
     console.log(`  RPC p95 Latency & Failures:     ${hud.performance?.rpcLatencyP95Ms?.toFixed(1) || 0} ms (${rpcStats.requestsTotal} requests, ${rpcStats.requestsFailed} failed)`);
     console.log(`  CPU & Memory Profile:           Peak RSS: ${peakRssMb} MB | Peak Heap: ${peakHeapMb} MB`);
-    console.log(`  Helius Credits Consumed (Est.): ${estimatedHeliusCredits} credits`);
+    console.log('----------------------------------------------------------------');
+    console.log('HELIUS BILLING & CREDIT TELEMETRY:');
+    console.log(`  RPC Requests Cost:              ${rpcCredits} credits (${rpcStats.requestsTotal} requests @ 1 credit)`);
+    console.log(`  WebSocket Connection Cost:      ${wsConnectionCredits} credits (${(wsStats.sessionTotalReconnectSuccesses || 0) + 1} connects @ 1 credit)`);
+    console.log(`  WebSocket Data Traffic:         ${wsMb.toFixed(2)} MB (${wsStats.messagesTotal} messages, ${wsBytes} bytes)`);
+    console.log(`  WebSocket Streaming Cost:       ${wsStreamingCredits} credits (2 credits per 0.1 MB)`);
+    console.log(`  Measured Total Credits:         ${measuredHeliusCredits} credits (over ${(totalElapsedMs / 1000).toFixed(1)}s)`);
+    console.log(`  Measured Rate per Hour:         ${measuredCreditsPerHour} credits/hour`);
+    console.log(`  Projected Monthly Consumption:  ${projectedMonthlyCredits.toLocaleString()} credits / month (30 days)`);
+    console.log(`  Free Tier Quota Check:          ${exceedsFreeLimit ? `FLAGGED: EXCEEDS 1,000,000 Free limit by ${(projectedMonthlyCredits - monthlyFreeLimit).toLocaleString()} credits (+${(((projectedMonthlyCredits - monthlyFreeLimit) / monthlyFreeLimit) * 100).toFixed(1)}%)` : 'COMPLIANT: Within 1,000,000 monthly Free limit'}`);
+    console.log('----------------------------------------------------------------');
     console.log(`  Profit Hurdle (Unified):        $${studyTelem.profitHurdleUSDC.toFixed(2)} USDC (HUD: $${hud.thresholdUSDC.toFixed(2)} USDC)`);
     console.log(`  Study Qualified Windows:        ${studyTelem.totalQualifiedWindows} (${studyTelem.completedQualifiedWindows} completed, ${studyTelem.openQualifiedWindows} open)`);
     console.log(`  Study Revalidation Survival:    ${studyTelem.revalidationSuccessPct !== null ? studyTelem.revalidationSuccessPct.toFixed(1) + '%' : 'N/A'}`);
@@ -221,7 +246,18 @@ async function runBenchmark(durationSeconds = 600) {
       wsStats,
       rpcStats,
       resources: { peakRssMb, peakHeapMb },
-      estimatedHeliusCredits,
+      heliusBilling: {
+        rpcCredits,
+        wsConnectionCredits,
+        wsTrafficBytes: wsBytes,
+        wsTrafficMb: Number(wsMb.toFixed(3)),
+        wsStreamingCredits,
+        measuredTotalCredits: measuredHeliusCredits,
+        measuredCreditsPerHour,
+        projectedMonthlyCredits,
+        monthlyFreeLimit,
+        exceedsFreeLimit
+      },
       audit: {
         coverage,
         activeWsSubscriptions,

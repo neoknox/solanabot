@@ -47,6 +47,8 @@ export interface WsStats {
   totalDowntimeMs?: number;
   downtimeEventsCount?: number;
   messagesTotal?: number;
+  totalBytesReceived?: number;
+  totalMegabytesReceived?: number;
   connectionState?: WsConnectionState;
   connectionStage?: WsConnectionStage;
   isReconnecting?: boolean;
@@ -93,6 +95,7 @@ export class SolanaWsProvider {
   private reqIdForSlot: number | null = null;
   private slotSubId: number | null = null;
   private messagesTotal = 0;
+  private totalBytesReceived = 0;
 
   // Connection reliability & subscription health telemetry
   private hasConnectedOnce = false;
@@ -208,6 +211,12 @@ export class SolanaWsProvider {
         this.ws.on('message', (data: WebSocket.RawData) => {
           if (this.socketGeneration !== currentGen) return;
           this.lastMessageTime = Date.now();
+          const byteLen = Buffer.isBuffer(data)
+            ? data.length
+            : Array.isArray(data)
+            ? data.reduce((acc, b) => acc + b.length, 0)
+            : Buffer.byteLength(data.toString());
+          this.totalBytesReceived += byteLen;
           this.handleMessage(data.toString());
         });
 
@@ -729,6 +738,8 @@ export class SolanaWsProvider {
       totalDowntimeMs: this.totalDowntimeMs + (this.disconnectStartTime > 0 ? Date.now() - this.disconnectStartTime : 0),
       downtimeEventsCount: this.downtimeEventsCount,
       messagesTotal: this.messagesTotal,
+      totalBytesReceived: this.totalBytesReceived,
+      totalMegabytesReceived: Number((this.totalBytesReceived / (1024 * 1024)).toFixed(3)),
       lastError: this.lastError
     };
   }
