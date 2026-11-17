@@ -2606,43 +2606,140 @@ export class ArbitrageScanner {
   }
 
   /**
-   * Pair-Aware Complete WebSocket Subscription Bundling
-   * Strictly enforces MAX_WS_SUBSCRIPTIONS (default 25) without leaving half-subscribed pools.
-   * For each pool, bundles pool account + vaults + open orders + active tick array + config.
-   * If a pool bundle cannot fit completely within remaining quota, it is skipped rather than partially subscribed.
+   * Builds the atomic account bundle required for 100% live streaming and executable quoting of a pool.
+   * Fails closed (returns null) if any required dependency is uninitialized or missing.
+   * Strictly excludes unquotable pools (e.g. Meteora DLMM missing bin arrays, Phoenix missing orderbooks).
+   */
+  public buildCompletePoolAccountBundle(poolId: string): Array<{
+    key: string;
+    type: 'POOL_ACCOUNT' | 'VAULT_ACCOUNT' | 'OPENORDERS_ACCOUNT' | 'TICK_ARRAY_ACCOUNT' | 'AMM_CONFIG_ACCOUNT';
+    metadata?: any;
+  }> | null {
+    const pool = this.poolRegistry.getPool(poolId);
+    const state = this.stateCache.getPoolState(poolId);
+    if (!pool || !state) return null;
+
+    const bundle: Array<{
+      key: string;
+      type: 'POOL_ACCOUNT' | 'VAULT_ACCOUNT' | 'OPENORDERS_ACCOUNT' | 'TICK_ARRAY_ACCOUNT' | 'AMM_CONFIG_ACCOUNT';
+      metadata?: any;
+    }> = [];
+
+    bundle.push({ key: poolId, type: 'POOL_ACCOUNT' });
+    const extra = (state.extraData as any) || {};
+
+    if (pool.dex === 'ORCA_WHIRLPOOL') {
+      const tickCurrent = extra.tickCurrent;
+      const tickSpacing = extra.tickSpacing || 1;
+      if (tickCurrent === undefined) {
+        return null; // Missing tick data: cannot quote
+      }
+      const surrounding = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
+      const currentStart = surrounding[2];
+      const pda = deriveTickArrayPda(poolId, currentStart);
+      bundle.push({
+        key: pda.toBase58(),
+        type: 'TICK_ARRAY_ACCOUNT',
+        metadata: { startTickIndex: currentStart, isClmm: false }
+      });
+    } else if (pool.dex === 'RAYDIUM_CLMM') {
+      const tickCurrent = extra.tickCurrent;
+      const tickSpacing = extra.tickSpacing || 1;
+      if (tickCurrent === undefined || !extra.ammConfig) {
+        return null; // Missing tick data or AmmConfig: cannot quote
+      }
+      const surrounding = getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing);
+      const currentStart = surrounding[2];
+      const pda = deriveRaydiumClmmTickArrayPda(poolId, currentStart);
+      bundle.push({
+        key: pda.toBase58(),
+        type: 'TICK_ARRAY_ACCOUNT',
+        metadata: { startTickIndex: currentStart, isClmm: true }
+      });
+      bundle.push({ key: extra.ammConfig, type: 'AMM_CONFIG_ACCOUNT' });
+    } else if (pool.dex === 'RAYDIUM_AMM') {
+      if (!extra.baseVault || !extra.quoteVault || !extra.openOrders) {
+        return null; // Missing vaults or OpenOrders: cannot quote
+      }
+      bundle.push({ key: extra.baseVault, type: 'VAULT_ACCOUNT', metadata: { isA: true } });
+      bundle.push({ key: extra.quoteVault, type: 'VAULT_ACCOUNT', metadata: { isA: false } });
+      bundle.push({ key: extra.openOrders, type: 'OPENORDERS_ACCOUNT' });
+    } else {
+      // Unquotable pools without live streaming dependencies (Meteora DLMM, Phoenix)
+      return null;
+    }
+
+    return bundle;
+  }
+
+  /**
+   * Route-Level Pair-Aware Complete WebSocket Subscription Bundling
+   * Replaces static priority lists with dynamic route-level economic ranking.
+   * Evaluates complete two-leg cycles (USDC -> TOKEN -> USDC) using:
+   * - Verified pool dependencies
+   * - Combined swap fees
+   * - Executable liquidity depth
+   * - Volatility/divergence potential
+   * - Strict enforcement of MAX_WS_SUBSCRIPTIONS (default 25)
    */
   public planAndSubscribeCompletePoolBundles(): void {
     if (!this.ws) return;
 
     const maxSubs = (this.config as any).MAX_WS_SUBSCRIPTIONS ?? 25;
 
-    // Profit-First Low-Fee Route Bundles (Prioritizing 2-8 bps combined fee 2-leg cycles)
-    // 1. Orca Whirlpool 0.02% SOL/USDC (FpCM... 2 bps)
-    // 2. Orca Whirlpool 0.04% SOL/USDC (Czfq... 4 bps) -> Combined Orca-Orca cycle: 6 bps
-    // 3. Raydium CLMM 0.04% SOL/USDC (3ucN... 4 bps) -> Combined Orca-CLMM cycle: 6 bps / 8 bps
-    // 4. Orca Whirlpool 0.01% USDC/USDT (4fuU... 1 bp)
-    // 5. Raydium CLMM 0.01% USDC/USDT (BZtg... 1 bp) -> Combined Stable cycle: 2 bps
-    // 6. Raydium AMM Main SOL/USDC (58oQ... 25 bps fallback)
-    // 7. Raydium AMM WSOL/USDT (7Xaw... 25 bps fallback)
-    // 8. Raydium AMM Secondary SOL/USDC (7TbG... 25 bps fallback)
-    const priorityPoolIds = [
-      'FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q', // Orca Whirlpool 0.02% SOL/USDC
-      'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE', // Orca Whirlpool 0.04% SOL/USDC
-      '3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv', // Raydium CLMM SOL/USDC
-      '4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4', // Orca Whirlpool USDC/USDT
-      'BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU', // Raydium CLMM USDC/USDT
-      '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2', // Raydium AMM Main SOL/USDC
-      '7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX', // Raydium AMM WSOL/USDT
-      '7TbGqz32RsuwXbXY7EyBCiAnMbJq1gm1wKmfjQjuwoyF'  // Raydium AMM Secondary SOL/USDC
-    ];
+    // 1. Identify and score all 2-leg routes with complete, quotable pool dependencies
+    const allRoutes = this.routeIndex.getAllRoutes();
+    const scoredRoutes: Array<{
+      route: IndexedDirectedRoute;
+      poolAId: string;
+      poolBId: string;
+      score: number;
+    }> = [];
 
-    // Append any remaining verified pools by initial liquidity
-    const allPools = this.poolRegistry.getAllPools();
-    const sortedPools = [...allPools].sort((a, b) => (b.initialLiquidityUsd || 0) - (a.initialLiquidityUsd || 0));
-    for (const p of sortedPools) {
-      if (!priorityPoolIds.includes(p.id)) {
-        priorityPoolIds.push(p.id);
+    for (const r of allRoutes) {
+      if (r.inputMint !== r.outputMint) continue;
+      const poolA = this.poolRegistry.getPool(r.poolAId);
+      const poolB = this.poolRegistry.getPool(r.poolBId);
+      if (!poolA || !poolB || poolA.id === poolB.id) continue;
+
+      const bundleA = this.buildCompletePoolAccountBundle(poolA.id);
+      const bundleB = this.buildCompletePoolAccountBundle(poolB.id);
+      if (!bundleA || !bundleB) continue; // Excludes unquotable pools (Meteora, etc.)
+
+      const minLiq = Math.min(poolA.initialLiquidityUsd || 0, poolB.initialLiquidityUsd || 0);
+      if (minLiq < 50_000) continue; // Exclude illiquid pools
+
+      const combinedFeeBps = (poolA.feeBps || 0) + (poolB.feeBps || 0);
+      const isVolatile = r.intermediateMint === CANONICAL_WSOL_MINT;
+      const volMultiplier = isVolatile ? 1.5 : 1.0;
+      const score = (volMultiplier * Math.log10(minLiq)) / Math.max(1, combinedFeeBps);
+      scoredRoutes.push({ route: r, poolAId: r.poolAId, poolBId: r.poolBId, score });
+    }
+
+    scoredRoutes.sort((a, b) => b.score - a.score);
+
+    // 2. Order unique candidate pools by top-scoring route coverage
+    const prioritizedPools: string[] = [];
+    const seenPools = new Set<string>();
+
+    for (const sr of scoredRoutes) {
+      if (!seenPools.has(sr.poolAId)) {
+        seenPools.add(sr.poolAId);
+        prioritizedPools.push(sr.poolAId);
       }
+      if (!seenPools.has(sr.poolBId)) {
+        seenPools.add(sr.poolBId);
+        prioritizedPools.push(sr.poolBId);
+      }
+    }
+
+    // Append any remaining quotable verified pools sorted by liquidity as fallback
+    const allPools = this.poolRegistry.getAllPools();
+    const fallbackPools = [...allPools]
+      .filter(p => !seenPools.has(p.id) && this.buildCompletePoolAccountBundle(p.id) !== null)
+      .sort((a, b) => (b.initialLiquidityUsd || 0) - (a.initialLiquidityUsd || 0));
+    for (const p of fallbackPools) {
+      prioritizedPools.push(p.id);
     }
 
     this.monitoredPoolBundleCount = 0;
@@ -2650,55 +2747,11 @@ export class ArbitrageScanner {
     this.fullyMonitoredPoolIds.clear();
 
     let bundleCount = 0;
-    for (const poolId of priorityPoolIds) {
-      const pool = this.poolRegistry.getPool(poolId);
-      const state = this.stateCache.getPoolState(poolId);
-      if (!pool || !state) continue;
-
-      // Build the atomic account bundle required for 100% live streaming of this pool
-      const bundle: Array<{
-        key: string;
-        type: 'POOL_ACCOUNT' | 'VAULT_ACCOUNT' | 'OPENORDERS_ACCOUNT' | 'TICK_ARRAY_ACCOUNT' | 'AMM_CONFIG_ACCOUNT';
-        metadata?: any;
-      }> = [];
-
-      bundle.push({ key: poolId, type: 'POOL_ACCOUNT' });
-
-      const extra = (state.extraData as any) || {};
-
-      if (pool.dex === 'RAYDIUM_AMM') {
-        if (extra.baseVault) bundle.push({ key: extra.baseVault, type: 'VAULT_ACCOUNT', metadata: { isA: true } });
-        if (extra.quoteVault) bundle.push({ key: extra.quoteVault, type: 'VAULT_ACCOUNT', metadata: { isA: false } });
-        if (extra.openOrders) bundle.push({ key: extra.openOrders, type: 'OPENORDERS_ACCOUNT' });
-      } else if (pool.dex === 'ORCA_WHIRLPOOL') {
-        const tickCurrent = extra.tickCurrent;
-        const tickSpacing = extra.tickSpacing || 1;
-        if (tickCurrent !== undefined) {
-          const surrounding = getSurroundingTickArrayStartIndices(tickCurrent, tickSpacing);
-          const currentStart = surrounding[2];
-          const pda = deriveTickArrayPda(poolId, currentStart);
-          bundle.push({
-            key: pda.toBase58(),
-            type: 'TICK_ARRAY_ACCOUNT',
-            metadata: { startTickIndex: currentStart, isClmm: false }
-          });
-        }
-      } else if (pool.dex === 'RAYDIUM_CLMM') {
-        const tickCurrent = extra.tickCurrent;
-        const tickSpacing = extra.tickSpacing || 1;
-        if (tickCurrent !== undefined) {
-          const surrounding = getSurroundingRaydiumClmmTickArrayStartIndices(tickCurrent, tickSpacing);
-          const currentStart = surrounding[2];
-          const pda = deriveRaydiumClmmTickArrayPda(poolId, currentStart);
-          bundle.push({
-            key: pda.toBase58(),
-            type: 'TICK_ARRAY_ACCOUNT',
-            metadata: { startTickIndex: currentStart, isClmm: true }
-          });
-        }
-        if (extra.ammConfig) {
-          bundle.push({ key: extra.ammConfig, type: 'AMM_CONFIG_ACCOUNT' });
-        }
+    for (const poolId of prioritizedPools) {
+      const bundle = this.buildCompletePoolAccountBundle(poolId);
+      if (!bundle) {
+        this.skippedPoolBundleCount++;
+        continue;
       }
 
       // Check if new accounts in this bundle fit within remaining subscription quota
