@@ -2140,7 +2140,7 @@ export class ArbitrageScanner {
     try {
       const rpcStart = performance.now();
       const rpcRes = await this.rpc.getMultipleAccountsAndContext(pubkeys);
-      this.latencyTracker.recordRpcLatency(this.rpc.getStats().lastLatencyMs || (performance.now() - rpcStart));
+      this.latencyTracker.recordRpcLatency(this.rpc.getStats?.().lastLatencyMs || (performance.now() - rpcStart));
 
       const snapshotSlot = rpcRes.slot;
       const accounts = rpcRes.value;
@@ -2274,7 +2274,7 @@ export class ArbitrageScanner {
         try {
           const vRpcStart = performance.now();
           const vRpcRes = await this.rpc.getMultipleAccountsAndContext(vaultsToFetch.map(v => v.pubkey));
-          this.latencyTracker.recordRpcLatency(this.rpc.getStats().lastLatencyMs || (performance.now() - vRpcStart));
+          this.latencyTracker.recordRpcLatency(this.rpc.getStats?.().lastLatencyMs || (performance.now() - vRpcStart));
           const vaultSlot = vRpcRes.slot;
           const vaultAccounts = vRpcRes.value;
 
@@ -2492,7 +2492,7 @@ export class ArbitrageScanner {
         try {
           const tRpcStart = performance.now();
           const tRpcRes = await this.rpc.getMultipleAccountsAndContext(tickArraysToFetch.map(t => t.pda));
-          this.latencyTracker.recordRpcLatency(this.rpc.getStats().lastLatencyMs || (performance.now() - tRpcStart));
+          this.latencyTracker.recordRpcLatency(this.rpc.getStats?.().lastLatencyMs || (performance.now() - tRpcStart));
           const tSlot = tRpcRes.slot;
           const tAccounts = tRpcRes.value;
 
@@ -2616,13 +2616,22 @@ export class ArbitrageScanner {
 
     const maxSubs = (this.config as any).MAX_WS_SUBSCRIPTIONS ?? 25;
 
-    // High-volume priority pairs covering major 2-leg cycles (SOL/USDC, WSOL/USDT, USDC/USDT)
+    // Profit-First Low-Fee Route Bundles (Prioritizing 2-8 bps combined fee 2-leg cycles)
+    // 1. Orca Whirlpool 0.02% SOL/USDC (FpCM... 2 bps)
+    // 2. Orca Whirlpool 0.04% SOL/USDC (Czfq... 4 bps) -> Combined Orca-Orca cycle: 6 bps
+    // 3. Raydium CLMM 0.04% SOL/USDC (3ucN... 4 bps) -> Combined Orca-CLMM cycle: 6 bps / 8 bps
+    // 4. Orca Whirlpool 0.01% USDC/USDT (4fuU... 1 bp)
+    // 5. Raydium CLMM 0.01% USDC/USDT (BZtg... 1 bp) -> Combined Stable cycle: 2 bps
+    // 6. Raydium AMM Main SOL/USDC (58oQ... 25 bps fallback)
+    // 7. Raydium AMM WSOL/USDT (7Xaw... 25 bps fallback)
+    // 8. Raydium AMM Secondary SOL/USDC (7TbG... 25 bps fallback)
     const priorityPoolIds = [
-      'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE', // Orca Whirlpool 0.04% SOL/USDC
-      '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2', // Raydium AMM Main SOL/USDC
       'FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q', // Orca Whirlpool 0.02% SOL/USDC
+      'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE', // Orca Whirlpool 0.04% SOL/USDC
       '3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv', // Raydium CLMM SOL/USDC
       '4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4', // Orca Whirlpool USDC/USDT
+      'BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU', // Raydium CLMM USDC/USDT
+      '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2', // Raydium AMM Main SOL/USDC
       '7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX', // Raydium AMM WSOL/USDT
       '7TbGqz32RsuwXbXY7EyBCiAnMbJq1gm1wKmfjQjuwoyF'  // Raydium AMM Secondary SOL/USDC
     ];
