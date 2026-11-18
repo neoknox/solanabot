@@ -68,11 +68,11 @@ export async function runStudy(options: StudyRunnerOptions = {}): Promise<void> 
   console.log(`Reports Target:      ${reportsDir}/`);
   console.log('----------------------------------------------------------------\n');
 
-  // Start HUD first
-  await hudServer.start();
-
-  // Start Scanner
+  // Start Scanner first (ensures clean pool hydration before HUD status polling)
   await scanner.start();
+
+  // Start HUD server
+  await hudServer.start();
 
   console.log('>> Scanner and HUD running. Collecting continuous opportunity windows...\n');
 
