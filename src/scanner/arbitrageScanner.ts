@@ -189,6 +189,7 @@ export class ArbitrageScanner {
   private lastSharedRefreshTime = 0;
   private hasPendingDrain = false;
   private inFlightRefreshPromise: Promise<void> | null = null;
+  private plannedPoolBundleIds: string[] = [];
 
   constructor(
     config: AppConfig,
@@ -426,6 +427,7 @@ export class ArbitrageScanner {
     this.initializationStage = 'WAITING_CONFIRMATIONS';
     const t4 = performance.now();
     await this.waitForSubscriptionConfirmations(3000);
+    this.confirmMonitoredPoolBundles();
     this.initializationElapsedMs['WAITING_CONFIRMATIONS'] = Math.round(performance.now() - t4);
 
     // 6. High-frequency background drain loop
@@ -460,6 +462,11 @@ export class ArbitrageScanner {
       this.windowTracker.updateFeedUptime(isWsConnected, true, now);
       this.windowTracker.purgeExpiredWindows(now, this.ws.getCurrentSlot());
       this.checkQuoteProducingFreshness(now);
+
+      // Re-verify monitored pool bundles if any were pending confirmation
+      if (this.monitoredPoolBundleCount < this.plannedPoolBundleIds.length) {
+        this.confirmMonitoredPoolBundles();
+      }
 
       // Periodic maintenance: keep SOL price fresh (< 2000ms) for fee conversion
       if (now - this.lastSolPriceTime >= 2000) {
@@ -2745,6 +2752,7 @@ export class ArbitrageScanner {
     this.monitoredPoolBundleCount = 0;
     this.skippedPoolBundleCount = 0;
     this.fullyMonitoredPoolIds.clear();
+    this.plannedPoolBundleIds = [];
 
     let bundleCount = 0;
     for (const poolId of prioritizedPools) {
@@ -2757,7 +2765,7 @@ export class ArbitrageScanner {
       // Check if new accounts in this bundle fit within remaining subscription quota
       const newAccounts = bundle.filter(a => !this.subscribedAccounts.has(a.key));
       if (newAccounts.length === 0) {
-        this.fullyMonitoredPoolIds.add(poolId);
+        this.plannedPoolBundleIds.push(poolId);
         bundleCount++;
         continue; // Already subscribed
       }
@@ -2843,12 +2851,58 @@ export class ArbitrageScanner {
           this.subscribedAccounts.add(item.key);
         }
       }
-      this.fullyMonitoredPoolIds.add(poolId);
+      this.plannedPoolBundleIds.push(poolId);
       bundleCount++;
     }
 
-    this.monitoredPoolBundleCount = bundleCount;
-    console.log(`[ArbitrageScanner] Subscribed ${bundleCount} complete pool bundles (${this.subscribedAccounts.size}/${maxSubs} WS accounts)`);
+    console.log(`[ArbitrageScanner] Planned and queued ${bundleCount} complete pool bundles (${this.subscribedAccounts.size}/${maxSubs} WS accounts)`);
+  }
+
+  /**
+   * Confirms monitored pool bundles by verifying that all required accounts
+   * for each planned bundle have received subscription acknowledgements (IDs) from WS.
+   * Only pools with 100% of required accounts confirmed are added to fullyMonitoredPoolIds.
+   */
+  public confirmMonitoredPoolBundles(): number {
+    this.fullyMonitoredPoolIds.clear();
+    let confirmedCount = 0;
+    for (const poolId of this.plannedPoolBundleIds) {
+      const bundle = this.buildCompletePoolAccountBundle(poolId);
+      if (!bundle || bundle.length === 0) continue;
+      const allAccountsConfirmed = bundle.every(item => {
+        if (!this.ws) return false;
+        if (typeof (this.ws as any).isAccountSubscriptionConfirmed === 'function') {
+          return (this.ws as any).isAccountSubscriptionConfirmed(item.key);
+        }
+        return this.subscribedAccounts.has(item.key);
+      });
+      if (allAccountsConfirmed) {
+        this.fullyMonitoredPoolIds.add(poolId);
+        confirmedCount++;
+      }
+    }
+    this.monitoredPoolBundleCount = confirmedCount;
+    return confirmedCount;
+  }
+
+  public isPoolFullyMonitored(poolId: string): boolean {
+    return this.fullyMonitoredPoolIds.has(poolId);
+  }
+
+  public getFullyMonitoredPoolIds(): string[] {
+    return Array.from(this.fullyMonitoredPoolIds);
+  }
+
+  public getPlannedPoolBundleIds(): string[] {
+    return [...this.plannedPoolBundleIds];
+  }
+
+  public isRouteFullyMonitored(route: IndexedDirectedRoute): boolean {
+    return this.fullyMonitoredPoolIds.has(route.poolAId) && this.fullyMonitoredPoolIds.has(route.poolBId);
+  }
+
+  public getFullyMonitoredRoutes(): IndexedDirectedRoute[] {
+    return this.routeIndex.getAllRoutes().filter(r => this.isRouteFullyMonitored(r));
   }
 
   /**

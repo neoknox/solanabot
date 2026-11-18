@@ -460,6 +460,11 @@ export class SolanaWsProvider {
     return true;
   }
 
+  public isAccountSubscriptionConfirmed(pubkey: string): boolean {
+    const sub = this.accountSubscriptions.get(pubkey);
+    return sub !== undefined && sub.id !== undefined;
+  }
+
   private enqueueAccountSubscribe(pubkey: string): void {
     if (!this.subscriptionQueue.includes(pubkey)) {
       this.subscriptionQueue.push(pubkey);
